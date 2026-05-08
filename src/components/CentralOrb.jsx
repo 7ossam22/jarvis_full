@@ -40,7 +40,7 @@ function Particle({ index, total, isListening }) {
   )
 }
 
-export default function CentralOrb({ isListening, isProcessing, onOrbClick }) {
+export default function CentralOrb({ isListening, isProcessing, directMode, onOrbClick }) {
   const orbControls = useAnimation()
 
   useEffect(() => {
@@ -73,7 +73,7 @@ export default function CentralOrb({ isListening, isProcessing, onOrbClick }) {
     }
   }, [isListening, isProcessing, orbControls])
 
-  const orbText = isListening ? 'LISTENING' : isProcessing ? 'PROCESSING' : 'JARVIS'
+  const orbText = isProcessing ? 'PROCESSING' : directMode ? 'SPEAK NOW' : isListening ? 'LISTENING' : 'JARVIS'
 
   return (
     <div className="orb-wrapper">

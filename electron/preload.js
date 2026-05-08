@@ -17,6 +17,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ElevenLabs TTS — returns base64 audio/mpeg
   elevenLabsTts: (params) => ipcRenderer.invoke('elevenlabs-tts', params),
 
+  // Spotify media controls
+  spotifyControl: (params) => ipcRenderer.invoke('spotify-control', params),
+
   // App launching
   openSpotify:  ()      => ipcRenderer.invoke('open-spotify'),
   openUrl:      (url)   => ipcRenderer.invoke('open-url', url),

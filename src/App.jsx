@@ -9,6 +9,7 @@ import SystemStats from './components/SystemStats'
 import Weather from './components/Weather'
 import Camera from './components/Camera'
 import SystemUptime from './components/SystemUptime'
+import SpotifyControls from './components/SpotifyControls'
 import { callAI, PROVIDERS } from './services/aiService'
 import { speak } from './services/ttsService'
 import { SettingsProvider, useSettings } from './context/SettingsContext'
@@ -41,10 +42,13 @@ function AppInner() {
   const [transcript, setTranscript] = useState('')
   const [provider, setProvider] = useState(PROVIDERS.LOCAL)
   const [voiceError, setVoiceError] = useState('')
+  const [directMode, setDirectMode] = useState(false)
 
   const recognitionRef = useRef(null)
   const isListeningRef = useRef(false)
   const micStreamRef = useRef(null)
+  const directModeRef = useRef(false)
+  const networkErrCountRef = useRef(0)
   const conversationHistoryRef = useRef([])
   // Keep a ref so voice callbacks always see the latest provider value
   const providerRef = useRef(PROVIDERS.LOCAL)
@@ -78,6 +82,33 @@ function AppInner() {
   // ── Local command routing ─────────────────────────────────────────────────
   const handleCommand = useCallback(async (command) => {
     const cmd = command.toLowerCase().trim()
+
+    // ── Spotify media controls ──────────────────────────────────────────────
+    const spotifyCmd = async (action, reply) => {
+      if (window.electronAPI?.spotifyControl) await window.electronAPI.spotifyControl({ action })
+      return reply
+    }
+
+    if (cmd.match(/\b(next song|next track|skip song|skip track|skip|play next)\b/))
+      return spotifyCmd('next', "Next track, Sir.")
+
+    if (cmd.match(/\b(previous song|previous track|last song|go back|play previous|prev)\b/))
+      return spotifyCmd('previous', "Previous track, Sir.")
+
+    if (cmd.match(/\b(pause|pause music|pause song|stop music|stop playing)\b/))
+      return spotifyCmd('play-pause', "Pausing, Sir.")
+
+    if (cmd.match(/\b(resume|resume music|play music|unpause)\b/))
+      return spotifyCmd('play-pause', "Resuming playback, Sir.")
+
+    if (cmd.match(/\b(volume up|louder|increase volume|turn it up|turn up)\b/))
+      return spotifyCmd('volume-up', "Volume up, Sir.")
+
+    if (cmd.match(/\b(volume down|quieter|lower volume|decrease volume|turn it down|turn down)\b/))
+      return spotifyCmd('volume-down', "Volume down, Sir.")
+
+    if (cmd.match(/\b(mute|silence music|mute music)\b/))
+      return spotifyCmd('mute', "Muted, Sir.")
 
     if (cmd.includes('open spotify') || cmd.includes('play spotify') || cmd.includes('launch spotify')) {
       if (window.electronAPI) {
@@ -224,24 +255,34 @@ function AppInner() {
         setVoiceError('Microphone access denied. Allow mic access and try again.')
         setIsListening(false)
         isListeningRef.current = false
+        directModeRef.current = false
+        setDirectMode(false)
       } else if (error === 'network') {
-        // Network error means no Google Speech API access — auto-restart quietly
-        // Don't stop listening, onend will restart
+        networkErrCountRef.current += 1
+        if (networkErrCountRef.current >= 3) {
+          setVoiceError('Speech API unreachable — check internet or try a VPN.')
+        }
       } else if (error === 'no-speech') {
-        // Normal — no speech detected, onend will restart
+        // Normal silence — onend will restart
       } else if (error === 'service-not-allowed') {
         setVoiceError('Speech service blocked. Try running the app from localhost.')
         setIsListening(false)
         isListeningRef.current = false
+        directModeRef.current = false
+        setDirectMode(false)
       } else if (error === 'audio-capture') {
         setVoiceError('No microphone found. Please connect a microphone.')
         setIsListening(false)
         isListeningRef.current = false
+        directModeRef.current = false
+        setDirectMode(false)
       }
-      // All other errors: let onend handle restart
     }
 
     recognition.onresult = (event) => {
+      networkErrCountRef.current = 0
+      setVoiceError('')
+
       let interimText = ''
       let finalText = ''
 
@@ -255,6 +296,17 @@ function AppInner() {
       setTranscript(currentText)
       if (!currentText) return
 
+      // ── Direct mode: user clicked mic, no wake word needed ──────────────
+      if (directModeRef.current) {
+        if (!finalText) return  // wait for final result
+        setTranscript('')
+        directModeRef.current = false
+        setDirectMode(false)
+        if (!isProcessing) sendMessage(finalText.trim())
+        return
+      }
+
+      // ── Wake word mode ────────────────────────────────────────────────────
       const hasWakeWord = WAKE_PHRASES.some(p => currentText.includes(p))
       if (!hasWakeWord) return
 
@@ -293,7 +345,9 @@ function AppInner() {
 
   const stopRecognition = useCallback(() => {
     isListeningRef.current = false
+    directModeRef.current = false
     setIsListening(false)
+    setDirectMode(false)
     setTranscript('')
     if (recognitionRef.current) {
       try { recognitionRef.current.stop() } catch {}
@@ -306,13 +360,27 @@ function AppInner() {
   }, [])
 
   const toggleMic = useCallback(() => {
-    if (isListeningRef.current) stopRecognition()
-    else startRecognition()
+    if (isListeningRef.current) {
+      // If already in direct mode, just cancel it back to wake-word mode
+      if (directModeRef.current) {
+        directModeRef.current = false
+        setDirectMode(false)
+      } else {
+        stopRecognition()
+      }
+    } else {
+      directModeRef.current = true
+      setDirectMode(true)
+      startRecognition()
+    }
   }, [startRecognition, stopRecognition])
 
   useEffect(() => {
     if (window.speechSynthesis) window.speechSynthesis.getVoices()
-    const t = setTimeout(startRecognition, 1200)
+    const t = setTimeout(() => {
+      directModeRef.current = false  // background wake-word mode
+      startRecognition()
+    }, 1200)
     return () => { clearTimeout(t); stopRecognition() }
   }, []) // run once on mount
 
@@ -333,6 +401,7 @@ function AppInner() {
         <div className="left-sidebar">
           <SystemStats />
           <Weather />
+          <SpotifyControls />
           <Camera active={cameraActive} onToggle={() => setCameraActive(v => !v)} />
           <SystemUptime />
         </div>
@@ -342,7 +411,20 @@ function AppInner() {
             <CentralOrb
               isListening={isListening}
               isProcessing={isProcessing}
-              onOrbClick={() => isListeningRef.current ? stopRecognition() : startRecognition()}
+              directMode={directMode}
+              onOrbClick={() => {
+                if (directModeRef.current) {
+                  directModeRef.current = false
+                  setDirectMode(false)
+                } else if (isListeningRef.current) {
+                  directModeRef.current = true
+                  setDirectMode(true)
+                } else {
+                  directModeRef.current = true
+                  setDirectMode(true)
+                  startRecognition()
+                }
+              }}
             />
           </div>
 
@@ -353,6 +435,7 @@ function AppInner() {
             onMicToggle={toggleMic}
             isListening={isListening}
             isProcessing={isProcessing}
+            directMode={directMode}
             transcript={transcript}
             voiceError={voiceError}
           />

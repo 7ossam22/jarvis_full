@@ -1,7 +1,7 @@
 import React, { useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 
-export default function InputBar({ value, onChange, onSend, onMicToggle, isListening, isProcessing, transcript, voiceError }) {
+export default function InputBar({ value, onChange, onSend, onMicToggle, isListening, isProcessing, directMode, transcript, voiceError }) {
   const inputRef = useRef(null)
 
   const handleKeyDown = (e) => {
@@ -78,7 +78,13 @@ export default function InputBar({ value, onChange, onSend, onMicToggle, isListe
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={isListening ? 'Listening... or type a command' : 'Ask JARVIS anything... or say "Jarvis"'}
+          placeholder={
+            directMode
+              ? 'Speak your command now...'
+              : isListening
+                ? 'Listening... say "Jarvis" + command, or type'
+                : 'Ask JARVIS anything... or say "Jarvis"'
+          }
           disabled={isProcessing}
         />
 

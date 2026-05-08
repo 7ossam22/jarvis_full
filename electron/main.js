@@ -231,6 +231,79 @@ ipcMain.handle('elevenlabs-tts', async (event, { apiKey, voiceId, text, modelId 
   }
 })
 
+// ── Spotify media controls ────────────────────────────────────────────────────
+ipcMain.handle('spotify-control', async (event, { action }) => {
+  const platform = os.platform()
+
+  if (platform === 'win32') {
+    // Virtual key codes (user32.dll)
+    const keyMap = {
+      'play-pause':  0xB3,  // VK_MEDIA_PLAY_PAUSE
+      'next':        0xB0,  // VK_MEDIA_NEXT_TRACK
+      'previous':    0xB1,  // VK_MEDIA_PREV_TRACK
+      'stop':        0xB2,  // VK_MEDIA_STOP
+      'volume-up':   0xAF,  // VK_VOLUME_UP
+      'volume-down': 0xAE,  // VK_VOLUME_DOWN
+      'mute':        0xAD,  // VK_VOLUME_MUTE
+    }
+    const code = keyMap[action]
+    if (!code) return { success: false, error: 'Unknown action' }
+
+    const tmpFile = path.join(os.tmpdir(), `jarvis_mk_${Date.now()}.ps1`)
+    const script = [
+      `if (-not ([System.Management.Automation.PSTypeName]'JarvisMK').Type) {`,
+      `  Add-Type -TypeDefinition @"`,
+      `using System.Runtime.InteropServices;`,
+      `public class JarvisMK {`,
+      `  [DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, int f, int e);`,
+      `}`,
+      `"@`,
+      `}`,
+      `[JarvisMK]::keybd_event(${code}, 0, 0, 0)`,
+      `[JarvisMK]::keybd_event(${code}, 0, 2, 0)`,
+    ].join('\r\n')
+
+    return new Promise(resolve => {
+      try { fs.writeFileSync(tmpFile, script, 'utf8') } catch (e) {
+        return resolve({ success: false, error: e.message })
+      }
+      exec(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tmpFile}"`, (err) => {
+        try { fs.unlinkSync(tmpFile) } catch {}
+        resolve(err ? { success: false, error: err.message } : { success: true })
+      })
+    })
+  }
+
+  if (platform === 'darwin') {
+    const scriptMap = {
+      'play-pause': 'tell application "Spotify" to playpause',
+      'next':       'tell application "Spotify" to next track',
+      'previous':   'tell application "Spotify" to previous track',
+      'volume-up':  'tell application "Spotify" to set sound volume to (sound volume + 10)',
+      'volume-down':'tell application "Spotify" to set sound volume to (sound volume - 10)',
+    }
+    const script = scriptMap[action]
+    if (!script) return { success: false, error: 'Unknown action' }
+    return new Promise(r => exec(`osascript -e '${script}'`, err => r({ success: !err })))
+  }
+
+  if (platform === 'linux') {
+    const cmdMap = {
+      'play-pause':  'playerctl play-pause',
+      'next':        'playerctl next',
+      'previous':    'playerctl previous',
+      'volume-up':   'playerctl volume 0.1+',
+      'volume-down': 'playerctl volume 0.1-',
+      'mute':        'amixer set Master toggle',
+    }
+    const cmd = cmdMap[action]
+    if (!cmd) return { success: false, error: 'Unknown action' }
+    return new Promise(r => exec(cmd, err => r({ success: !err })))
+  }
+
+  return { success: false, error: 'Unsupported platform' }
+})
+
 // ── Spotify ───────────────────────────────────────────────────────────────────
 ipcMain.handle('open-spotify', async () => {
   const platform = os.platform()
