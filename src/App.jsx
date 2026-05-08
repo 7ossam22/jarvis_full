@@ -247,6 +247,7 @@ function AppInner() {
       setIsListening(true)
       setVoiceError('')
       isListeningRef.current = true
+      networkErrCountRef.current = 0  // reset on clean start
     }
 
     recognition.onend = () => {
@@ -265,8 +266,18 @@ function AppInner() {
         directModeRef.current = false;  setDirectMode(false)
       } else if (error === 'network') {
         networkErrCountRef.current += 1
-        if (networkErrCountRef.current >= 3)
-          setVoiceError('Speech API unreachable — check internet or try a VPN.')
+        if (networkErrCountRef.current === 3) {
+          // Set error once, then stop — no point restarting if Google's servers are unreachable
+          setVoiceError('Google Speech API unreachable. Voice disabled — type commands or check your internet.')
+          isListeningRef.current = false
+          directModeRef.current = false
+          setIsListening(false)
+          setDirectMode(false)
+          if (recognitionRef.current) {
+            try { recognitionRef.current.stop() } catch {}
+            recognitionRef.current = null
+          }
+        }
       } else if (error === 'service-not-allowed') {
         setVoiceError('Speech service blocked. Run the app from localhost.')
         isListeningRef.current = false; setIsListening(false)
