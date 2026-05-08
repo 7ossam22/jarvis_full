@@ -44,6 +44,7 @@ function AppInner() {
 
   const recognitionRef = useRef(null)
   const isListeningRef = useRef(false)
+  const micStreamRef = useRef(null)
   const conversationHistoryRef = useRef([])
   // Keep a ref so voice callbacks always see the latest provider value
   const providerRef = useRef(PROVIDERS.LOCAL)
@@ -166,11 +167,31 @@ function AppInner() {
   }, [isProcessing, handleCommand])
 
   // ── Voice recognition ─────────────────────────────────────────────────────
-  const startRecognition = useCallback(() => {
+  const startRecognition = useCallback(async () => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
     if (!SpeechRecognition) {
       setVoiceError('Speech recognition is not supported in this browser.')
       return
+    }
+
+    // Prime the selected microphone device so recognition uses it
+    const deviceId = settingsRef.current?.micDeviceId
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(t => t.stop())
+      micStreamRef.current = null
+    }
+    try {
+      const constraints = { audio: deviceId ? { deviceId: { exact: deviceId } } : true }
+      micStreamRef.current = await navigator.mediaDevices.getUserMedia(constraints)
+    } catch (err) {
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setVoiceError('Microphone access denied. Allow mic access and try again.')
+        return
+      }
+      if (err.name === 'OverconstrainedError') {
+        // Device no longer available — fall back to default
+        try { micStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true }) } catch {}
+      }
     }
 
     setVoiceError('')
@@ -277,6 +298,10 @@ function AppInner() {
     if (recognitionRef.current) {
       try { recognitionRef.current.stop() } catch {}
       recognitionRef.current = null
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(t => t.stop())
+      micStreamRef.current = null
     }
   }, [])
 

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useSettings } from '../context/SettingsContext'
 import { pingLocalAI } from '../services/aiService'
@@ -12,10 +12,19 @@ export default function SettingsModal() {
   const [elKey, setElKey] = useState(settings.elevenLabsKey)
   const [voiceId, setVoiceId] = useState(settings.voiceId)
   const [ttsModel, setTtsModel] = useState(settings.ttsModel)
+  const [micDeviceId, setMicDeviceId] = useState(settings.micDeviceId || '')
   const [pingStatus, setPingStatus] = useState(null)
   const [models, setModels] = useState([])
   const [saved, setSaved] = useState(false)
   const [testingVoice, setTestingVoice] = useState(false)
+
+  // Microphone state
+  const [micDevices, setMicDevices] = useState([])
+  const [micPermission, setMicPermission] = useState('unknown') // 'unknown'|'granted'|'denied'
+  const [micLevel, setMicLevel] = useState(0)
+  const [testingMic, setTestingMic] = useState(false)
+  const micTestStreamRef = useRef(null)
+  const micAnimFrameRef = useRef(null)
 
   useEffect(() => {
     if (open) {
@@ -24,11 +33,64 @@ export default function SettingsModal() {
       setElKey(settings.elevenLabsKey)
       setVoiceId(settings.voiceId)
       setTtsModel(settings.ttsModel)
+      setMicDeviceId(settings.micDeviceId || '')
       setPingStatus(null)
       setModels([])
       setSaved(false)
+      loadMicDevices()
+    } else {
+      stopMicTest()
     }
   }, [open, settings])
+
+  const loadMicDevices = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      stream.getTracks().forEach(t => t.stop())
+      setMicPermission('granted')
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      setMicDevices(devices.filter(d => d.kind === 'audioinput'))
+    } catch {
+      setMicPermission('denied')
+    }
+  }
+
+  const startMicTest = async () => {
+    if (testingMic) { stopMicTest(); return }
+    try {
+      const constraints = { audio: micDeviceId ? { deviceId: { exact: micDeviceId } } : true }
+      const stream = await navigator.mediaDevices.getUserMedia(constraints)
+      micTestStreamRef.current = stream
+      setTestingMic(true)
+
+      const ctx = new AudioContext()
+      const src = ctx.createMediaStreamSource(stream)
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 256
+      src.connect(analyser)
+      const buf = new Uint8Array(analyser.frequencyBinCount)
+
+      const tick = () => {
+        analyser.getByteFrequencyData(buf)
+        const avg = buf.reduce((a, b) => a + b, 0) / buf.length
+        setMicLevel(Math.min(100, Math.round(avg * 2.5)))
+        micAnimFrameRef.current = requestAnimationFrame(tick)
+      }
+      tick()
+    } catch (err) {
+      setMicPermission('denied')
+    }
+  }
+
+  const stopMicTest = () => {
+    if (micAnimFrameRef.current) cancelAnimationFrame(micAnimFrameRef.current)
+    if (micTestStreamRef.current) {
+      micTestStreamRef.current.getTracks().forEach(t => t.stop())
+      micTestStreamRef.current = null
+    }
+    setTestingMic(false)
+    setMicLevel(0)
+  }
 
   const testConnection = async () => {
     setPingStatus('testing')
@@ -53,8 +115,9 @@ export default function SettingsModal() {
   }
 
   const handleSave = () => {
-    save({ localAiUrl: url.trim(), localAiModel: model.trim(), elevenLabsKey: elKey.trim(), voiceId, ttsModel })
+    save({ localAiUrl: url.trim(), localAiModel: model.trim(), elevenLabsKey: elKey.trim(), voiceId, ttsModel, micDeviceId })
     setSaved(true)
+    stopMicTest()
     setTimeout(() => { setSaved(false); setOpen(false) }, 800)
   }
 
@@ -74,6 +137,75 @@ export default function SettingsModal() {
             </div>
 
             <div className="settings-body">
+
+              {/* ── Microphone ── */}
+              <div className="settings-section">
+                <div className="settings-section-label">🎤 MICROPHONE INPUT</div>
+
+                {micPermission === 'denied' && (
+                  <div className="settings-hint" style={{ color: '#ff4444', marginBottom: 8 }}>
+                    ⚠ Microphone access denied. Check browser/system permissions.
+                  </div>
+                )}
+
+                <div className="settings-field">
+                  <label className="settings-label">INPUT DEVICE</label>
+                  <select
+                    className="settings-input settings-select"
+                    value={micDeviceId}
+                    onChange={e => setMicDeviceId(e.target.value)}
+                    disabled={micPermission === 'denied'}
+                  >
+                    <option value="">System Default</option>
+                    {micDevices.map(d => (
+                      <option key={d.deviceId} value={d.deviceId}>
+                        {d.label || `Microphone (${d.deviceId.slice(0, 8)}…)`}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="settings-hint">
+                    {micDevices.length > 0
+                      ? `${micDevices.length} device(s) found`
+                      : micPermission === 'granted' ? 'No devices detected' : 'Grant mic permission to list devices'}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button className="settings-test-btn" onClick={loadMicDevices} style={{ flex: 1 }}>
+                    ↻ REFRESH
+                  </button>
+                  <button
+                    className={`settings-test-btn ${testingMic ? 'success' : ''}`}
+                    onClick={startMicTest}
+                    style={{ flex: 2 }}
+                    disabled={micPermission === 'denied'}
+                  >
+                    {testingMic ? '■ STOP TEST' : '▶ TEST MIC'}
+                  </button>
+                </div>
+
+                {testingMic && (
+                  <div style={{ marginTop: 8 }}>
+                    <div className="settings-label" style={{ marginBottom: 4 }}>
+                      AUDIO LEVEL {micLevel > 5 ? '— hearing you' : '— speak to test'}
+                    </div>
+                    <div style={{
+                      height: 8, borderRadius: 4,
+                      background: 'rgba(0,255,255,0.1)',
+                      border: '1px solid rgba(0,255,255,0.2)',
+                      overflow: 'hidden',
+                    }}>
+                      <div style={{
+                        height: '100%',
+                        width: `${micLevel}%`,
+                        background: micLevel > 60 ? '#00ff88' : micLevel > 20 ? '#00ffff' : '#0088cc',
+                        transition: 'width 60ms linear',
+                        borderRadius: 4,
+                      }} />
+                    </div>
+                  </div>
+                )}
+              </div>
 
               {/* ── Voice / TTS ── */}
               <div className="settings-section">
