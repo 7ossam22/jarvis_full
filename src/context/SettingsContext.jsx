@@ -5,6 +5,9 @@ const STORAGE_KEY = 'jarvis_settings'
 const DEFAULTS = {
   localAiUrl: 'http://192.168.1.108:1234',
   localAiModel: 'local-model',
+  elevenLabsKey: '',
+  voiceId: 'onwK4e9ZLuTAKqWW03F9',
+  ttsModel: 'eleven_turbo_v2_5',
 }
 
 function load() {

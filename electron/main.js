@@ -3,19 +3,73 @@ const path = require('path')
 const os = require('os')
 const http = require('http')
 const https = require('https')
+const fs = require('fs')
 const { exec } = require('child_process')
 
-// Linux: disable SUID sandbox (not needed or wanted on Windows/macOS)
+// Linux: disable SUID sandbox
 if (process.platform === 'linux') {
   app.commandLine.appendSwitch('no-sandbox')
   app.commandLine.appendSwitch('disable-setuid-sandbox')
 }
 
 let mainWindow
+let localServer = null
 
 const isDev = process.env.NODE_ENV !== 'production' && !app.isPackaged
 
-function createWindow() {
+// ── Production static file server ─────────────────────────────────────────────
+// Serves dist/ over http://127.0.0.1 so Web Speech API works (blocked on file://)
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js':   'application/javascript',
+  '.css':  'text/css',
+  '.png':  'image/png',
+  '.ico':  'image/x-icon',
+  '.svg':  'image/svg+xml',
+  '.json': 'application/json',
+  '.woff': 'font/woff',
+  '.woff2':'font/woff2',
+  '.ttf':  'font/ttf',
+}
+
+function startLocalServer(distPath) {
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      const urlPath = req.url.split('?')[0]
+      let filePath = path.join(distPath, urlPath === '/' ? 'index.html' : urlPath)
+
+      if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+        filePath = path.join(distPath, 'index.html')
+      }
+
+      fs.readFile(filePath, (err, data) => {
+        if (err) { res.writeHead(404); res.end('Not found'); return }
+        const ext = path.extname(filePath)
+        res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' })
+        res.end(data)
+      })
+    })
+
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address()
+      resolve({ server, port })
+    })
+  })
+}
+
+// ── Window ────────────────────────────────────────────────────────────────────
+async function createWindow() {
+  let appUrl
+
+  if (isDev) {
+    appUrl = 'http://localhost:5173'
+  } else {
+    const distPath = path.join(__dirname, '../dist')
+    const { server, port } = await startLocalServer(distPath)
+    localServer = server
+    appUrl = `http://127.0.0.1:${port}`
+  }
+
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -29,31 +83,27 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false,
-      allowRunningInsecureContent: true,
     },
     show: false,
-    titleBarStyle: 'hidden'
+    titleBarStyle: 'hidden',
   })
 
-  if (isDev) {
-    mainWindow.loadURL('http://localhost:5173')
-    // mainWindow.webContents.openDevTools({ mode: 'detach' })
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
-  }
+  mainWindow.loadURL(appUrl)
 
   mainWindow.once('ready-to-show', () => {
     mainWindow.show()
     mainWindow.focus()
   })
 
-  mainWindow.on('closed', () => { mainWindow = null })
+  mainWindow.on('closed', () => {
+    mainWindow = null
+    if (localServer) { localServer.close(); localServer = null }
+  })
 }
 
 app.whenReady().then(() => {
   const { session } = require('electron')
 
-  // Grant all media permissions (mic, camera) automatically
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
     const allowed = ['media', 'microphone', 'camera', 'audioCapture', 'videoCapture', 'geolocation', 'notifications']
     callback(allowed.includes(permission))
@@ -66,6 +116,7 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  if (localServer) localServer.close()
   if (process.platform !== 'darwin') app.quit()
 })
 
@@ -102,42 +153,50 @@ ipcMain.handle('get-system-info', () => {
 
 ipcMain.handle('get-uptime', () => Math.floor(os.uptime()))
 
-// ── Local AI proxy (bypasses CORS — runs in Node.js, not browser) ─────────────
-function nodeRequest(baseUrl, urlPath, body, timeoutMs = 8000) {
+// ── Generic Node.js HTTP proxy (no CORS) ─────────────────────────────────────
+function nodeRequest(baseUrl, urlPath, body, headers = {}, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     let parsed
     try { parsed = new URL(urlPath, baseUrl) } catch (e) { return reject(e) }
 
     const lib = parsed.protocol === 'https:' ? https : http
+    const bodyStr = body ? JSON.stringify(body) : null
     const options = {
       hostname: parsed.hostname,
       port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
       path: parsed.pathname + parsed.search,
       method: body ? 'POST' : 'GET',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...headers },
       timeout: timeoutMs,
     }
+    if (bodyStr) options.headers['Content-Length'] = Buffer.byteLength(bodyStr)
 
+    const chunks = []
     const req = lib.request(options, (res) => {
-      let raw = ''
-      res.on('data', c => { raw += c })
+      res.on('data', c => chunks.push(c))
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(raw) }) }
-        catch { resolve({ status: res.statusCode, data: raw }) }
+        const buf = Buffer.concat(chunks)
+        const ct = res.headers['content-type'] || ''
+        if (ct.includes('application/json')) {
+          try { resolve({ status: res.statusCode, data: JSON.parse(buf.toString()), binary: false }) }
+          catch { resolve({ status: res.statusCode, data: buf.toString(), binary: false }) }
+        } else {
+          resolve({ status: res.statusCode, data: buf.toString('base64'), binary: true })
+        }
       })
     })
 
-    req.on('timeout', () => { req.destroy(new Error('Request timed out')) })
+    req.on('timeout', () => req.destroy(new Error('Request timed out')))
     req.on('error', reject)
-
-    if (body) req.write(JSON.stringify(body))
+    if (bodyStr) req.write(bodyStr)
     req.end()
   })
 }
 
+// Local AI
 ipcMain.handle('local-ai-ping', async (event, { url }) => {
   try {
-    const result = await nodeRequest(url, '/v1/models', null, 5000)
+    const result = await nodeRequest(url, '/v1/models', null, {}, 5000)
     const models = (result.data?.data || []).map(m => m.id)
     return { online: result.status < 400, models }
   } catch (err) {
@@ -147,13 +206,26 @@ ipcMain.handle('local-ai-ping', async (event, { url }) => {
 
 ipcMain.handle('local-ai-chat', async (event, { url, body }) => {
   try {
-    const result = await nodeRequest(url, '/v1/chat/completions', body, 60000)
-    if (result.status >= 400) {
-      const msg = result.data?.error?.message || `HTTP ${result.status}`
-      return { ok: false, error: msg }
-    }
-    const text = result.data?.choices?.[0]?.message?.content
-    return { ok: true, text: text || '' }
+    const result = await nodeRequest(url, '/v1/chat/completions', body, {}, 60000)
+    if (result.status >= 400) return { ok: false, error: result.data?.error?.message || `HTTP ${result.status}` }
+    return { ok: true, text: result.data?.choices?.[0]?.message?.content || '' }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+})
+
+// ElevenLabs TTS — returns base64 audio/mpeg
+ipcMain.handle('elevenlabs-tts', async (event, { apiKey, voiceId, text, modelId }) => {
+  try {
+    const result = await nodeRequest(
+      'https://api.elevenlabs.io',
+      `/v1/text-to-speech/${voiceId}`,
+      { text, model_id: modelId || 'eleven_turbo_v2_5', voice_settings: { stability: 0.55, similarity_boost: 0.80, style: 0.2, use_speaker_boost: true } },
+      { 'xi-api-key': apiKey, Accept: 'audio/mpeg' },
+      30000
+    )
+    if (result.status >= 400) return { ok: false, error: `ElevenLabs HTTP ${result.status}` }
+    return { ok: true, audio: result.data } // base64 mp3
   } catch (err) {
     return { ok: false, error: err.message }
   }
@@ -162,15 +234,15 @@ ipcMain.handle('local-ai-chat', async (event, { url, body }) => {
 // ── Spotify ───────────────────────────────────────────────────────────────────
 ipcMain.handle('open-spotify', async () => {
   const platform = os.platform()
-  const tryUri = (uri) => shell.openExternal(uri).then(() => true).catch(() => false)
+  const tryUri  = (uri) => shell.openExternal(uri).then(() => true).catch(() => false)
   const tryExec = (cmd) => new Promise(r => exec(cmd, { timeout: 5000 }, err => r(!err)))
 
   if (platform === 'win32') {
     if (await tryUri('spotify:')) return { success: true }
-    const storePath = path.join(process.env.LOCALAPPDATA || '', 'Microsoft\\WindowsApps\\Spotify.exe')
-    if (await tryExec(`"${storePath}"`)) return { success: true }
-    const appPath = path.join(process.env.APPDATA || '', 'Spotify\\Spotify.exe')
-    if (await tryExec(`"${appPath}"`)) return { success: true }
+    const store = path.join(process.env.LOCALAPPDATA || '', 'Microsoft\\WindowsApps\\Spotify.exe')
+    if (await tryExec(`"${store}"`)) return { success: true }
+    const app2 = path.join(process.env.APPDATA || '', 'Spotify\\Spotify.exe')
+    if (await tryExec(`"${app2}"`)) return { success: true }
   }
   if (platform === 'darwin') {
     if (await tryUri('spotify:')) return { success: true }
@@ -182,9 +254,8 @@ ipcMain.handle('open-spotify', async () => {
     if (await tryExec('flatpak run com.spotify.Client')) return { success: true }
     if (await tryExec('snap run spotify')) return { success: true }
   }
-
   if (await tryUri('https://open.spotify.com')) return { success: true, web: true }
-  return { success: false, error: 'Spotify not found on this system.' }
+  return { success: false, error: 'Spotify not found.' }
 })
 
 ipcMain.handle('open-url', async (event, url) => {

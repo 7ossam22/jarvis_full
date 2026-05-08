@@ -14,6 +14,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   localAiPing: (url)        => ipcRenderer.invoke('local-ai-ping', { url }),
   localAiChat: (url, body)  => ipcRenderer.invoke('local-ai-chat', { url, body }),
 
+  // ElevenLabs TTS — returns base64 audio/mpeg
+  elevenLabsTts: (params) => ipcRenderer.invoke('elevenlabs-tts', params),
+
   // App launching
   openSpotify:  ()      => ipcRenderer.invoke('open-spotify'),
   openUrl:      (url)   => ipcRenderer.invoke('open-url', url),

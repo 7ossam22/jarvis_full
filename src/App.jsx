@@ -10,32 +10,15 @@ import Weather from './components/Weather'
 import Camera from './components/Camera'
 import SystemUptime from './components/SystemUptime'
 import { callAI, PROVIDERS } from './services/aiService'
+import { speak } from './services/ttsService'
 import { SettingsProvider, useSettings } from './context/SettingsContext'
 import SettingsModal from './components/SettingsModal'
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const WAKE_PHRASES = ['jarvis', 'hey jarvis', 'okay jarvis', 'hello jarvis', 'ok jarvis']
 
-// ── Utility ────────────────────────────────────────────────────────────────
 function makeId() {
   return Math.random().toString(36).slice(2)
-}
-
-function speak(text) {
-  if (!window.speechSynthesis) return
-  window.speechSynthesis.cancel()
-  const utterance = new SpeechSynthesisUtterance(text)
-  utterance.rate = 0.95
-  utterance.pitch = 0.85
-  utterance.volume = 1
-  const voices = window.speechSynthesis.getVoices()
-  const preferredVoice = voices.find(v =>
-    v.name.toLowerCase().includes('daniel') ||
-    v.name.toLowerCase().includes('british') ||
-    v.lang === 'en-GB'
-  )
-  if (preferredVoice) utterance.voice = preferredVoice
-  window.speechSynthesis.speak(utterance)
 }
 
 // ── Root with context ──────────────────────────────────────────────────────
@@ -72,7 +55,7 @@ function AppInner() {
     conversationHistoryRef.current = []
     setMessages([])
     const label = next === PROVIDERS.CLAUDE ? 'Claude AI' : 'local AI model'
-    speak(`Switching to ${label}, Sir.`)
+    speak(`Switching to ${label}, Sir.`, settingsRef.current)
   }, [])
 
   // ── AI call with history management ──────────────────────────────────────
@@ -176,7 +159,7 @@ function AppInner() {
     try {
       const reply = await handleCommand(trimmed)
       setMessages(prev => [...prev, { id: makeId(), role: 'assistant', content: reply, timestamp: Date.now() }])
-      speak(reply)
+      speak(reply, settingsRef.current)
     } finally {
       setIsProcessing(false)
     }
@@ -267,7 +250,7 @@ function AppInner() {
       setTranscript('')
 
       if (!command) {
-        speak("Yes, Sir?")
+        speak("Yes, Sir?", settingsRef.current)
         setMessages(prev => [...prev, {
           id: makeId(), role: 'assistant',
           content: "Yes, Sir? How may I assist you?",
