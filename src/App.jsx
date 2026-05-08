@@ -57,6 +57,7 @@ function AppInner() {
   const [cameraActive, setCameraActive] = useState(false)
   const [transcript, setTranscript] = useState('')
   const [provider, setProvider] = useState(PROVIDERS.LOCAL)
+  const [voiceError, setVoiceError] = useState('')
 
   const recognitionRef = useRef(null)
   const isListeningRef = useRef(false)
@@ -184,8 +185,12 @@ function AppInner() {
   // ── Voice recognition ─────────────────────────────────────────────────────
   const startRecognition = useCallback(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!SpeechRecognition) return
+    if (!SpeechRecognition) {
+      setVoiceError('Speech recognition is not supported in this browser.')
+      return
+    }
 
+    setVoiceError('')
     const recognition = new SpeechRecognition()
     recognition.continuous = true
     recognition.interimResults = true
@@ -194,22 +199,42 @@ function AppInner() {
 
     recognition.onstart = () => {
       setIsListening(true)
+      setVoiceError('')
       isListeningRef.current = true
     }
 
     recognition.onend = () => {
+      // Auto-restart while listening flag is still set
       if (isListeningRef.current) {
-        try { recognition.start() } catch {}
+        try { recognition.start() } catch (e) {
+          // If start() throws (e.g. already started), ignore
+        }
       } else {
         setIsListening(false)
       }
     }
 
     recognition.onerror = (event) => {
-      if (event.error === 'not-allowed') {
+      const { error } = event
+      if (error === 'not-allowed') {
+        setVoiceError('Microphone access denied. Allow mic access and try again.')
+        setIsListening(false)
+        isListeningRef.current = false
+      } else if (error === 'network') {
+        // Network error means no Google Speech API access — auto-restart quietly
+        // Don't stop listening, onend will restart
+      } else if (error === 'no-speech') {
+        // Normal — no speech detected, onend will restart
+      } else if (error === 'service-not-allowed') {
+        setVoiceError('Speech service blocked. Try running the app from localhost.')
+        setIsListening(false)
+        isListeningRef.current = false
+      } else if (error === 'audio-capture') {
+        setVoiceError('No microphone found. Please connect a microphone.')
         setIsListening(false)
         isListeningRef.current = false
       }
+      // All other errors: let onend handle restart
     }
 
     recognition.onresult = (event) => {
@@ -257,7 +282,9 @@ function AppInner() {
     try {
       recognition.start()
       recognitionRef.current = recognition
-    } catch {}
+    } catch (err) {
+      setVoiceError(`Could not start recognition: ${err.message}`)
+    }
   }, [isProcessing, sendMessage])
 
   const stopRecognition = useCallback(() => {
@@ -319,6 +346,7 @@ function AppInner() {
             isListening={isListening}
             isProcessing={isProcessing}
             transcript={transcript}
+            voiceError={voiceError}
           />
         </div>
 

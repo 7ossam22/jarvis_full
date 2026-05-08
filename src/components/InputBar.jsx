@@ -1,7 +1,7 @@
 import React, { useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 
-export default function InputBar({ value, onChange, onSend, onMicToggle, isListening, isProcessing, transcript }) {
+export default function InputBar({ value, onChange, onSend, onMicToggle, isListening, isProcessing, transcript, voiceError }) {
   const inputRef = useRef(null)
 
   const handleKeyDown = (e) => {
@@ -16,7 +16,29 @@ export default function InputBar({ value, onChange, onSend, onMicToggle, isListe
   return (
     <div style={{ width: '100%', maxWidth: '680px', position: 'relative' }}>
       <AnimatePresence>
-        {transcript && (
+        {voiceError && (
+          <motion.div
+            initial={{ opacity: 0, y: 5 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            style={{
+              position: 'absolute',
+              bottom: '100%',
+              left: 0,
+              right: 0,
+              textAlign: 'center',
+              paddingBottom: '8px',
+              fontFamily: "'Share Tech Mono', monospace",
+              fontSize: '10px',
+              color: '#ff4444',
+              letterSpacing: '0.5px',
+              pointerEvents: 'none',
+            }}
+          >
+            ⚠ {voiceError}
+          </motion.div>
+        )}
+        {!voiceError && transcript && (
           <motion.div
             initial={{ opacity: 0, y: 5 }}
             animate={{ opacity: 1, y: 0 }}
