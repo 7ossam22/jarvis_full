@@ -5,12 +5,6 @@ const http = require('http')
 const https = require('https')
 const { exec } = require('child_process')
 
-// ── Chromium flags ────────────────────────────────────────────────────────────
-// Enable Web Speech API (speech recognition) in Electron's Chromium
-app.commandLine.appendSwitch('enable-features', 'WebSpeechAPI,SpeechSynthesis')
-app.commandLine.appendSwitch('enable-speech-input')
-app.commandLine.appendSwitch('allow-http-background-page')
-
 // Linux: disable SUID sandbox (not needed or wanted on Windows/macOS)
 if (process.platform === 'linux') {
   app.commandLine.appendSwitch('no-sandbox')
@@ -61,15 +55,9 @@ app.whenReady().then(() => {
 
   // Grant all media permissions (mic, camera) automatically
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    const allowed = ['media', 'microphone', 'camera', 'audioCapture', 'videoCapture', 'geolocation', 'notifications', 'speech']
+    const allowed = ['media', 'microphone', 'camera', 'audioCapture', 'videoCapture', 'geolocation', 'notifications']
     callback(allowed.includes(permission))
   })
-  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
-    return true // allow all permission checks
-  })
-
-  // Allow all media devices to be enumerated without permission prompt
-  session.defaultSession.setDevicePermissionHandler(() => true)
 
   createWindow()
   app.on('activate', () => {
