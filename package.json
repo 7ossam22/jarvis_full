@@ -23,7 +23,7 @@
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "@vitejs/plugin-basic-ssl": "^1.1.0",
     "@vitejs/plugin-react": "^4.2.0",
     "concurrently": "^8.2.0",
     "electron": "^28.3.3",
@@ -52,11 +52,15 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "artifactName": "${productName}-Setup-${version}.${ext}",
