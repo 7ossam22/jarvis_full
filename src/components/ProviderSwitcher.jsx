@@ -1,14 +1,16 @@
 import React, { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { PROVIDERS, pingLocalAI } from '../services/aiService'
+import { useSettings } from '../context/SettingsContext'
 
 export default function ProviderSwitcher({ provider, onChange }) {
+  const { settings } = useSettings()
   const [localStatus, setLocalStatus] = useState('unknown') // 'online' | 'offline' | 'unknown'
   const [localModel, setLocalModel] = useState('')
 
   useEffect(() => {
     const check = async () => {
-      const result = await pingLocalAI()
+      const result = await pingLocalAI(settings.localAiUrl)
       setLocalStatus(result.online ? 'online' : 'offline')
       if (result.models.length > 0) {
         // Show just the model filename without path
@@ -22,7 +24,7 @@ export default function ProviderSwitcher({ provider, onChange }) {
     check()
     const interval = setInterval(check, 15000)
     return () => clearInterval(interval)
-  }, [])
+  }, [settings.localAiUrl])
 
   const isClaude = provider === PROVIDERS.CLAUDE
   const isLocal = provider === PROVIDERS.LOCAL

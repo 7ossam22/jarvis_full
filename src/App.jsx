@@ -10,6 +10,8 @@ import Weather from './components/Weather'
 import Camera from './components/Camera'
 import SystemUptime from './components/SystemUptime'
 import { callAI, PROVIDERS } from './services/aiService'
+import { SettingsProvider, useSettings } from './context/SettingsContext'
+import SettingsModal from './components/SettingsModal'
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const WAKE_PHRASES = ['jarvis', 'hey jarvis', 'okay jarvis', 'hello jarvis', 'ok jarvis']
@@ -36,8 +38,18 @@ function speak(text) {
   window.speechSynthesis.speak(utterance)
 }
 
-// ── Main Component ─────────────────────────────────────────────────────────
+// ── Root with context ──────────────────────────────────────────────────────
 export default function App() {
+  return (
+    <SettingsProvider>
+      <AppInner />
+      <SettingsModal />
+    </SettingsProvider>
+  )
+}
+
+function AppInner() {
+  const { settings } = useSettings()
   const [messages, setMessages] = useState([])
   const [inputText, setInputText] = useState('')
   const [isListening, setIsListening] = useState(false)
@@ -63,14 +75,17 @@ export default function App() {
   }, [])
 
   // ── AI call with history management ──────────────────────────────────────
+  const settingsRef = useRef(settings)
+  useEffect(() => { settingsRef.current = settings }, [settings])
+
   const queryAI = useCallback(async (userMessage) => {
     conversationHistoryRef.current.push({ role: 'user', content: userMessage })
     try {
-      const reply = await callAI(conversationHistoryRef.current, providerRef.current)
+      const reply = await callAI(conversationHistoryRef.current, providerRef.current, settingsRef.current)
       conversationHistoryRef.current.push({ role: 'assistant', content: reply })
       return reply
     } catch (err) {
-      conversationHistoryRef.current.pop() // roll back failed user message
+      conversationHistoryRef.current.pop()
       return `I encountered an error, Sir: ${err.message}`
     }
   }, [])

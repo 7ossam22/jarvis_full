@@ -12,8 +12,6 @@ export const PROVIDER_LABELS = {
 }
 
 const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages'
-const LOCAL_API_URL = import.meta.env.VITE_LOCAL_AI_URL || 'http://192.168.1.108:1234'
-const LOCAL_MODEL = import.meta.env.VITE_LOCAL_AI_MODEL || 'local-model'
 
 const SYSTEM_PROMPT = `You are J.A.R.V.I.S (Just A Rather Very Intelligent System), Tony Stark's highly sophisticated AI assistant. You are:
 - Sophisticated, eloquent, and witty with a British-influenced manner of speech
@@ -56,24 +54,19 @@ async function callClaude(history, apiKey) {
 }
 
 // ── Local AI (LM Studio / OpenAI-compatible) ──────────────────────────────────
-async function callLocalAI(history) {
+async function callLocalAI(history, { localAiUrl, localAiModel }) {
+  const baseUrl = (localAiUrl || 'http://192.168.1.108:1234').replace(/\/$/, '')
+  const model = localAiModel || 'local-model'
+
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
     ...history.slice(-20),
   ]
 
-  const res = await fetch(`${LOCAL_API_URL}/v1/chat/completions`, {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: LOCAL_MODEL,
-      messages,
-      max_tokens: 512,
-      temperature: 0.75,
-      stream: false,
-    }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, max_tokens: 512, temperature: 0.75, stream: false }),
   })
 
   if (!res.ok) {
@@ -89,23 +82,34 @@ async function callLocalAI(history) {
 }
 
 // ── Public interface ──────────────────────────────────────────────────────────
-export async function callAI(history, provider) {
+
+/**
+ * @param {Array}  history  - conversation history [{role, content}]
+ * @param {string} provider - PROVIDERS.CLAUDE | PROVIDERS.LOCAL
+ * @param {object} settings - { localAiUrl, localAiModel }
+ */
+export async function callAI(history, provider, settings = {}) {
   const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
 
   switch (provider) {
     case PROVIDERS.CLAUDE:
       return callClaude(history, apiKey)
     case PROVIDERS.LOCAL:
-      return callLocalAI(history)
+      return callLocalAI(history, settings)
     default:
       throw new Error(`Unknown AI provider: "${provider}"`)
   }
 }
 
-export async function pingLocalAI() {
+/**
+ * Ping LM Studio to check connectivity and list loaded models.
+ * @param {string} url - base URL to test (defaults to stored setting)
+ */
+export async function pingLocalAI(url) {
+  const baseUrl = (url || 'http://192.168.1.108:1234').replace(/\/$/, '')
   try {
-    const res = await fetch(`${LOCAL_API_URL}/v1/models`, {
-      signal: AbortSignal.timeout(3000),
+    const res = await fetch(`${baseUrl}/v1/models`, {
+      signal: AbortSignal.timeout(4000),
     })
     if (!res.ok) return { online: false, models: [] }
     const data = await res.json()

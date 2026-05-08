@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, shell } = require('electron')
 const path = require('path')
 const os = require('os')
+const { exec } = require('child_process')
 
 // Required for Linux sandbox
 app.commandLine.appendSwitch('no-sandbox')
@@ -121,18 +122,60 @@ ipcMain.handle('get-uptime', () => {
 
 // Open external applications
 ipcMain.handle('open-spotify', async () => {
-  try {
-    const spotifyURI = 'spotify:'
-    await shell.openExternal(spotifyURI)
-    return { success: true }
-  } catch (err) {
-    try {
-      await shell.openExternal('https://open.spotify.com')
-      return { success: true, web: true }
-    } catch (e) {
-      return { success: false, error: e.message }
-    }
+  const platform = os.platform()
+
+  // Helper: try shell.openExternal and resolve with result
+  const tryUri = (uri) => new Promise(resolve => {
+    shell.openExternal(uri).then(() => resolve(true)).catch(() => resolve(false))
+  })
+
+  // Helper: try running a command silently
+  const tryExec = (cmd) => new Promise(resolve => {
+    exec(cmd, { timeout: 5000 }, (err) => resolve(!err))
+  })
+
+  // ── Windows ──────────────────────────────────────────────────────────────
+  if (platform === 'win32') {
+    // 1. Spotify URI scheme (works if Spotify from any source is installed)
+    if (await tryUri('spotify:')) return { success: true }
+
+    // 2. Windows Store / UWP path
+    const winStorePath = path.join(
+      process.env.LOCALAPPDATA || '',
+      'Microsoft\\WindowsApps\\Spotify.exe'
+    )
+    if (await tryExec(`"${winStorePath}"`)) return { success: true }
+
+    // 3. Traditional install path
+    const winPath = path.join(
+      process.env.APPDATA || '',
+      'Spotify\\Spotify.exe'
+    )
+    if (await tryExec(`"${winPath}"`)) return { success: true }
   }
+
+  // ── macOS ─────────────────────────────────────────────────────────────────
+  if (platform === 'darwin') {
+    if (await tryUri('spotify:')) return { success: true }
+    if (await tryExec('open -a Spotify')) return { success: true }
+  }
+
+  // ── Linux ─────────────────────────────────────────────────────────────────
+  if (platform === 'linux') {
+    // Try URI first (works if xdg-open knows the handler)
+    if (await tryUri('spotify:')) return { success: true }
+    // Native .deb / .rpm install
+    if (await tryExec('spotify')) return { success: true }
+    // Flatpak
+    if (await tryExec('flatpak run com.spotify.Client')) return { success: true }
+    // Snap
+    if (await tryExec('snap run spotify')) return { success: true }
+  }
+
+  // ── Final fallback: web player ─────────────────────────────────────────────
+  if (await tryUri('https://open.spotify.com')) return { success: true, web: true }
+
+  return { success: false, error: 'Spotify could not be found on this system.' }
 })
 
 ipcMain.handle('open-url', async (event, url) => {

@@ -1,7 +1,9 @@
 import React from 'react'
 import ProviderSwitcher from './ProviderSwitcher'
+import { useSettings } from '../context/SettingsContext'
 
 export default function TitleBar({ isListening, provider, onProviderChange }) {
+  const { setOpen } = useSettings()
   const handleMinimize = () => {
     if (window.electronAPI) window.electronAPI.minimizeWindow()
   }
@@ -41,6 +43,14 @@ export default function TitleBar({ isListening, provider, onProviderChange }) {
             {isListening ? 'LISTENING' : 'ONLINE'}
           </span>
         </div>
+        <button
+          className="window-btn"
+          onClick={() => setOpen(true)}
+          title="Settings"
+          style={{ marginRight: 4 }}
+        >
+          ⚙
+        </button>
         <button className="window-btn minimize" onClick={handleMinimize} title="Minimize">
           &#8211;
         </button>
