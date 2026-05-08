@@ -3,9 +3,11 @@ const path = require('path')
 const os = require('os')
 const { exec } = require('child_process')
 
-// Required for Linux sandbox
-app.commandLine.appendSwitch('no-sandbox')
-app.commandLine.appendSwitch('disable-setuid-sandbox')
+// Linux requires disabling the SUID sandbox (not needed or wanted on Windows/macOS)
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('no-sandbox')
+  app.commandLine.appendSwitch('disable-setuid-sandbox')
+}
 
 let mainWindow
 

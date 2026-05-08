@@ -24,23 +24,15 @@ jobs:
       - name: Build React app
         run: npm run build
 
-      - name: Build Windows EXE
+      - name: Build Windows portable EXE
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx electron-builder --win --x64
 
-      - name: Upload installer
+      - name: Upload portable EXE
         uses: actions/upload-artifact@v4
         with:
-          name: JARVIS-Windows-Installer
+          name: JARVIS-Windows
           path: release/*.exe
           retention-days: 30
-
-      - name: Upload portable
-        uses: actions/upload-artifact@v4
-        with:
-          name: JARVIS-Windows-Portable
-          path: release/*Portable*.exe
-          retention-days: 30
-          if-no-files-found: ignore
