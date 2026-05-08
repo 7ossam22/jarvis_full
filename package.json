@@ -2,6 +2,7 @@
   "name": "jarvis-desktop",
   "version": "1.0.0",
   "description": "JARVIS AI Assistant Desktop Application",
+  "author": "7ossam22",
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron . --no-sandbox\"",
@@ -11,6 +12,8 @@
     "electron:prod": "vite build && electron . --no-sandbox",
     "build": "vite build",
     "dist": "vite build && electron-builder",
+    "dist:win": "vite build && electron-builder --win",
+    "dist:linux": "vite build && electron-builder --linux",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -31,20 +34,47 @@
   "build": {
     "appId": "com.jarvis.desktop",
     "productName": "JARVIS",
+    "copyright": "Copyright © 2025 JARVIS",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "assets"
     },
     "files": [
       "dist/**/*",
       "electron/**/*",
-      "assets/**/*"
+      "assets/**/*",
+      "!node_modules/**/*"
     ],
+    "extraMetadata": {
+      "main": "electron/main.js"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "JARVIS",
+      "installerHeaderIcon": "assets/icon.ico",
+      "deleteAppDataOnUninstall": false
+    },
     "linux": {
       "target": "AppImage",
       "category": "Utility"
-    },
-    "win": {
-      "target": "nsis"
     },
     "mac": {
       "target": "dmg"
