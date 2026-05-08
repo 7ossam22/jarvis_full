@@ -12,10 +12,15 @@ export default defineConfig({
     ...(webMode ? [basicSsl()] : []),
   ],
   base: './',
+  // Transformers.js uses dynamic WASM imports — don't pre-bundle it
+  optimizeDeps: {
+    exclude: ['@xenova/transformers'],
+  },
   build: {
     outDir: 'dist',
     assetsDir: 'assets',
     emptyOutDir: true,
+    chunkSizeWarningLimit: 2000,  // ONNX runtime is large by design
   },
   server: {
     host: '0.0.0.0',

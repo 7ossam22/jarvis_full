@@ -12,6 +12,8 @@ import SystemUptime from './components/SystemUptime'
 import SpotifyControls from './components/SpotifyControls'
 import { callAI, PROVIDERS } from './services/aiService'
 import { speak } from './services/ttsService'
+import { loadModel, transcribeBlob, isLoaded } from './services/sttService'
+import { VAD } from './services/vadService'
 import { SettingsProvider, useSettings } from './context/SettingsContext'
 import SettingsModal from './components/SettingsModal'
 
@@ -43,16 +45,20 @@ function AppInner() {
   const [provider, setProvider] = useState(PROVIDERS.LOCAL)
   const [voiceError, setVoiceError] = useState('')
   const [directMode, setDirectMode] = useState(false)
+  const [modelLoading, setModelLoading] = useState(false)
+  const [modelProgress, setModelProgress] = useState(0)
 
-  const recognitionRef = useRef(null)
   const isListeningRef = useRef(false)
-  const isProcessingRef = useRef(false)   // ref so recognition callbacks always see current value
+  const isProcessingRef = useRef(false)
   const micStreamRef = useRef(null)
+  const vadRef = useRef(null)
+  const recorderRef = useRef(null)
+  const chunksRef = useRef([])
   const directModeRef = useRef(false)
-  const networkErrCountRef = useRef(0)
+  const modelLoadedRef = useRef(false)
   const conversationHistoryRef = useRef([])
   const providerRef = useRef(PROVIDERS.LOCAL)
-  const sendMessageRef = useRef(null)      // ref so recognition callbacks always see current sendMessage
+  const sendMessageRef = useRef(null)
 
   const handleProviderChange = useCallback((next) => {
     setProvider(next)
@@ -203,197 +209,167 @@ function AppInner() {
   // Keep ref in sync so recognition callbacks always call the latest sendMessage
   sendMessageRef.current = sendMessage
 
-  // ── Voice recognition ─────────────────────────────────────────────────────
-  const startRecognition = useCallback(async () => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!SpeechRecognition) {
-      setVoiceError('Speech recognition is not supported in this browser.')
+  // ── Process a Whisper transcript ──────────────────────────────────────────
+  const handleTranscriptRef = useRef(null)
+  handleTranscriptRef.current = (rawText) => {
+    const text = rawText.trim()
+    if (!text) return
+    const lower = text.toLowerCase()
+    setTranscript(lower)
+
+    if (directModeRef.current) {
+      setTranscript('')
+      directModeRef.current = false
+      setDirectMode(false)
+      if (!isProcessingRef.current) sendMessageRef.current(text)
       return
     }
 
-    // Stop any existing recognition to prevent multiple instances competing
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop() } catch {}
-      recognitionRef.current = null
+    const hasWakeWord = WAKE_PHRASES.some(p => lower.includes(p))
+    if (!hasWakeWord) { setTimeout(() => setTranscript(''), 2500); return }
+
+    let command = null
+    for (const phrase of [...WAKE_PHRASES].sort((a, b) => b.length - a.length)) {
+      if (lower.includes(phrase)) {
+        const after = lower.split(phrase).pop().trim()
+        if (after.length > 1) command = after
+        break
+      }
     }
 
-    // Prime the selected microphone device so recognition uses it
-    const deviceId = settingsRef.current?.micDeviceId
+    setTranscript('')
+    if (!command) {
+      speak("Yes, Sir?", settingsRef.current)
+      setMessages(prev => [...prev, {
+        id: makeId(), role: 'assistant',
+        content: "Yes, Sir? How may I assist you?",
+        timestamp: Date.now(),
+      }])
+      return
+    }
+
+    if (!isProcessingRef.current) sendMessageRef.current(command)
+  }
+
+  // ── Local Whisper voice recognition (no Google, no internet required) ────
+  const stopRecognition = useCallback(() => {
+    if (vadRef.current) { vadRef.current.destroy(); vadRef.current = null }
+    if (recorderRef.current?.state === 'recording') {
+      try { recorderRef.current.stop() } catch {}
+      recorderRef.current = null
+    }
     if (micStreamRef.current) {
       micStreamRef.current.getTracks().forEach(t => t.stop())
       micStreamRef.current = null
     }
-    try {
-      const constraints = { audio: deviceId ? { deviceId: { exact: deviceId } } : true }
-      micStreamRef.current = await navigator.mediaDevices.getUserMedia(constraints)
-    } catch (err) {
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        setVoiceError('Microphone access denied. Allow mic access and try again.')
-        return
-      }
-      if (err.name === 'OverconstrainedError') {
-        try { micStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true }) } catch {}
-      }
-    }
-
-    setVoiceError('')
-    const recognition = new SpeechRecognition()
-    recognition.continuous = true
-    recognition.interimResults = true
-    recognition.lang = 'en-US'
-    recognition.maxAlternatives = 1
-
-    recognition.onstart = () => {
-      setIsListening(true)
-      setVoiceError('')
-      isListeningRef.current = true
-      networkErrCountRef.current = 0  // reset on clean start
-    }
-
-    recognition.onend = () => {
-      if (isListeningRef.current) {
-        try { recognition.start() } catch {}
-      } else {
-        setIsListening(false)
-      }
-    }
-
-    recognition.onerror = (event) => {
-      const { error } = event
-      if (error === 'not-allowed') {
-        setVoiceError('Microphone access denied. Allow mic access and try again.')
-        isListeningRef.current = false; setIsListening(false)
-        directModeRef.current = false;  setDirectMode(false)
-      } else if (error === 'network') {
-        networkErrCountRef.current += 1
-        if (networkErrCountRef.current === 3) {
-          // Set error once, then stop — no point restarting if Google's servers are unreachable
-          setVoiceError('Google Speech API unreachable. Voice disabled — type commands or check your internet.')
-          isListeningRef.current = false
-          directModeRef.current = false
-          setIsListening(false)
-          setDirectMode(false)
-          if (recognitionRef.current) {
-            try { recognitionRef.current.stop() } catch {}
-            recognitionRef.current = null
-          }
-        }
-      } else if (error === 'service-not-allowed') {
-        setVoiceError('Speech service blocked. Run the app from localhost.')
-        isListeningRef.current = false; setIsListening(false)
-        directModeRef.current = false;  setDirectMode(false)
-      } else if (error === 'audio-capture') {
-        setVoiceError('No microphone found. Please connect a microphone.')
-        isListeningRef.current = false; setIsListening(false)
-        directModeRef.current = false;  setDirectMode(false)
-      }
-      // no-speech: normal, onend will restart
-    }
-
-    recognition.onresult = (event) => {
-      // All values read from refs — never stale regardless of when this callback was registered
-      networkErrCountRef.current = 0
-      setVoiceError('')
-
-      let interimText = ''
-      let finalText = ''
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const r = event.results[i]
-        if (r.isFinal) finalText += r[0].transcript
-        else interimText += r[0].transcript
-      }
-
-      const currentText = (finalText || interimText).toLowerCase().trim()
-      setTranscript(currentText)
-      if (!currentText) return
-
-      // ── Direct mode: user clicked mic, no wake word needed ──────────────
-      if (directModeRef.current) {
-        if (!finalText) return
-        setTranscript('')
-        directModeRef.current = false
-        setDirectMode(false)
-        if (!isProcessingRef.current) sendMessageRef.current(finalText.trim())
-        return
-      }
-
-      // ── Wake word mode ────────────────────────────────────────────────────
-      const hasWakeWord = WAKE_PHRASES.some(p => currentText.includes(p))
-      if (!hasWakeWord) return
-
-      let command = null
-      for (const phrase of [...WAKE_PHRASES].sort((a, b) => b.length - a.length)) {
-        if (currentText.includes(phrase)) {
-          const after = currentText.split(phrase).pop().trim()
-          if (after.length > 1) command = after
-          break
-        }
-      }
-
-      if (!finalText) return
-      setTranscript('')
-
-      if (!command) {
-        speak("Yes, Sir?", settingsRef.current)
-        setMessages(prev => [...prev, {
-          id: makeId(), role: 'assistant',
-          content: "Yes, Sir? How may I assist you?",
-          timestamp: Date.now(),
-        }])
-        return
-      }
-
-      if (!isProcessingRef.current) sendMessageRef.current(command)
-    }
-
-    try {
-      recognition.start()
-      recognitionRef.current = recognition
-    } catch (err) {
-      setVoiceError(`Could not start recognition: ${err.message}`)
-    }
-  }, [])  // empty deps — all values read through refs, no stale closures
-
-  const stopRecognition = useCallback(() => {
     isListeningRef.current = false
     directModeRef.current = false
     setIsListening(false)
     setDirectMode(false)
     setTranscript('')
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop() } catch {}
-      recognitionRef.current = null
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach(t => t.stop())
-      micStreamRef.current = null
-    }
   }, [])
+
+  const startRecognition = useCallback(async () => {
+    if (!modelLoadedRef.current) {
+      setVoiceError('Voice model still loading — please wait.')
+      return
+    }
+
+    stopRecognition()
+
+    const deviceId = settingsRef.current?.micDeviceId
+    let stream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+      })
+    } catch (err) {
+      setVoiceError(
+        err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError'
+          ? 'Microphone access denied. Allow mic access and try again.'
+          : `Microphone error: ${err.message}`
+      )
+      return
+    }
+    micStreamRef.current = stream
+
+    const processBlob = async (blob) => {
+      if (blob.size < 4000) return  // skip clips too short to be real speech
+      isProcessingRef.current = true
+      setIsProcessing(true)
+      try {
+        const text = await transcribeBlob(blob)
+        if (text) handleTranscriptRef.current(text)
+      } catch (err) {
+        console.error('Whisper STT error:', err)
+      } finally {
+        isProcessingRef.current = false
+        setIsProcessing(false)
+      }
+    }
+
+    const vad = new VAD({
+      threshold: 10,
+      silenceMs: 1300,
+      onSpeechStart: () => {
+        chunksRef.current = []
+        const mr = new MediaRecorder(stream)
+        mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
+        mr.onstop = () => {
+          const blob = new Blob(chunksRef.current, { type: mr.mimeType || 'audio/webm' })
+          chunksRef.current = []
+          processBlob(blob)
+        }
+        mr.start(100)
+        recorderRef.current = mr
+      },
+      onSpeechEnd: () => {
+        if (recorderRef.current?.state === 'recording') {
+          recorderRef.current.stop()
+          recorderRef.current = null
+        }
+      },
+    })
+
+    vad.start(stream)
+    vadRef.current = vad
+    isListeningRef.current = true
+    setIsListening(true)
+    setVoiceError('')
+  }, [stopRecognition])
 
   const toggleMic = useCallback(() => {
     if (directModeRef.current) {
-      // Already in direct mode — cancel it, back to background wake-word listening
       directModeRef.current = false
       setDirectMode(false)
     } else if (isListeningRef.current) {
-      // Background listening active — switch to direct mode without restarting recognition
       directModeRef.current = true
       setDirectMode(true)
     } else {
-      // Not listening at all — start recognition in direct mode
       directModeRef.current = true
       setDirectMode(true)
       startRecognition()
     }
   }, [startRecognition])
 
+  // Load Whisper model on mount, then auto-start listening
   useEffect(() => {
     if (window.speechSynthesis) window.speechSynthesis.getVoices()
-    const t = setTimeout(() => {
-      directModeRef.current = false  // background wake-word mode
+    setModelLoading(true)
+    loadModel(p => {
+      if (p.status === 'progress' || p.status === 'downloading') {
+        setModelProgress(Math.round(p.progress ?? 0))
+      }
+    }).then(() => {
+      modelLoadedRef.current = true
+      setModelLoading(false)
+      setModelProgress(0)
       startRecognition()
-    }, 1200)
-    return () => { clearTimeout(t); stopRecognition() }
+    }).catch(err => {
+      setModelLoading(false)
+      setVoiceError(`Voice model failed to load: ${err.message}`)
+    })
+    return () => stopRecognition()
   }, []) // run once on mount
 
   return (
@@ -424,6 +400,8 @@ function AppInner() {
               isListening={isListening}
               isProcessing={isProcessing}
               directMode={directMode}
+              modelLoading={modelLoading}
+              modelProgress={modelProgress}
               onOrbClick={() => {
                 if (directModeRef.current) {
                   directModeRef.current = false
