@@ -46,12 +46,13 @@ function AppInner() {
 
   const recognitionRef = useRef(null)
   const isListeningRef = useRef(false)
+  const isProcessingRef = useRef(false)   // ref so recognition callbacks always see current value
   const micStreamRef = useRef(null)
   const directModeRef = useRef(false)
   const networkErrCountRef = useRef(0)
   const conversationHistoryRef = useRef([])
-  // Keep a ref so voice callbacks always see the latest provider value
   const providerRef = useRef(PROVIDERS.LOCAL)
+  const sendMessageRef = useRef(null)      // ref so recognition callbacks always see current sendMessage
 
   const handleProviderChange = useCallback((next) => {
     setProvider(next)
@@ -182,10 +183,11 @@ function AppInner() {
   // ── Send message ──────────────────────────────────────────────────────────
   const sendMessage = useCallback(async (text) => {
     const trimmed = text.trim()
-    if (!trimmed || isProcessing) return
+    if (!trimmed || isProcessingRef.current) return  // use ref — never stale
 
     setMessages(prev => [...prev, { id: makeId(), role: 'user', content: trimmed, timestamp: Date.now() }])
     setInputText('')
+    isProcessingRef.current = true
     setIsProcessing(true)
 
     try {
@@ -193,9 +195,13 @@ function AppInner() {
       setMessages(prev => [...prev, { id: makeId(), role: 'assistant', content: reply, timestamp: Date.now() }])
       speak(reply, settingsRef.current)
     } finally {
+      isProcessingRef.current = false
       setIsProcessing(false)
     }
-  }, [isProcessing, handleCommand])
+  }, [handleCommand])  // removed isProcessing — use ref instead
+
+  // Keep ref in sync so recognition callbacks always call the latest sendMessage
+  sendMessageRef.current = sendMessage
 
   // ── Voice recognition ─────────────────────────────────────────────────────
   const startRecognition = useCallback(async () => {
@@ -203,6 +209,12 @@ function AppInner() {
     if (!SpeechRecognition) {
       setVoiceError('Speech recognition is not supported in this browser.')
       return
+    }
+
+    // Stop any existing recognition to prevent multiple instances competing
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop() } catch {}
+      recognitionRef.current = null
     }
 
     // Prime the selected microphone device so recognition uses it
@@ -220,7 +232,6 @@ function AppInner() {
         return
       }
       if (err.name === 'OverconstrainedError') {
-        // Device no longer available — fall back to default
         try { micStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true }) } catch {}
       }
     }
@@ -239,11 +250,8 @@ function AppInner() {
     }
 
     recognition.onend = () => {
-      // Auto-restart while listening flag is still set
       if (isListeningRef.current) {
-        try { recognition.start() } catch (e) {
-          // If start() throws (e.g. already started), ignore
-        }
+        try { recognition.start() } catch {}
       } else {
         setIsListening(false)
       }
@@ -253,39 +261,31 @@ function AppInner() {
       const { error } = event
       if (error === 'not-allowed') {
         setVoiceError('Microphone access denied. Allow mic access and try again.')
-        setIsListening(false)
-        isListeningRef.current = false
-        directModeRef.current = false
-        setDirectMode(false)
+        isListeningRef.current = false; setIsListening(false)
+        directModeRef.current = false;  setDirectMode(false)
       } else if (error === 'network') {
         networkErrCountRef.current += 1
-        if (networkErrCountRef.current >= 3) {
+        if (networkErrCountRef.current >= 3)
           setVoiceError('Speech API unreachable — check internet or try a VPN.')
-        }
-      } else if (error === 'no-speech') {
-        // Normal silence — onend will restart
       } else if (error === 'service-not-allowed') {
-        setVoiceError('Speech service blocked. Try running the app from localhost.')
-        setIsListening(false)
-        isListeningRef.current = false
-        directModeRef.current = false
-        setDirectMode(false)
+        setVoiceError('Speech service blocked. Run the app from localhost.')
+        isListeningRef.current = false; setIsListening(false)
+        directModeRef.current = false;  setDirectMode(false)
       } else if (error === 'audio-capture') {
         setVoiceError('No microphone found. Please connect a microphone.')
-        setIsListening(false)
-        isListeningRef.current = false
-        directModeRef.current = false
-        setDirectMode(false)
+        isListeningRef.current = false; setIsListening(false)
+        directModeRef.current = false;  setDirectMode(false)
       }
+      // no-speech: normal, onend will restart
     }
 
     recognition.onresult = (event) => {
+      // All values read from refs — never stale regardless of when this callback was registered
       networkErrCountRef.current = 0
       setVoiceError('')
 
       let interimText = ''
       let finalText = ''
-
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const r = event.results[i]
         if (r.isFinal) finalText += r[0].transcript
@@ -298,11 +298,11 @@ function AppInner() {
 
       // ── Direct mode: user clicked mic, no wake word needed ──────────────
       if (directModeRef.current) {
-        if (!finalText) return  // wait for final result
+        if (!finalText) return
         setTranscript('')
         directModeRef.current = false
         setDirectMode(false)
-        if (!isProcessing) sendMessage(finalText.trim())
+        if (!isProcessingRef.current) sendMessageRef.current(finalText.trim())
         return
       }
 
@@ -332,7 +332,7 @@ function AppInner() {
         return
       }
 
-      if (!isProcessing) sendMessage(command)
+      if (!isProcessingRef.current) sendMessageRef.current(command)
     }
 
     try {
@@ -341,7 +341,7 @@ function AppInner() {
     } catch (err) {
       setVoiceError(`Could not start recognition: ${err.message}`)
     }
-  }, [isProcessing, sendMessage])
+  }, [])  // empty deps — all values read through refs, no stale closures
 
   const stopRecognition = useCallback(() => {
     isListeningRef.current = false
@@ -360,20 +360,21 @@ function AppInner() {
   }, [])
 
   const toggleMic = useCallback(() => {
-    if (isListeningRef.current) {
-      // If already in direct mode, just cancel it back to wake-word mode
-      if (directModeRef.current) {
-        directModeRef.current = false
-        setDirectMode(false)
-      } else {
-        stopRecognition()
-      }
+    if (directModeRef.current) {
+      // Already in direct mode — cancel it, back to background wake-word listening
+      directModeRef.current = false
+      setDirectMode(false)
+    } else if (isListeningRef.current) {
+      // Background listening active — switch to direct mode without restarting recognition
+      directModeRef.current = true
+      setDirectMode(true)
     } else {
+      // Not listening at all — start recognition in direct mode
       directModeRef.current = true
       setDirectMode(true)
       startRecognition()
     }
-  }, [startRecognition, stopRecognition])
+  }, [startRecognition])
 
   useEffect(() => {
     if (window.speechSynthesis) window.speechSynthesis.getVoices()
