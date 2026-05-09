@@ -1,6 +1,7 @@
 node_modules/
 dist/
 release/
+public/models/
 .env
 *.log
 .DS_Store

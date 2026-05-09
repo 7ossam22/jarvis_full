@@ -345,9 +345,8 @@ ipcMain.handle('google-search', async (event, query) => {
   } catch (err) { return { success: false, error: err.message } }
 })
 
-// ── HuggingFace model downloader (bypasses renderer CORS/firewall) ────────────
-// Downloads HF files via Node.js, caches to disk, returns base64 to renderer.
-// The renderer monkey-patches window.fetch so @xenova/transformers calls go here.
+// ── (removed: fetch-hf-file — model files are now bundled locally) ───────────
+// Legacy placeholder kept to avoid hard crash if old renderer calls it
 ipcMain.handle('fetch-hf-file', async (event, url) => {
   const cacheDir = path.join(app.getPath('userData'), 'hf-cache')
   try { fs.mkdirSync(cacheDir, { recursive: true }) } catch {}

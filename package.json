@@ -5,6 +5,7 @@
   "author": "7ossam22",
   "main": "electron/main.js",
   "scripts": {
+    "setup": "node scripts/download-models.js",
     "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron . --no-sandbox\"",
     "web": "WEB_MODE=true vite",
     "vite": "vite",
