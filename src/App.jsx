@@ -194,7 +194,7 @@ function AppInner() {
           <InputBar
             value={inputText}
             onChange={setInputText}
-            onSend={() => sendMessage(inputText)}
+            onSend={sendMessage}
             isProcessing={isProcessing}
           />
         </div>

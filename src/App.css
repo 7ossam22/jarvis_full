@@ -443,6 +443,17 @@
   box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.1), 0 0 20px rgba(0, 212, 255, 0.1), 0 4px 30px rgba(0, 0, 0, 0.3);
 }
 
+.input-bar--listening {
+  border-color: rgba(0, 212, 255, 0.7);
+  box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.2), 0 0 30px rgba(0, 212, 255, 0.2), 0 4px 30px rgba(0, 0, 0, 0.3);
+  animation: listening-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes listening-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.2), 0 0 30px rgba(0, 212, 255, 0.2); }
+  50% { box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.4), 0 0 50px rgba(0, 212, 255, 0.35); }
+}
+
 .input-field {
   flex: 1;
   background: transparent;
