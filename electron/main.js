@@ -366,13 +366,27 @@ ipcMain.handle('fetch-hf-file', async (event, url) => {
   return new Promise((resolve) => {
     const download = (targetUrl, hops) => {
       if (hops > 10) return resolve({ ok: false, error: 'Too many redirects' })
-      let parsed
-      try { parsed = new URL(targetUrl) } catch (e) { return resolve({ ok: false, error: `Bad URL: ${e.message}` }) }
-      const lib = parsed.protocol === 'https:' ? https : http
+
+      // Avoid new URL() on first hop — the raw string is fine for http.get.
+      // For redirect hops the url is already resolved to an absolute string.
+      const isHttps = typeof targetUrl === 'string' && targetUrl.startsWith('https://')
+      const isHttp  = typeof targetUrl === 'string' && targetUrl.startsWith('http://')
+      if (!isHttps && !isHttp) {
+        return resolve({ ok: false, error: `Unusable URL: ${String(targetUrl).slice(0, 300)}` })
+      }
+
+      const lib = isHttps ? https : http
       const req = lib.get(targetUrl, { headers: { 'User-Agent': 'transformers.js/2' }, timeout: 180000 }, (res) => {
         if ([301, 302, 307, 308].includes(res.statusCode)) {
           res.resume()
-          return download(res.headers.location, hops + 1)
+          const loc = (res.headers.location || '').trim()
+          if (!loc) return resolve({ ok: false, error: 'Redirect with no Location header' })
+          // Resolve protocol-relative (//host/path) and path-relative (/path) redirects
+          let nextUrl = loc
+          if (!loc.startsWith('http://') && !loc.startsWith('https://')) {
+            try { nextUrl = new URL(loc, targetUrl).href } catch { nextUrl = loc }
+          }
+          return download(nextUrl, hops + 1)
         }
         if (res.statusCode !== 200) {
           res.resume()
