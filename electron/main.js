@@ -30,6 +30,8 @@ const MIME = {
   '.woff': 'font/woff',
   '.woff2':'font/woff2',
   '.ttf':  'font/ttf',
+  '.wasm': 'application/wasm',
+  '.onnx': 'application/octet-stream',
 }
 
 function startLocalServer(distPath) {
@@ -341,4 +343,54 @@ ipcMain.handle('google-search', async (event, query) => {
     await shell.openExternal(`https://www.google.com/search?q=${encodeURIComponent(query)}`)
     return { success: true }
   } catch (err) { return { success: false, error: err.message } }
+})
+
+// ── HuggingFace model downloader (bypasses renderer CORS/firewall) ────────────
+// Downloads HF files via Node.js, caches to disk, returns base64 to renderer.
+// The renderer monkey-patches window.fetch so @xenova/transformers calls go here.
+ipcMain.handle('fetch-hf-file', async (event, url) => {
+  const cacheDir = path.join(app.getPath('userData'), 'hf-cache')
+  try { fs.mkdirSync(cacheDir, { recursive: true }) } catch {}
+
+  const cacheKey = url.replace(/https?:\/\//g, '').replace(/[^a-zA-Z0-9._-]/g, '_')
+  const cachePath = path.join(cacheDir, cacheKey)
+
+  if (fs.existsSync(cachePath)) {
+    try {
+      const data = fs.readFileSync(cachePath)
+      const ct = url.endsWith('.json') ? 'application/json' : 'application/octet-stream'
+      return { ok: true, base64: data.toString('base64'), contentType: ct }
+    } catch {}
+  }
+
+  return new Promise((resolve) => {
+    const download = (targetUrl, hops) => {
+      if (hops > 10) return resolve({ ok: false, error: 'Too many redirects' })
+      let parsed
+      try { parsed = new URL(targetUrl) } catch (e) { return resolve({ ok: false, error: `Bad URL: ${e.message}` }) }
+      const lib = parsed.protocol === 'https:' ? https : http
+      const req = lib.get(targetUrl, { headers: { 'User-Agent': 'transformers.js/2' }, timeout: 180000 }, (res) => {
+        if ([301, 302, 307, 308].includes(res.statusCode)) {
+          res.resume()
+          return download(res.headers.location, hops + 1)
+        }
+        if (res.statusCode !== 200) {
+          res.resume()
+          return resolve({ ok: false, error: `HTTP ${res.statusCode}` })
+        }
+        const chunks = []
+        res.on('data', c => chunks.push(c))
+        res.on('end', () => {
+          const buf = Buffer.concat(chunks)
+          try { fs.writeFileSync(cachePath, buf) } catch {}
+          const ct = res.headers['content-type'] || (targetUrl.endsWith('.json') ? 'application/json' : 'application/octet-stream')
+          resolve({ ok: true, base64: buf.toString('base64'), contentType: ct })
+        })
+        res.on('error', err => resolve({ ok: false, error: err.message }))
+      })
+      req.on('error', err => resolve({ ok: false, error: err.message }))
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'Request timed out' }) })
+    }
+    download(url, 0)
+  })
 })

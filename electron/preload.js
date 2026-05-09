@@ -20,6 +20,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Spotify media controls
   spotifyControl: (params) => ipcRenderer.invoke('spotify-control', params),
 
+  // HuggingFace model download proxy (routes through Node.js to bypass CORS/firewall)
+  fetchHfFile: (url) => ipcRenderer.invoke('fetch-hf-file', url),
+
   // App launching
   openSpotify:  ()      => ipcRenderer.invoke('open-spotify'),
   openUrl:      (url)   => ipcRenderer.invoke('open-url', url),

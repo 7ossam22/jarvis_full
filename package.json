@@ -30,6 +30,7 @@
     "electron": "^28.3.3",
     "electron-builder": "^24.9.0",
     "vite": "^5.0.0",
+    "vite-plugin-static-copy": "^4.1.0",
     "wait-on": "^7.2.0"
   },
   "build": {
