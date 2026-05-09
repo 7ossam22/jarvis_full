@@ -8,7 +8,6 @@ const DEFAULTS = {
   elevenLabsKey: '',
   voiceId: 'onwK4e9ZLuTAKqWW03F9',
   ttsModel: 'eleven_turbo_v2_5',
-  micDeviceId: '',
 }
 
 function load() {
