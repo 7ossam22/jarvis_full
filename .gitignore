@@ -1,3 +1,4 @@
+# General
 node_modules/
 dist/
 release/
@@ -5,3 +6,19 @@ public/models/
 .env
 *.log
 .DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Obsidian
+.obsidian/workspace.json
+.obsidian/graph.json
+.obsidian/appearance.json
+.obsidian/plugins/obsidian-local-rest-api/data.json
