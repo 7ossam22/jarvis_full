@@ -85,6 +85,9 @@ async function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false,
+      // Explicitly allow camera + microphone in the renderer
+      allowRunningInsecureContent: false,
+      experimentalFeatures: true,
     },
     show: false,
     titleBarStyle: 'hidden',
@@ -104,12 +107,30 @@ async function createWindow() {
 }
 
 app.whenReady().then(() => {
-  const { session } = require('electron')
+  const { session, systemPreferences } = require('electron')
 
+  // 1. Sync check — Chromium calls this before asking the user; return true to pre-approve
+  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
+    const allowed = ['media', 'microphone', 'camera', 'audioCapture', 'videoCapture',
+                     'geolocation', 'notifications', 'mediaKeySystem', 'clipboard-read']
+    return allowed.includes(permission)
+  })
+
+  // 2. Async request — fires when a page actually requests a permission
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    const allowed = ['media', 'microphone', 'camera', 'audioCapture', 'videoCapture', 'geolocation', 'notifications']
+    const allowed = ['media', 'microphone', 'camera', 'audioCapture', 'videoCapture',
+                     'geolocation', 'notifications', 'mediaKeySystem', 'clipboard-read']
     callback(allowed.includes(permission))
   })
+
+  // 3. Device-level access — required for getUserMedia (camera / microphone) in Electron 20+
+  session.defaultSession.setDevicePermissionHandler(() => true)
+
+  // macOS: request OS-level mic + camera entitlements (no-op on Windows/Linux)
+  if (process.platform === 'darwin') {
+    systemPreferences.askForMediaAccess('microphone').catch(() => {})
+    systemPreferences.askForMediaAccess('camera').catch(() => {})
+  }
 
   createWindow()
   app.on('activate', () => {
