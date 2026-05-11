@@ -333,6 +333,27 @@ ipcMain.handle('open-spotify', async () => {
   return { success: false, error: 'Spotify not found.' }
 })
 
+ipcMain.handle('close-spotify', async () => {
+  const platform = os.platform()
+  const tryExec = (cmd) => new Promise(r => exec(cmd, { timeout: 5000 }, err => r(!err)))
+
+  if (platform === 'linux') {
+    if (await tryExec('pkill -x spotify')) return { success: true }
+    if (await tryExec('pkill -f spotify')) return { success: true }
+    if (await tryExec('pkill -f "flatpak run com.spotify.Client"')) return { success: true }
+    return { success: false, error: 'Spotify process not found' }
+  }
+  if (platform === 'win32') {
+    const ok = await tryExec('taskkill /F /IM Spotify.exe')
+    return { success: ok }
+  }
+  if (platform === 'darwin') {
+    const ok = await tryExec('osascript -e \'tell application "Spotify" to quit\'')
+    return { success: ok }
+  }
+  return { success: false, error: 'Unsupported platform' }
+})
+
 ipcMain.handle('open-url', async (event, url) => {
   try { await shell.openExternal(url); return { success: true } }
   catch (err) { return { success: false, error: err.message } }

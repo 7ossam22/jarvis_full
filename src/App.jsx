@@ -7,11 +7,11 @@ import InputBar from './components/InputBar'
 import Conversation from './components/Conversation'
 import SystemStats from './components/SystemStats'
 import Weather from './components/Weather'
-import Camera from './components/Camera'
-import SystemUptime from './components/SystemUptime'
-import SpotifyControls from './components/SpotifyControls'
+import CameraOverlay from './components/Camera'
 import { callAI, PROVIDERS } from './services/aiService'
 import { speak } from './services/ttsService'
+import { logger } from './services/logger'
+import LogViewer from './components/LogViewer'
 import { SettingsProvider, useSettings } from './context/SettingsContext'
 import SettingsModal from './components/SettingsModal'
 
@@ -35,6 +35,7 @@ function AppInner() {
   const [isProcessing, setIsProcessing] = useState(false)
   const [cameraActive, setCameraActive] = useState(false)
   const [provider, setProvider] = useState(PROVIDERS.LOCAL)
+  const [logsVisible, setLogsVisible] = useState(false)
 
   const isProcessingRef = useRef(false)
   const conversationHistoryRef = useRef([])
@@ -52,18 +53,22 @@ function AppInner() {
   }, [])
 
   const queryAI = useCallback(async (userMessage) => {
+    logger.info('AI', `Sending to AI: ${userMessage.slice(0, 80)}`)
     conversationHistoryRef.current.push({ role: 'user', content: userMessage })
     try {
       const reply = await callAI(conversationHistoryRef.current, providerRef.current, settingsRef.current)
       conversationHistoryRef.current.push({ role: 'assistant', content: reply })
+      logger.info('AI', `AI replied: ${reply.slice(0, 80)}`)
       return reply
     } catch (err) {
       conversationHistoryRef.current.pop()
+      logger.error('AI', `AI error: ${err.message}`)
       return `I encountered an error, Sir: ${err.message}`
     }
   }, [])
 
   const handleCommand = useCallback(async (command) => {
+    logger.info('CMD', `Received command: "${command}"`)
     const cmd = command.toLowerCase().trim()
 
     const spotifyCmd = async (action, reply) => {
@@ -77,7 +82,7 @@ function AppInner() {
       return spotifyCmd('previous', "Previous track, Sir.")
     if (cmd.match(/\b(pause|pause music|pause song|stop music|stop playing)\b/))
       return spotifyCmd('play-pause', "Pausing, Sir.")
-    if (cmd.match(/\b(resume|resume music|play music|unpause)\b/))
+    if (cmd.match(/\b(resume|resume music|unpause)\b/))
       return spotifyCmd('play-pause', "Resuming playback, Sir.")
     if (cmd.match(/\b(volume up|louder|increase volume|turn it up|turn up)\b/))
       return spotifyCmd('volume-up', "Volume up, Sir.")
@@ -85,6 +90,23 @@ function AppInner() {
       return spotifyCmd('volume-down', "Volume down, Sir.")
     if (cmd.match(/\b(mute|silence music|mute music)\b/))
       return spotifyCmd('mute', "Muted, Sir.")
+
+    // "play music" / "play some music" / "play a song" — sends play-pause if spotify is open, or opens Spotify
+    if (cmd.match(/\b(play music|play some music|play a song|play something|start music|start playing)\b/)) {
+      if (window.electronAPI?.spotifyControl) {
+        await window.electronAPI.spotifyControl({ action: 'play-pause' })
+      }
+      return "Playing music, Sir."
+    }
+
+    // "close spotify" / "quit spotify" / "exit spotify" / "kill spotify"
+    if (cmd.match(/\b(close spotify|quit spotify|exit spotify|kill spotify|stop spotify|shut down spotify|close music app)\b/)) {
+      if (window.electronAPI?.closeSpotify) {
+        const result = await window.electronAPI.closeSpotify()
+        return result.success ? "Spotify closed, Sir." : "Unable to close Spotify, Sir."
+      }
+      return "Spotify close is only available in the desktop app, Sir."
+    }
 
     if (cmd.includes('open spotify') || cmd.includes('play spotify') || cmd.includes('launch spotify')) {
       if (window.electronAPI) {
@@ -105,11 +127,11 @@ function AppInner() {
       }
     }
 
-    if (cmd.match(/turn on camera|enable camera|activate camera/)) {
+    if (cmd.match(/\b(open camera|look at me|what is this|watch me|show camera|turn on camera|enable camera|activate camera|camera on|start camera)\b/)) {
       setCameraActive(true)
       return "Camera activated, Sir. Visual feed is now online."
     }
-    if (cmd.match(/turn off camera|disable camera|deactivate camera/)) {
+    if (cmd.match(/\b(close camera|stop looking|am done|i('m| am) done|done|dismiss camera|turn off camera|disable camera|deactivate camera|camera off)\b/)) {
       setCameraActive(false)
       return "Camera deactivated, Sir."
     }
@@ -146,6 +168,15 @@ function AppInner() {
     if (cmd.match(/system status|status/))
       return `All systems nominal, Sir. Currently routing through ${providerRef.current === PROVIDERS.CLAUDE ? 'Claude AI' : 'your local model'}.`
 
+    if (cmd.match(/\b(show logs|open logs|show debug|debug mode|show log viewer|display logs)\b/)) {
+      setLogsVisible(true)
+      return "Debug log viewer opened, Sir."
+    }
+    if (cmd.match(/\b(hide logs|close logs|hide debug|close debug|dismiss logs)\b/)) {
+      setLogsVisible(false)
+      return "Log viewer closed, Sir."
+    }
+
     return await queryAI(command)
   }, [queryAI, handleProviderChange])
 
@@ -159,12 +190,14 @@ function AppInner() {
     setIsProcessing(true)
 
     try {
+      logger.debug('INPUT', `Processing message: "${trimmed}"`)
       const reply = await handleCommand(trimmed)
       setMessages(prev => [...prev, { id: makeId(), role: 'assistant', content: reply, timestamp: Date.now() }])
       speak(reply, settingsRef.current)
     } finally {
       isProcessingRef.current = false
       setIsProcessing(false)
+      logger.debug('INPUT', 'Message processing complete')
     }
   }, [handleCommand])
 
@@ -181,9 +214,6 @@ function AppInner() {
         <div className="left-sidebar">
           <SystemStats />
           <Weather />
-          <SpotifyControls />
-          <Camera active={cameraActive} onToggle={() => setCameraActive(v => !v)} />
-          <SystemUptime />
         </div>
 
         <div className="center-column">
@@ -203,6 +233,8 @@ function AppInner() {
           <Conversation messages={messages} isProcessing={isProcessing} />
         </div>
       </div>
+      <CameraOverlay active={cameraActive} onClose={() => setCameraActive(false)} />
+      <LogViewer visible={logsVisible} onClose={() => setLogsVisible(false)} />
     </div>
   )
 }

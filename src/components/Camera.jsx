@@ -1,6 +1,6 @@
 import React, { useRef, useEffect } from 'react'
 
-export default function Camera({ active, onToggle }) {
+export default function CameraOverlay({ active, onClose }) {
   const videoRef = useRef(null)
   const streamRef = useRef(null)
 
@@ -16,7 +16,7 @@ export default function Camera({ active, onToggle }) {
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 360 }, facingMode: 'user' },
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
         audio: false,
       })
       streamRef.current = stream
@@ -38,43 +38,24 @@ export default function Camera({ active, onToggle }) {
     }
   }
 
+  if (!active) return null
+
   return (
-    <div className="camera-panel panel">
-      <div className="panel-header">
-        <span className="panel-title">Camera Feed</span>
-        <span className="panel-indicator" style={{ background: active ? '#ff4444' : 'var(--cyan-primary)', boxShadow: `0 0 8px ${active ? '#ff4444' : 'var(--cyan-primary)'}` }} />
-      </div>
-
-      <div className="camera-content">
-        <div className="camera-feed">
-          {active ? (
-            <>
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '7px' }}
-              />
-              <div className="camera-active-badge">
-                <div className="camera-live-dot" />
-                <span className="camera-live-text">LIVE</span>
-              </div>
-            </>
-          ) : (
-            <div className="camera-offline">
-              <div className="camera-offline-icon">📷</div>
-              <div className="camera-offline-text">CAMERA OFFLINE</div>
-            </div>
-          )}
+    <div className="camera-fullscreen-overlay">
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        className="camera-fullscreen-video"
+      />
+      <div className="camera-vignette" />
+      <div className="camera-overlay-ui">
+        <div className="camera-live-indicator">
+          <div className="camera-live-dot" />
+          <span className="camera-live-text">LIVE FEED</span>
         </div>
-
-        <button
-          className={`camera-toggle-btn ${active ? 'active' : ''}`}
-          onClick={onToggle}
-        >
-          {active ? '⬛ DISABLE CAMERA' : '▶ ENABLE CAMERA'}
-        </button>
+        <div className="camera-close-hint">SAY "CLOSE CAMERA" OR "I'M DONE" TO DISMISS</div>
       </div>
     </div>
   )

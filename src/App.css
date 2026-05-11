@@ -906,114 +906,78 @@
   color: var(--text-primary);
 }
 
-/* ============================================================
-   CAMERA PANEL
-   ============================================================ */
-.camera-panel {
-  flex: 1;
-  min-height: 0;
-}
-
-.camera-content {
-  padding: 10px;
-  height: calc(100% - 37px);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.camera-feed {
-  flex: 1;
-  min-height: 0;
-  background: rgba(0, 0, 0, 0.5);
-  border: 1px solid rgba(0, 212, 255, 0.1);
-  border-radius: 8px;
-  overflow: hidden;
-  position: relative;
+/* ── Camera Fullscreen Overlay ─────────────────────────────────────────────── */
+.camera-fullscreen-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: #000;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.camera-feed video {
+.camera-fullscreen-video {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  border-radius: 7px;
 }
 
-.camera-offline {
+.camera-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse at center,
+    transparent 40%,
+    rgba(0, 0, 0, 0.45) 65%,
+    rgba(0, 0, 0, 0.85) 85%,
+    rgba(0, 212, 255, 0.15) 100%
+  );
+  box-shadow: inset 0 0 120px rgba(0, 212, 255, 0.12);
+}
+
+.camera-overlay-ui {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  color: var(--text-muted);
+  justify-content: space-between;
+  padding: 32px;
 }
 
-.camera-offline-icon {
-  font-size: 28px;
-  opacity: 0.5;
-}
-
-.camera-offline-text {
-  font-family: 'Share Tech Mono', monospace;
-  font-size: 9px;
-  letter-spacing: 1px;
-  color: var(--text-muted);
-}
-
-.camera-active-badge {
-  position: absolute;
-  top: 8px;
-  left: 8px;
+.camera-live-indicator {
   display: flex;
   align-items: center;
-  gap: 5px;
-  background: rgba(0, 0, 0, 0.7);
-  border: 1px solid rgba(255, 68, 68, 0.5);
-  border-radius: 4px;
-  padding: 3px 8px;
+  gap: 8px;
+  align-self: flex-start;
 }
 
 .camera-live-dot {
-  width: 5px;
-  height: 5px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
-  background: var(--danger);
-  box-shadow: 0 0 6px var(--danger);
+  background: #ff4444;
+  box-shadow: 0 0 10px #ff4444;
   animation: blink 1s ease-in-out infinite;
 }
 
 .camera-live-text {
   font-family: 'Share Tech Mono', monospace;
-  font-size: 8px;
-  color: var(--danger);
-  letter-spacing: 1px;
+  font-size: 13px;
+  color: #ff4444;
+  letter-spacing: 2px;
+  text-shadow: 0 0 8px rgba(255, 68, 68, 0.8);
 }
 
-.camera-toggle-btn {
-  height: 28px;
-  border-radius: 6px;
-  background: rgba(0, 212, 255, 0.08);
-  border: 1px solid rgba(0, 212, 255, 0.2);
-  color: var(--cyan-primary);
+.camera-close-hint {
   font-family: 'Share Tech Mono', monospace;
-  font-size: 9px;
+  font-size: 11px;
+  color: rgba(0, 212, 255, 0.5);
   letter-spacing: 1.5px;
-  transition: all 0.2s ease;
-}
-
-.camera-toggle-btn:hover {
-  background: rgba(0, 212, 255, 0.15);
-  border-color: rgba(0, 212, 255, 0.4);
-  box-shadow: 0 0 10px rgba(0, 212, 255, 0.2);
-}
-
-.camera-toggle-btn.active {
-  background: rgba(255, 68, 68, 0.1);
-  border-color: rgba(255, 68, 68, 0.3);
-  color: var(--danger);
+  text-align: center;
+  align-self: center;
 }
 
 /* ============================================================

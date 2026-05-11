@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // App launching
   openSpotify:  ()      => ipcRenderer.invoke('open-spotify'),
+  closeSpotify: ()      => ipcRenderer.invoke('close-spotify'),
   openUrl:      (url)   => ipcRenderer.invoke('open-url', url),
   googleSearch: (query) => ipcRenderer.invoke('google-search', query),
 })
