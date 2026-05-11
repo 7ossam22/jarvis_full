@@ -1,146 +1,198 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react'
 import { motion } from 'framer-motion'
 import { logger } from '../services/logger'
+import { loadWhisper, transcribeFloat32, blobToFloat32 } from '../services/whisperService'
 
-const hasSpeechAPI = !!(window.SpeechRecognition || window.webkitSpeechRecognition)
-const MAX_NETWORK_RETRIES = 5
+// Silence detection thresholds
+const VOLUME_THRESHOLD = 12       // 0–255 scale; below = silence
+const SPEECH_MIN_MS    = 400      // ignore blips shorter than this
+const SILENCE_AFTER_MS = 1400     // stop recording after this much silence post-speech
 
 export default function InputBar({ value, onChange, onSend, isProcessing }) {
-  const inputRef = useRef(null)
-  const recognitionRef = useRef(null)
-  const shouldListenRef = useRef(true)
-  const restartTimerRef = useRef(null)
   const isProcessingRef = useRef(isProcessing)
-  const onSendRef = useRef(onSend)
-  const onChangeRef = useRef(onChange)
-  const networkErrorCountRef = useRef(0)
-
-  const [isListening, setIsListening] = useState(false)
-  const [muted, setMuted] = useState(false)
-  const [networkFailed, setNetworkFailed] = useState(false)
-
+  const onSendRef       = useRef(onSend)
+  const onChangeRef     = useRef(onChange)
   useEffect(() => { isProcessingRef.current = isProcessing }, [isProcessing])
-  useEffect(() => { onSendRef.current = onSend }, [onSend])
-  useEffect(() => { onChangeRef.current = onChange }, [onChange])
+  useEffect(() => { onSendRef.current = onSend },             [onSend])
+  useEffect(() => { onChangeRef.current = onChange },         [onChange])
 
-  const startRecognition = useCallback(() => {
-    if (!hasSpeechAPI || recognitionRef.current) return
+  const [micStatus, setMicStatus]       = useState('loading') // loading|ready|listening|processing|muted|error
+  const [muted, setMuted]               = useState(false)
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
-    const rec = new SpeechRecognition()
-    rec.continuous = true
-    rec.interimResults = false
-    rec.lang = 'en-US'
-    rec.maxAlternatives = 1
+  const streamRef        = useRef(null)
+  const audioCtxRef      = useRef(null)
+  const analyserRef      = useRef(null)
+  const recorderRef      = useRef(null)
+  const chunksRef        = useRef([])
+  const rafRef           = useRef(null)
+  const silenceTimerRef  = useRef(null)
+  const speechStartRef   = useRef(null)
+  const isTranscribingRef = useRef(false)
+  const mutedRef         = useRef(false)
 
-    rec.onstart = () => {
-      networkErrorCountRef.current = 0
-      setIsListening(true)
-      setNetworkFailed(false)
-      logger.info('VOICE', 'Recognition started')
-    }
-
-    rec.onresult = (e) => {
-      networkErrorCountRef.current = 0
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) {
-          const transcript = e.results[i][0].transcript.trim()
-          if (!transcript) continue
-          logger.info('VOICE', `Heard: "${transcript}"`, { processing: isProcessingRef.current })
-          if (isProcessingRef.current) {
-            logger.warn('VOICE', 'Command dropped — still processing previous')
-          } else {
-            onChangeRef.current(transcript)
-            onSendRef.current(transcript)
-          }
-        }
-      }
-    }
-
-    rec.onerror = (e) => {
-      if (e.error === 'no-speech' || e.error === 'audio-capture') return
-
-      if (e.error === 'network') {
-        networkErrorCountRef.current++
-        logger.warn('VOICE', `Network error #${networkErrorCountRef.current} — speech API cannot reach Google servers`)
-        if (networkErrorCountRef.current >= MAX_NETWORK_RETRIES) {
-          shouldListenRef.current = false
-          setNetworkFailed(true)
-          setIsListening(false)
-          logger.error('VOICE', 'Too many network errors — stopping recognition. Check internet connection or use text input.')
-        }
+  // ── Transcribe a finished recording ──────────────────────────────────────────
+  const handleRecordingReady = useCallback(async (blob) => {
+    if (!blob.size || isTranscribingRef.current) return
+    isTranscribingRef.current = true
+    setMicStatus('processing')
+    try {
+      const float32 = await blobToFloat32(blob)
+      // Discard near-silent recordings (e.g. background noise blips)
+      const rms = Math.sqrt(float32.reduce((s, v) => s + v * v, 0) / float32.length)
+      if (rms < 0.01) {
+        logger.debug('WHISPER', 'Skipping silent segment')
         return
       }
-
-      logger.warn('VOICE', `Recognition error: ${e.error}`)
-      recognitionRef.current = null
-      setIsListening(false)
-    }
-
-    rec.onend = () => {
-      recognitionRef.current = null
-      setIsListening(false)
-
-      if (!shouldListenRef.current) return
-
-      // Exponential backoff for network errors: 1s, 2s, 4s, 8s, 16s
-      const delay = networkErrorCountRef.current > 0
-        ? Math.min(1000 * Math.pow(2, networkErrorCountRef.current - 1), 16000)
-        : 500
-
-      if (networkErrorCountRef.current > 0) {
-        logger.debug('VOICE', `Backoff restart in ${delay}ms (network errors: ${networkErrorCountRef.current})`)
+      const text = await transcribeFloat32(float32)
+      if (text && !isProcessingRef.current) {
+        onChangeRef.current(text)
+        onSendRef.current(text)
+      } else if (text && isProcessingRef.current) {
+        logger.warn('WHISPER', 'Command dropped — still processing previous')
       }
-
-      restartTimerRef.current = setTimeout(startRecognition, delay)
-    }
-
-    try {
-      rec.start()
-      recognitionRef.current = rec
     } catch (err) {
-      logger.error('VOICE', `Failed to start: ${err.message}`)
-      recognitionRef.current = null
+      logger.error('WHISPER', `Transcription failed: ${err.message}`)
+    } finally {
+      isTranscribingRef.current = false
+      if (!mutedRef.current) setMicStatus('listening')
     }
   }, [])
 
-  useEffect(() => {
-    if (hasSpeechAPI) {
-      shouldListenRef.current = true
-      startRecognition()
-    } else {
-      logger.warn('VOICE', 'Web Speech API not available')
+  // ── Start a fresh MediaRecorder segment ──────────────────────────────────────
+  const startSegment = useCallback(() => {
+    if (!streamRef.current) return
+    chunksRef.current = []
+    const rec = new MediaRecorder(streamRef.current)
+    rec.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data) }
+    rec.onstop = () => {
+      const blob = new Blob(chunksRef.current, { type: rec.mimeType })
+      handleRecordingReady(blob)
     }
-    return () => {
-      shouldListenRef.current = false
-      clearTimeout(restartTimerRef.current)
-      if (recognitionRef.current) {
-        try { recognitionRef.current.stop() } catch {}
-        recognitionRef.current = null
-      }
-    }
-  }, [startRecognition])
+    rec.start()
+    recorderRef.current = rec
+  }, [handleRecordingReady])
 
-  const toggleMic = useCallback(() => {
-    if (muted || networkFailed) {
-      setMuted(false)
-      setNetworkFailed(false)
-      networkErrorCountRef.current = 0
-      shouldListenRef.current = true
-      startRecognition()
-      logger.info('VOICE', 'Mic re-enabled manually')
-    } else {
-      setMuted(true)
-      shouldListenRef.current = false
-      clearTimeout(restartTimerRef.current)
-      if (recognitionRef.current) {
-        try { recognitionRef.current.stop() } catch {}
-        recognitionRef.current = null
-      }
-      setIsListening(false)
-      logger.info('VOICE', 'Mic muted')
+  const stopSegment = useCallback(() => {
+    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+      recorderRef.current.stop()
+      recorderRef.current = null
     }
-  }, [muted, networkFailed, startRecognition])
+  }, [])
+
+  // ── Silence detection loop (requestAnimationFrame) ────────────────────────────
+  const startSilenceLoop = useCallback(() => {
+    const analyser = analyserRef.current
+    if (!analyser) return
+    const data = new Uint8Array(analyser.frequencyBinCount)
+    let speaking = false
+
+    const tick = () => {
+      if (mutedRef.current) { rafRef.current = null; return }
+      analyser.getByteFrequencyData(data)
+      const vol = data.reduce((a, b) => a + b, 0) / data.length
+
+      if (vol > VOLUME_THRESHOLD) {
+        // ── speech detected ──────────────────────────────────────────────────
+        clearTimeout(silenceTimerRef.current)
+        silenceTimerRef.current = null
+        if (!speaking) {
+          speaking = true
+          speechStartRef.current = Date.now()
+          logger.debug('VOICE', `Speech started (vol=${vol.toFixed(1)})`)
+          startSegment()
+        }
+      } else if (speaking) {
+        // ── silence after speech ─────────────────────────────────────────────
+        if (!silenceTimerRef.current) {
+          silenceTimerRef.current = setTimeout(() => {
+            const duration = Date.now() - (speechStartRef.current || 0)
+            speaking = false
+            silenceTimerRef.current = null
+            if (duration >= SPEECH_MIN_MS) {
+              logger.debug('VOICE', `Silence detected after ${duration}ms — sending for transcription`)
+              stopSegment()
+            } else {
+              logger.debug('VOICE', `Ignoring short blip (${duration}ms)`)
+              stopSegment()
+            }
+            startSegment() // ready for next phrase
+          }, SILENCE_AFTER_MS)
+        }
+      }
+
+      rafRef.current = requestAnimationFrame(tick)
+    }
+
+    rafRef.current = requestAnimationFrame(tick)
+  }, [startSegment, stopSegment])
+
+  // ── Boot: load Whisper, open mic ──────────────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false
+
+    const init = async () => {
+      try {
+        await loadWhisper((status) => {
+          if (!cancelled) setMicStatus(status === 'ready' ? 'ready' : 'loading')
+        })
+        if (cancelled) return
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+        if (cancelled) { stream.getTracks().forEach(t => t.stop()); return }
+        streamRef.current = stream
+
+        const ctx = new AudioContext()
+        audioCtxRef.current = ctx
+        const analyser = ctx.createAnalyser()
+        analyser.fftSize = 1024
+        analyserRef.current = analyser
+        ctx.createMediaStreamSource(stream).connect(analyser)
+
+        logger.info('VOICE', 'Mic open — starting silence detection')
+        setMicStatus('listening')
+        startSegment()
+        startSilenceLoop()
+      } catch (err) {
+        if (!cancelled) {
+          logger.error('VOICE', `Init failed: ${err.message}`)
+          setMicStatus('error')
+        }
+      }
+    }
+
+    init()
+
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(rafRef.current)
+      clearTimeout(silenceTimerRef.current)
+      stopSegment()
+      streamRef.current?.getTracks().forEach(t => t.stop())
+      audioCtxRef.current?.close()
+      streamRef.current = null
+      audioCtxRef.current = null
+      analyserRef.current = null
+    }
+  }, [startSilenceLoop, startSegment, stopSegment])
+
+  // ── Mute toggle ───────────────────────────────────────────────────────────────
+  const toggleMic = useCallback(() => {
+    const nowMuted = !mutedRef.current
+    mutedRef.current = nowMuted
+    setMuted(nowMuted)
+    if (nowMuted) {
+      cancelAnimationFrame(rafRef.current)
+      clearTimeout(silenceTimerRef.current)
+      stopSegment()
+      setMicStatus('muted')
+      logger.info('VOICE', 'Mic muted')
+    } else {
+      setMicStatus('listening')
+      startSegment()
+      startSilenceLoop()
+      logger.info('VOICE', 'Mic unmuted')
+    }
+  }, [startSegment, startSilenceLoop, stopSegment])
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -149,60 +201,54 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
     }
   }
 
-  const micIcon = networkFailed
-    ? '⚠️'
-    : muted
-      ? '🔇'
-      : isListening
-        ? (
-          <motion.span
-            animate={{ scale: [1, 1.25, 1] }}
-            transition={{ duration: 0.7, repeat: Infinity }}
-            style={{ display: 'inline-block' }}
-          >
-            🎙
-          </motion.span>
-        )
-        : '🎤'
+  // ── Status-dependent UI ───────────────────────────────────────────────────────
+  const STATUS = {
+    loading:    { icon: '⏳', label: 'Loading Whisper model...', color: 'rgba(0,212,255,0.45)' },
+    ready:      { icon: '🎤', label: 'Initializing mic...',       color: 'rgba(0,212,255,0.45)' },
+    listening:  { icon: '🎙', label: 'Listening... speak anytime', color: '#00d4ff',              pulse: true },
+    processing: { icon: '⟳', label: 'Transcribing...',            color: '#ffaa00',              spin: true  },
+    muted:      { icon: '🔇', label: 'Mic muted — click to unmute', color: 'rgba(0,212,255,0.3)' },
+    error:      { icon: '⚠️', label: 'Mic error — check permissions', color: '#ff4444'            },
+  }
 
-  const micTitle = networkFailed
-    ? 'Speech API network error — click to retry'
-    : muted
-      ? 'Mic muted — click to unmute'
-      : isListening
-        ? 'Listening — click to mute'
-        : 'Starting mic...'
-
-  const placeholder = networkFailed
-    ? 'Speech unavailable (network error) — type here or click ⚠️ to retry'
-    : muted
-      ? 'Mic muted — click 🔇 to unmute'
-      : isListening
-        ? 'Listening... speak anytime'
-        : 'Ask JARVIS anything...'
+  const s = STATUS[micStatus] || STATUS.ready
 
   return (
     <div style={{ width: '100%', maxWidth: '680px' }}>
-      <div className={`input-bar${isListening && !muted && !networkFailed ? ' input-bar--listening' : ''}`}>
-        {hasSpeechAPI && (
-          <button
-            className={`mic-btn${isListening && !muted && !networkFailed ? ' active' : ''}`}
-            onClick={toggleMic}
-            title={micTitle}
-            style={networkFailed ? { color: '#ffaa00' } : {}}
-          >
-            {micIcon}
-          </button>
-        )}
+      <div className={`input-bar${micStatus === 'listening' ? ' input-bar--listening' : ''}`}>
+        <button
+          className={`mic-btn${micStatus === 'listening' ? ' active' : ''}`}
+          onClick={toggleMic}
+          disabled={micStatus === 'loading' || micStatus === 'error'}
+          title={s.label}
+          style={{ color: s.color }}
+        >
+          {s.pulse ? (
+            <motion.span
+              animate={{ scale: [1, 1.25, 1] }}
+              transition={{ duration: 0.7, repeat: Infinity }}
+              style={{ display: 'inline-block' }}
+            >
+              {s.icon}
+            </motion.span>
+          ) : s.spin ? (
+            <motion.span
+              animate={{ rotate: 360 }}
+              transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
+              style={{ display: 'inline-block' }}
+            >
+              ⟳
+            </motion.span>
+          ) : s.icon}
+        </button>
 
         <input
-          ref={inputRef}
           className="input-field"
           type="text"
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={placeholder}
+          placeholder={s.label}
           disabled={isProcessing}
         />
 
@@ -224,15 +270,9 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
         </button>
       </div>
 
-      {networkFailed && (
-        <div style={{ textAlign: 'center', marginTop: 6, fontSize: 10, color: '#ffaa00', fontFamily: "'Share Tech Mono', monospace", letterSpacing: 1 }}>
-          SPEECH API NETWORK ERROR — CHECK INTERNET · SAY "SHOW LOGS" OR CLICK ⚠️ TO RETRY
-        </div>
-      )}
-
-      {!hasSpeechAPI && (
-        <div style={{ textAlign: 'center', marginTop: 6, fontSize: 10, color: 'rgba(255,100,100,0.6)', fontFamily: "'Share Tech Mono', monospace", letterSpacing: 1 }}>
-          SPEECH API UNAVAILABLE — TYPE COMMANDS MANUALLY
+      {micStatus === 'loading' && (
+        <div style={{ textAlign: 'center', marginTop: 6, fontSize: 10, color: 'rgba(0,212,255,0.4)', fontFamily: "'Share Tech Mono', monospace", letterSpacing: 1 }}>
+          LOADING LOCAL WHISPER MODEL — ONE-TIME STARTUP DELAY
         </div>
       )}
     </div>

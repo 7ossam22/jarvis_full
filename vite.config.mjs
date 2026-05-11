@@ -16,11 +16,22 @@ export default defineConfig({
     outDir: 'dist',
     assetsDir: 'assets',
     emptyOutDir: true,
+    target: 'esnext',
   },
   server: {
     host: '0.0.0.0',
     port: webMode ? 5174 : 5173,
     strictPort: true,
     https: webMode || undefined,
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
+  optimizeDeps: {
+    exclude: ['@xenova/transformers'],
+  },
+  worker: {
+    format: 'es',
   },
 })
