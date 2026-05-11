@@ -3,6 +3,7 @@ import { motion } from 'framer-motion'
 import { logger } from '../services/logger'
 
 const hasSpeechAPI = !!(window.SpeechRecognition || window.webkitSpeechRecognition)
+const MAX_NETWORK_RETRIES = 5
 
 export default function InputBar({ value, onChange, onSend, isProcessing }) {
   const inputRef = useRef(null)
@@ -12,8 +13,11 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
   const isProcessingRef = useRef(isProcessing)
   const onSendRef = useRef(onSend)
   const onChangeRef = useRef(onChange)
+  const networkErrorCountRef = useRef(0)
+
   const [isListening, setIsListening] = useState(false)
   const [muted, setMuted] = useState(false)
+  const [networkFailed, setNetworkFailed] = useState(false)
 
   useEffect(() => { isProcessingRef.current = isProcessing }, [isProcessing])
   useEffect(() => { onSendRef.current = onSend }, [onSend])
@@ -30,18 +34,21 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
     rec.maxAlternatives = 1
 
     rec.onstart = () => {
+      networkErrorCountRef.current = 0
       setIsListening(true)
-      logger.info('VOICE', 'Recognition started — listening continuously')
+      setNetworkFailed(false)
+      logger.info('VOICE', 'Recognition started')
     }
 
     rec.onresult = (e) => {
+      networkErrorCountRef.current = 0
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (e.results[i].isFinal) {
           const transcript = e.results[i][0].transcript.trim()
           if (!transcript) continue
           logger.info('VOICE', `Heard: "${transcript}"`, { processing: isProcessingRef.current })
           if (isProcessingRef.current) {
-            logger.warn('VOICE', 'Command dropped — still processing previous command')
+            logger.warn('VOICE', 'Command dropped — still processing previous')
           } else {
             onChangeRef.current(transcript)
             onSendRef.current(transcript)
@@ -51,9 +58,21 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
     }
 
     rec.onerror = (e) => {
-      logger.warn('VOICE', `Recognition error: ${e.error}`)
-      // no-speech and audio-capture are non-fatal — recognition continues
       if (e.error === 'no-speech' || e.error === 'audio-capture') return
+
+      if (e.error === 'network') {
+        networkErrorCountRef.current++
+        logger.warn('VOICE', `Network error #${networkErrorCountRef.current} — speech API cannot reach Google servers`)
+        if (networkErrorCountRef.current >= MAX_NETWORK_RETRIES) {
+          shouldListenRef.current = false
+          setNetworkFailed(true)
+          setIsListening(false)
+          logger.error('VOICE', 'Too many network errors — stopping recognition. Check internet connection or use text input.')
+        }
+        return
+      }
+
+      logger.warn('VOICE', `Recognition error: ${e.error}`)
       recognitionRef.current = null
       setIsListening(false)
     }
@@ -61,30 +80,36 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
     rec.onend = () => {
       recognitionRef.current = null
       setIsListening(false)
-      if (shouldListenRef.current) {
-        logger.debug('VOICE', 'Recognition ended unexpectedly — restarting in 500ms')
-        restartTimerRef.current = setTimeout(startRecognition, 500)
+
+      if (!shouldListenRef.current) return
+
+      // Exponential backoff for network errors: 1s, 2s, 4s, 8s, 16s
+      const delay = networkErrorCountRef.current > 0
+        ? Math.min(1000 * Math.pow(2, networkErrorCountRef.current - 1), 16000)
+        : 500
+
+      if (networkErrorCountRef.current > 0) {
+        logger.debug('VOICE', `Backoff restart in ${delay}ms (network errors: ${networkErrorCountRef.current})`)
       }
+
+      restartTimerRef.current = setTimeout(startRecognition, delay)
     }
 
     try {
       rec.start()
       recognitionRef.current = rec
-      logger.debug('VOICE', 'Recognition instance started')
     } catch (err) {
-      logger.error('VOICE', `Failed to start recognition: ${err.message}`)
+      logger.error('VOICE', `Failed to start: ${err.message}`)
       recognitionRef.current = null
     }
   }, [])
 
-  // Auto-start on mount, auto-cleanup on unmount
   useEffect(() => {
     if (hasSpeechAPI) {
-      logger.info('VOICE', 'InputBar mounted — starting continuous recognition')
       shouldListenRef.current = true
       startRecognition()
     } else {
-      logger.warn('VOICE', 'Web Speech API not available in this environment')
+      logger.warn('VOICE', 'Web Speech API not available')
     }
     return () => {
       shouldListenRef.current = false
@@ -97,11 +122,13 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
   }, [startRecognition])
 
   const toggleMic = useCallback(() => {
-    if (muted) {
+    if (muted || networkFailed) {
       setMuted(false)
+      setNetworkFailed(false)
+      networkErrorCountRef.current = 0
       shouldListenRef.current = true
       startRecognition()
-      logger.info('VOICE', 'Mic unmuted — resuming recognition')
+      logger.info('VOICE', 'Mic re-enabled manually')
     } else {
       setMuted(true)
       shouldListenRef.current = false
@@ -111,9 +138,9 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
         recognitionRef.current = null
       }
       setIsListening(false)
-      logger.info('VOICE', 'Mic muted — recognition paused')
+      logger.info('VOICE', 'Mic muted')
     }
-  }, [muted, startRecognition])
+  }, [muted, networkFailed, startRecognition])
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -122,28 +149,49 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
     }
   }
 
+  const micIcon = networkFailed
+    ? '⚠️'
+    : muted
+      ? '🔇'
+      : isListening
+        ? (
+          <motion.span
+            animate={{ scale: [1, 1.25, 1] }}
+            transition={{ duration: 0.7, repeat: Infinity }}
+            style={{ display: 'inline-block' }}
+          >
+            🎙
+          </motion.span>
+        )
+        : '🎤'
+
+  const micTitle = networkFailed
+    ? 'Speech API network error — click to retry'
+    : muted
+      ? 'Mic muted — click to unmute'
+      : isListening
+        ? 'Listening — click to mute'
+        : 'Starting mic...'
+
+  const placeholder = networkFailed
+    ? 'Speech unavailable (network error) — type here or click ⚠️ to retry'
+    : muted
+      ? 'Mic muted — click 🔇 to unmute'
+      : isListening
+        ? 'Listening... speak anytime'
+        : 'Ask JARVIS anything...'
+
   return (
     <div style={{ width: '100%', maxWidth: '680px' }}>
-      <div className={`input-bar${isListening && !muted ? ' input-bar--listening' : ''}`}>
+      <div className={`input-bar${isListening && !muted && !networkFailed ? ' input-bar--listening' : ''}`}>
         {hasSpeechAPI && (
           <button
-            className={`mic-btn${isListening && !muted ? ' active' : ''}`}
+            className={`mic-btn${isListening && !muted && !networkFailed ? ' active' : ''}`}
             onClick={toggleMic}
-            title={muted ? 'Mic muted — click to unmute' : isListening ? 'Always listening — click to mute' : 'Starting mic...'}
+            title={micTitle}
+            style={networkFailed ? { color: '#ffaa00' } : {}}
           >
-            {muted
-              ? '🔇'
-              : isListening
-                ? (
-                  <motion.span
-                    animate={{ scale: [1, 1.25, 1] }}
-                    transition={{ duration: 0.7, repeat: Infinity }}
-                    style={{ display: 'inline-block' }}
-                  >
-                    🎙
-                  </motion.span>
-                )
-                : '🎤'}
+            {micIcon}
           </button>
         )}
 
@@ -154,7 +202,7 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={muted ? 'Mic muted — click 🔇 to unmute' : isListening ? 'Listening... speak anytime' : 'Ask JARVIS anything...'}
+          placeholder={placeholder}
           disabled={isProcessing}
         />
 
@@ -175,6 +223,12 @@ export default function InputBar({ value, onChange, onSend, isProcessing }) {
           ) : '➤'}
         </button>
       </div>
+
+      {networkFailed && (
+        <div style={{ textAlign: 'center', marginTop: 6, fontSize: 10, color: '#ffaa00', fontFamily: "'Share Tech Mono', monospace", letterSpacing: 1 }}>
+          SPEECH API NETWORK ERROR — CHECK INTERNET · SAY "SHOW LOGS" OR CLICK ⚠️ TO RETRY
+        </div>
+      )}
 
       {!hasSpeechAPI && (
         <div style={{ textAlign: 'center', marginTop: 6, fontSize: 10, color: 'rgba(255,100,100,0.6)', fontFamily: "'Share Tech Mono', monospace", letterSpacing: 1 }}>
