@@ -53,6 +53,11 @@ Rules:
   those notes, in one witty sentence plus the key facts — never just recite the note back,
   it is already on their screen. If the notes don't cover it, say so plainly (with a touch
   of wit), don't invent facts.
+- When the question needs information the notes don't have and the notes wouldn't plausibly
+  cover it (current events, prices, weather, "what is X", anything time-sensitive or about
+  the outside world), use your web search tool rather than guessing or refusing. Search
+  first, then answer from what you found — briefly cite what kind of source it came from
+  ("according to their site", "recent reports say") without reading out full URLs.
 - When there are no relevant SOURCE NOTES for this turn (small talk, jokes, general chat),
   just be yourself — charming, brief, helpful. Do not pretend to consult notes that aren't
   there.
@@ -84,6 +89,11 @@ def load_config():
 def has_real_api_key(cfg):
     key = cfg.get("api_key", "")
     return bool(key) and "PUT-YOUR-KEY-HERE" not in key and key.strip() != ""
+
+
+def has_elevenlabs_key(cfg):
+    key = cfg.get("elevenlabs_api_key", "")
+    return bool(key) and "PUT-YOUR" not in key and key.strip() != ""
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +141,9 @@ def call_anthropic(cfg, system_prompt, messages):
         "max_tokens": 400,
         "system": system_prompt,
         "messages": messages,
+        # Server-side web search — Claude decides when to use it and the results
+        # come back merged into the response, no extra round trip needed here.
+        "tools": [{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}],
     }).encode("utf-8")
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -149,15 +162,45 @@ def call_anthropic(cfg, system_prompt, messages):
 
 def call_claude_cli(system_prompt, messages):
     # Fallback: shell out to the user's Claude Code subscription.
+    # --allowedTools WebSearch,WebFetch lets JARVIS look things up (and read the page,
+    # not just snippets) even without an API key — non-interactive mode can't prompt
+    # for tool permission, so both must be granted upfront.
     convo = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
     full_prompt = f"{system_prompt}\n\n{convo}\n\nASSISTANT:"
     result = subprocess.run(
-        ["claude", "-p", full_prompt],
-        capture_output=True, text=True, timeout=60,
+        ["claude", "-p", full_prompt, "--allowedTools", "WebSearch,WebFetch"],
+        capture_output=True, text=True, timeout=90,
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise RuntimeError(result.stderr or "claude CLI returned no output")
     return result.stdout.strip()
+
+
+DEFAULT_ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # "George" — warm British male
+
+
+def call_elevenlabs_tts(cfg, text):
+    """Returns (audio_bytes, content_type). Raises on any failure — caller falls
+    back to the browser's own speechSynthesis, so this is never a hard dependency."""
+    api_key = cfg["elevenlabs_api_key"]
+    voice_id = cfg.get("elevenlabs_voice_id") or DEFAULT_ELEVENLABS_VOICE_ID
+    payload = json.dumps({
+        "text": text,
+        "model_id": "eleven_turbo_v2_5",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+        data=payload,
+        method="POST",
+        headers={
+            "content-type": "application/json",
+            "xi-api-key": api_key,
+            "accept": "audio/mpeg",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read(), "audio/mpeg"
 
 
 def call_model(cfg, system_prompt, messages, fallback_text):
@@ -289,8 +332,37 @@ class JarvisHandler(BaseHTTPRequestHandler):
             self._handle_chat()
         elif self.path == "/remember":
             self._handle_remember()
+        elif self.path == "/speak":
+            self._handle_speak()
         else:
             self.send_error(404, "Not found")
+
+    def _handle_speak(self):
+        # Proxies ElevenLabs TTS so the API key never reaches the browser (and
+        # never reaches anyone else on the LAN this server is bound to).
+        body = self._read_json_body()
+        text = (body.get("text") or "").strip()
+        if not text:
+            self._send_json({"error": "empty text"}, status=400)
+            return
+
+        cfg = load_config()
+        if not has_elevenlabs_key(cfg):
+            self._send_json({"error": "no elevenlabs key configured"}, status=404)
+            return
+
+        try:
+            audio, content_type = call_elevenlabs_tts(cfg, text)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError) as e:
+            print(f"[jarvis] ElevenLabs TTS failed ({e})", file=sys.stderr)
+            self._send_json({"error": "tts failed"}, status=502)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(audio)))
+        self.end_headers()
+        self.wfile.write(audio)
 
     def _handle_chat(self):
         body = self._read_json_body()
@@ -402,8 +474,8 @@ def main():
     graph = regenerate_graph()
     print(f"[jarvis] {len(graph['nodes'])} notes, {len(graph['links'])} links indexed.")
 
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), JarvisHandler)
-    print(f"[jarvis] Serving on http://127.0.0.1:{PORT}  (open this in Chrome)")
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), JarvisHandler)
+    print(f"[jarvis] Serving on http://0.0.0.0:{PORT}  (open this in Chrome, reachable over LAN)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

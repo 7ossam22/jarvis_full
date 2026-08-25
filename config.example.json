@@ -1,4 +1,6 @@
 {
   "api_key": "PUT-YOUR-KEY-HERE",
-  "model": "claude-sonnet-5"
+  "model": "claude-sonnet-5",
+  "elevenlabs_api_key": "PUT-YOUR-ELEVENLABS-KEY-HERE",
+  "elevenlabs_voice_id": "JBFqnCBsd6RMkjVDRZzb"
 }

@@ -129,7 +129,7 @@
 </div>
 
 <div id="dock">
-  <button id="mic-btn" title="Talk to JARVIS">🎙</button>
+  <button id="mic-btn" title="Toggle always-listening (say “Jarvis” to talk)">🎙</button>
   <input id="chat-input" type="text" placeholder="Ask about your notes, or say “remember that…”" autocomplete="off" />
   <button id="send-btn" title="Send">➤</button>
 </div>
@@ -138,7 +138,7 @@
   <div class="ring"></div>
   <h1>Knowledge Galaxy</h1>
   <button id="wake-btn">Wake JARVIS</button>
-  <small>Browsers block audio until you interact with the page once — click above to boot JARVIS and unlock his voice.</small>
+  <small>Browsers block audio until you interact with the page once — click above to boot JARVIS and unlock his voice. Once awake, he's always listening — just say “Jarvis” before your question.</small>
 </div>
 
 <script>
@@ -316,14 +316,59 @@
   speechSynthesis.onvoiceschanged = pickVoice;
   pickVoice();
 
-  function speak(text) {
-    if (!text || !("speechSynthesis" in window)) return;
+  // Pause the mic while JARVIS is talking so he doesn't hear (and react to) his own voice.
+  function pauseMicForSpeech() {
+    const wasListening = listeningEnabled && recognizer;
+    if (wasListening) { try { recognizer.stop(); } catch (e) { /* not running */ } }
+    return wasListening;
+  }
+  function resumeMicAfterSpeech(wasListening) {
+    if (wasListening && listeningEnabled) { try { recognizer.start(); } catch (e) { /* already running */ } }
+  }
+
+  function speakWithBrowserVoice(text, wasListening) {
+    if (!("speechSynthesis" in window)) { resumeMicAfterSpeech(wasListening); return; }
     speechSynthesis.cancel();
     const utter = new SpeechSynthesisUtterance(text);
     if (britishVoice) utter.voice = britishVoice;
     utter.rate = 1.0;
     utter.pitch = 0.95;
+    utter.onend = utter.onerror = () => resumeMicAfterSpeech(wasListening);
     speechSynthesis.speak(utter);
+  }
+
+  // JARVIS's real voice, via a server-side ElevenLabs proxy — server.py holds the
+  // API key, so it never reaches this page or anyone else on the LAN. Falls back
+  // to the browser's built-in voice if no key is configured or the call fails.
+  let currentAudio = null;
+  async function speak(text) {
+    if (!text) return;
+    if (currentAudio) { try { currentAudio.pause(); } catch (e) {} currentAudio = null; }
+    if ("speechSynthesis" in window) speechSynthesis.cancel();
+
+    const wasListening = pauseMicForSpeech();
+
+    try {
+      const res = await fetch("/speak", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error(`speak endpoint returned ${res.status}`);
+
+      const blob = await res.blob();
+      const audio = new Audio(URL.createObjectURL(blob));
+      currentAudio = audio;
+      audio.onended = audio.onerror = () => {
+        if (currentAudio === audio) currentAudio = null;
+        resumeMicAfterSpeech(wasListening);
+      };
+      await audio.play();
+    } catch (err) {
+      // No ElevenLabs key configured, network hiccup, autoplay block — fall back
+      // to the browser's own voice rather than JARVIS going silent.
+      speakWithBrowserVoice(text, wasListening);
+    }
   }
 
   const statusEl = document.getElementById("status-line");
@@ -337,26 +382,94 @@
     showAnswer._t = setTimeout(() => answerToast.classList.remove("show"), 9000);
   }
 
-  // mic (Chrome / Edge only)
+  // mic (Chrome / Edge only) — always-listening, gated behind a "Jarvis" wake word.
+  // Anything heard that isn't addressed to him is ignored: no server call, no reply.
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   const micBtn = document.getElementById("mic-btn");
+  const WAKE_RE = /\bjarvis\b[,:]?\s*/i;
+  const AWAIT_COMMAND_MS = 6000;
+
   let recognizer = null;
+  let listeningEnabled = false;  // always-on mode, toggled by the mic button
+  let awaitingCommand = false;   // true right after a bare "Jarvis" with no command attached
+  let awaitTimer = null;
+
+  function standbyStatus() {
+    return listeningEnabled ? "◌ standby — say “Jarvis” to talk" : "";
+  }
+
+  function armAwaitingCommand() {
+    awaitingCommand = true;
+    clearTimeout(awaitTimer);
+    awaitTimer = setTimeout(() => { awaitingCommand = false; setStatus(standbyStatus()); }, AWAIT_COMMAND_MS);
+  }
+
+  function handleHeardSpeech(transcript) {
+    const text = (transcript || "").trim();
+    if (!text) return;
+
+    if (awaitingCommand) {
+      clearTimeout(awaitTimer);
+      awaitingCommand = false;
+      handleSubmit(text);
+      return;
+    }
+
+    const match = text.match(WAKE_RE);
+    if (!match) return; // not addressed to JARVIS — ignored, nothing sent anywhere
+
+    const command = text.slice(match.index + match[0].length).trim();
+    if (command) {
+      handleSubmit(command);
+    } else {
+      speak("Yes, sir?");
+      showAnswer("Yes, sir?");
+      armAwaitingCommand();
+      setStatus("● listening for your command…");
+    }
+  }
+
   if (SpeechRecognition) {
     recognizer = new SpeechRecognition();
     recognizer.lang = "en-US";
+    recognizer.continuous = true;
     recognizer.interimResults = false;
     recognizer.maxAlternatives = 1;
-    recognizer.onstart = () => { micBtn.classList.add("recording"); setStatus("● listening…"); };
-    recognizer.onerror = () => { micBtn.classList.remove("recording"); setStatus(""); };
-    recognizer.onend = () => { micBtn.classList.remove("recording"); };
-    recognizer.onresult = (e) => {
-      const transcript = e.results[0][0].transcript;
-      document.getElementById("chat-input").value = transcript;
-      handleSubmit(transcript);
+
+    recognizer.onstart = () => {
+      micBtn.classList.add("recording");
+      setStatus(awaitingCommand ? "● listening for your command…" : standbyStatus());
     };
+    recognizer.onerror = (e) => {
+      // "no-speech" fires constantly in continuous mode while idle — not a real error.
+      if (e.error !== "no-speech") console.warn("[jarvis] speech recognition error:", e.error);
+    };
+    recognizer.onend = () => {
+      micBtn.classList.remove("recording");
+      if (listeningEnabled) {
+        // Chrome periodically stops continuous recognition on its own — restart to stay always-on.
+        try { recognizer.start(); } catch (e) { /* already running */ }
+      } else {
+        setStatus("");
+      }
+    };
+    recognizer.onresult = (e) => {
+      const result = e.results[e.results.length - 1];
+      if (!result.isFinal) return;
+      handleHeardSpeech(result[0].transcript);
+    };
+
     micBtn.addEventListener("click", () => {
       audioUnlocked = true;
-      try { recognizer.start(); } catch (e) { /* already running */ }
+      listeningEnabled = !listeningEnabled;
+      if (listeningEnabled) {
+        try { recognizer.start(); } catch (e) { /* already running */ }
+      } else {
+        awaitingCommand = false;
+        clearTimeout(awaitTimer);
+        try { recognizer.stop(); } catch (e) { /* not running */ }
+        setStatus("");
+      }
     });
   } else {
     micBtn.disabled = true;
@@ -475,6 +588,13 @@
     const greeting = `Good evening, sir. ${graphData.nodes.length} notes indexed, all present and accounted for.`;
     showAnswer(greeting);
     speak(greeting);
+
+    if (recognizer) {
+      listeningEnabled = true;
+      // speak()'s onend will start the recognizer once the greeting finishes;
+      // this covers browsers where speechSynthesis fires no events at all.
+      setTimeout(() => { if (listeningEnabled) { try { recognizer.start(); } catch (e) {} } }, 4000);
+    }
   });
 })();
 </script>
