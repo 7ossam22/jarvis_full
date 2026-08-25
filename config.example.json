@@ -1,6 +1,47 @@
 {
-  "api_key": "PUT-YOUR-KEY-HERE",
-  "model": "claude-sonnet-5",
-  "elevenlabs_api_key": "PUT-YOUR-ELEVENLABS-KEY-HERE",
-  "elevenlabs_voice_id": "JBFqnCBsd6RMkjVDRZzb"
+  "server": {
+    "port": 4700,
+    "bind": "0.0.0.0"
+  },
+  "model": {
+    "provider_api_key": "PUT-YOUR-KEY-HERE",
+    "model_id": "claude-sonnet-5"
+  },
+  "persona": {
+    "name": "JARVIS",
+    "address_term": "sir",
+    "voice_style": "a dry, impeccably polite British butler with a razor wit",
+    "system_prompt_extra": ""
+  },
+  "voice": {
+    "elevenlabs_api_key": "PUT-YOUR-ELEVENLABS-KEY-HERE",
+    "elevenlabs_voice_id": "JBFqnCBsd6RMkjVDRZzb",
+    "elevenlabs_model_id": "eleven_turbo_v2_5"
+  },
+  "wake_word": {
+    "pattern": "jarvis",
+    "await_command_ms": 6000,
+    "silence_commit_ms": 1300
+  },
+  "conversation": {
+    "extra_closing_phrases": [],
+    "closing_lines": [
+      "Very good, sir. I'll be here when you need me.",
+      "Until next time, sir.",
+      "Anytime, sir — just say the word.",
+      "Standing by, sir."
+    ]
+  },
+  "retrieval": {
+    "top_notes_limit": 6,
+    "max_history_turns": 6
+  },
+  "images": {
+    "max_gallery": 6
+  },
+  "brain": {
+    "radius": 150,
+    "shell_color": "#8a6bff",
+    "wire_color": "#6be3ff"
+  }
 }
