@@ -1,0 +1,140 @@
+# JARVIS — a talking AI second brain
+
+An interactive 3D "knowledge galaxy" built from a folder of markdown notes, with a
+voice-enabled AI ([Claude](https://claude.com)) that answers questions **only from
+those notes**, flies the camera to the source it used, and lets you grow the graph
+live by voice ("remember that…"). Built by following the
+[Build Your Own JARVIS](https://skool.com/aiworkshop) prompt pack, end to end.
+
+No frameworks, no npm, no build step. Python 3 standard library on the backend,
+plain HTML/CSS/JS + [3d-force-graph](https://github.com/vasturiano/3d-force-graph)
+(from a CDN) on the frontend.
+
+## What's here
+
+- **The Galaxy** — `build.py` scans `notes/*.md`, links notes that mention each
+  other's titles or share `[[wikilinks]]`, and writes `viewer/graph-data.js`.
+  `viewer/index.html` renders it as a cinematic 3D starfield: click a node to fly
+  the camera to it, see its neighbors light up, and read its excerpt in the side
+  panel.
+- **The Brain** — `POST /chat` in `server.py` scores every note against your
+  question by keyword overlap (title matches weigh extra), hands the top 6 to
+  Claude with a "only answer from these notes" system prompt, and returns the
+  answer plus which notes it used.
+- **The Voice** — answers are spoken aloud (`speechSynthesis`, prefers a British
+  voice); the 🎙 button captures your question with `webkitSpeechRecognition`
+  (Chrome/Edge only).
+- **The Magic** — when an answer draws on notes, the camera flies to the top
+  source (lighting up its neighbors), or lights up the whole cluster if 4+ notes
+  were used.
+- **The Personality** — JARVIS is a dry, witty British butler who calls you "sir"
+  occasionally, answers in one sharp sentence plus the facts, and doesn't drag
+  the camera around for small talk.
+- **Total Recall** — say or type "remember that…" and JARVIS writes a real
+  markdown note into `notes/captures/`, births a new glowing star at its most
+  related neighbor, flies to it, and confirms out loud with one witty line.
+
+This repo ships with 25 sample notes (a small coffee-roasting business, Nova
+Roasters) so it works out of the box — swap in your own notes folder any time.
+
+## Setup (5 minutes)
+
+**You'll need:** Python 3, Google Chrome (the mic and voice need it — Safari
+won't cut it), and optionally an
+[Anthropic API key](https://console.anthropic.com) ($5 of credit is plenty;
+answers cost fractions of a cent).
+
+1. **Give it a brain.**
+
+   ```bash
+   cp config.example.json config.json
+   ```
+
+   Open `config.json` and paste your API key in:
+
+   ```json
+   { "api_key": "sk-ant-...", "model": "claude-sonnet-5" }
+   ```
+
+   ⚠️ **Never paste your API key into a chat window** — type it directly into
+   this file yourself. `config.json` lives at the project root (not inside
+   `viewer/`) and the server never serves it, so it's never reachable from the
+   browser.
+
+   **No API key?** Skip this step. If the
+   [`claude` CLI](https://claude.com/claude-code) is installed and logged in,
+   `server.py` automatically falls back to `claude -p` — slower, but free on
+   your Claude Code subscription. With neither configured, JARVIS still runs
+   and answers honestly that his brain isn't wired up yet.
+
+2. **Point it at your notes** (optional). By default JARVIS reads the sample
+   `notes/` folder in this repo. To use your own vault instead:
+
+   ```bash
+   python3 build.py /path/to/your/notes
+   ```
+
+   (`server.py` also rebuilds the graph from `notes/` automatically every time
+   it starts and every time you ask a question, so captured notes always stay
+   in sync — pass a different folder by editing `NOTES_DIR` in `server.py` if
+   you want to point the live server permanently at your own vault instead of
+   the bundled sample notes.)
+
+3. **Launch it.**
+
+   ```bash
+   python3 server.py
+   ```
+
+   Open **http://127.0.0.1:4700** in Chrome, click **Wake JARVIS** (browsers
+   block audio until you interact with the page once), and fly around.
+
+## Try it
+
+- Click any star to see its excerpt and fly the camera to it.
+- Ask by typing or by clicking 🎙 and speaking:
+  - *"What supplier do we use for the seasonal blend?"*
+  - *"Who's on the espresso machine training track?"*
+  - *"What did customers say in September?"*
+- Say *"remember that prompt packs make excellent free gifts"* and watch a new
+  star get born.
+- Say *"tell me a joke"* — JARVIS will banter without touching the camera.
+
+## Project layout
+
+```
+build.py               scans notes/, writes viewer/graph-data.js (stdlib only)
+server.py               static file server (viewer/ only) + /chat + /remember
+config.example.json     copy to config.json and add your key (config.json is gitignored)
+notes/                  sample markdown notes (25 notes, Nova Roasters coffee co.)
+notes/captures/         notes JARVIS writes for you via "remember that…" (gitignored)
+viewer/index.html       the whole frontend — 3D galaxy, chat dock, voice, personality
+viewer/graph-data.js    generated by build.py — not committed, regenerated on run
+```
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Mic button does nothing | Chrome → lock icon in the address bar → allow Microphone. Must be Chrome or Edge. |
+| No sound | Click **Wake JARVIS** once — browsers block audio before the first interaction. |
+| Page looks stale after a change | Hard reload: `Cmd+Shift+R` / `Ctrl+Shift+R`. |
+| "I appear to be without a working brain" | You haven't pasted a key into `config.json`, or the `claude` CLI isn't installed/logged in either. |
+| Answers are generic / off-topic | Your notes folder is thin on that topic, or you pointed `build.py` at the wrong path — re-run `python3 build.py /full/path/to/notes`. |
+| Port 4700 already in use | Another `server.py` is still running — stop it, or edit `PORT` in `server.py`. |
+
+## Security notes
+
+- `config.json` (your real API key) is gitignored and never served over HTTP —
+  only files under `viewer/` are reachable from the browser.
+- `server.py` only serves files inside `viewer/`; path traversal (`..`,
+  absolute paths) is rejected.
+- Conversation history is kept in memory per session and is lost on server
+  restart — nothing is persisted beyond the notes themselves.
+
+---
+
+*Prompt pack: "Build Your Own JARVIS" by Zubair Trabzada — AI Workshop
+([skool.com/aiworkshop](https://skool.com/aiworkshop)). This build follows all
+six prompts (Galaxy, Brain, Voice, Magic, Personality, Total Recall) as the
+spec for what to build.*

@@ -1,24 +1,19 @@
-# General
-node_modules/
-dist/
-release/
-public/models/
-.env
-*.log
-.DS_Store
-Thumbs.db
+# Your real API key lives here — never commit it. Copy config.example.json to
+# get started.
+config.json
+
+# Live-grown notes captured via voice ("remember that…") and the generated
+# graph data are local state, not source.
+notes/captures/
+viewer/graph-data.js
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 .venv/
 venv/
-ENV/
-env/
 
-# Obsidian
-.obsidian/workspace.json
-.obsidian/graph.json
-.obsidian/appearance.json
-.obsidian/plugins/obsidian-local-rest-api/data.json
+# OS
+.DS_Store
+Thumbs.db
+*.log

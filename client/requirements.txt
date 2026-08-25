@@ -1,7 +1,0 @@
-requests
-openai
-python-dotenv
-SpeechRecognition
-pyaudio
-pydub
-pygame
