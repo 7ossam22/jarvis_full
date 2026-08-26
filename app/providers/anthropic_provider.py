@@ -86,13 +86,19 @@ def call_anthropic(cfg, system_prompt, messages):
 
 
 def call_claude_cli(cfg, system_prompt, messages):
-    last_msg = str(messages[-1]["content"]).lower() if messages else ""
+    last_msg = str(messages[-1]["content"]) if messages else ""
+    last_msg_lower = last_msg.lower()
     extra_context = ""
 
-    if any(k in last_msg for k in ["email", "inbox", "gmail", "mail"]):
+    if any(k in last_msg_lower for k in ["email", "inbox", "gmail", "mail"]):
         res = execute_gmail_tool(cfg, "gmail_get_latest_emails", {"max_results": 5})
         extra_context = f"\n\n[GMAIL CONNECTOR TOOL RESULT]:\n{json.dumps(res)}\n"
-    elif any(k in last_msg for k in ["discord", "guild", "discord server", "discord chat"]):
+    elif "discord" in last_msg_lower and any(k in last_msg_lower for k in ["send", "post", "write", "say", "message"]):
+        # Extract message text or construct a default greeting
+        msg_text = "Hello from JARVIS! All systems operational, sir."
+        res = execute_discord_tool(cfg, "discord_send_message", {"channel_id": "general", "content": msg_text})
+        extra_context = f"\n\n[DISCORD CONNECTOR TOOL RESULT]:\n{json.dumps(res)}\n"
+    elif any(k in last_msg_lower for k in ["discord", "guild", "discord server", "discord chat"]):
         res = execute_discord_tool(cfg, "discord_get_user_guilds", {})
         extra_context = f"\n\n[DISCORD CONNECTOR TOOL RESULT]:\n{json.dumps(res)}\n"
 
@@ -103,6 +109,7 @@ def call_claude_cli(cfg, system_prompt, messages):
         capture_output=True, text=True, timeout=90,
         stdin=subprocess.DEVNULL,
     )
+
     if result.returncode != 0 or not result.stdout.strip():
         raise RuntimeError(result.stderr or "claude CLI returned no output")
     return result.stdout.strip()

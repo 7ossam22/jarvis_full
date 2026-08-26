@@ -99,6 +99,31 @@ def _make_discord_request(token, endpoint, params=None, method="GET", body_data=
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _resolve_channel_id(token, channel_input):
+    """Resolves channel name (e.g. 'general' or '#general') or channel ID to numeric ID."""
+    if not channel_input:
+        channel_input = "general"
+    if str(channel_input).isdigit():
+        return str(channel_input)
+
+    target_name = str(channel_input).lstrip("#").strip().lower()
+    try:
+        guilds = _make_discord_request(token, "users/@me/guilds")
+        for g in guilds:
+            channels = _make_discord_request(token, f"guilds/{g['id']}/channels")
+            for c in channels:
+                if c.get("type") == 0 and c.get("name", "").lower() == target_name:
+                    return c.get("id")
+        if guilds:
+            channels = _make_discord_request(token, f"guilds/{guilds[0]['id']}/channels")
+            text_chans = [c for c in channels if c.get("type") == 0]
+            if text_chans:
+                return text_chans[0].get("id")
+    except Exception:
+        pass
+    return channel_input
+
+
 def execute_discord_tool(cfg, tool_name, tool_input):
     """Executes a Discord tool call using configured Bot Token or User Token."""
     token = cfg.get("discord.bot_token") or cfg.get("discord.token") or os.environ.get("DISCORD_BOT_TOKEN")
@@ -109,7 +134,8 @@ def execute_discord_tool(cfg, tool_name, tool_input):
 
     try:
         if tool_name == "discord_get_recent_messages":
-            channel_id = tool_input.get("channel_id")
+            raw_channel = tool_input.get("channel_id")
+            channel_id = _resolve_channel_id(token, raw_channel)
             limit = min(tool_input.get("limit", 10), 20)
             res = _make_discord_request(token, f"channels/{channel_id}/messages", params={"limit": limit})
             messages = []
@@ -123,10 +149,11 @@ def execute_discord_tool(cfg, tool_name, tool_input):
             return {"channel_id": channel_id, "messages": messages}
 
         elif tool_name == "discord_send_message":
-            channel_id = tool_input.get("channel_id")
-            content = tool_input.get("content")
+            raw_channel = tool_input.get("channel_id")
+            content = tool_input.get("content") or "Greetings from JARVIS! Neural core online, sir."
+            channel_id = _resolve_channel_id(token, raw_channel)
             res = _make_discord_request(token, f"channels/{channel_id}/messages", method="POST", body_data={"content": content})
-            return {"status": "sent", "message_id": res.get("id")}
+            return {"status": "sent", "channel_id": channel_id, "message_id": res.get("id"), "content": content}
 
         elif tool_name == "discord_get_user_guilds":
             guilds = _make_discord_request(token, "users/@me/guilds")
@@ -136,7 +163,6 @@ def execute_discord_tool(cfg, tool_name, tool_input):
         elif tool_name == "discord_get_guild_channels":
             guild_id = tool_input.get("guild_id")
             channels = _make_discord_request(token, f"guilds/{guild_id}/channels")
-            # Filter to text channels (type 0)
             text_channels = [
                 {"id": c.get("id"), "name": c.get("name"), "type": c.get("type")}
                 for c in channels if c.get("type") == 0
@@ -148,3 +174,4 @@ def execute_discord_tool(cfg, tool_name, tool_input):
 
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
         return {"error": f"Discord API request failed: {e}"}
+
