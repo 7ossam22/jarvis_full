@@ -95,7 +95,10 @@ function createVideoReferenceWindow(url) {
   header.appendChild(closeBtn);
   el.appendChild(header);
 
-  const ytMatch = url.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i);
+  // Match all YouTube URL variants (watch?v=ID, shorts/ID, embed/ID, v/ID, youtu.be/ID)
+  const ytMatch = url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/|.+\?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/i);
+  const vimeoMatch = url.match(/vimeo\.com\/(?:video\/)?([0-9]+)/i);
+
   if (ytMatch) {
     const iframe = document.createElement("iframe");
     iframe.src = `https://www.youtube.com/embed/${ytMatch[1]}?autoplay=1`;
@@ -103,7 +106,14 @@ function createVideoReferenceWindow(url) {
     iframe.allowFullscreen = true;
     iframe.className = "ref-video-frame";
     el.appendChild(iframe);
-  } else {
+  } else if (vimeoMatch) {
+    const iframe = document.createElement("iframe");
+    iframe.src = `https://player.vimeo.com/video/${vimeoMatch[1]}?autoplay=1`;
+    iframe.allow = "autoplay; fullscreen; picture-in-picture";
+    iframe.allowFullscreen = true;
+    iframe.className = "ref-video-frame";
+    el.appendChild(iframe);
+  } else if (/\.(mp4|webm|ogg|m4v)(\?.*)?$/i.test(url)) {
     const video = document.createElement("video");
     video.controls = true;
     video.autoplay = true;
@@ -111,9 +121,22 @@ function createVideoReferenceWindow(url) {
     video.playsInline = true;
     video.className = "ref-video-player";
     video.src = url;
-    video.onerror = () => removeReferenceWindow({ el });
     video.onloadeddata = placeReferenceWindows;
+    video.onerror = () => {
+      // Fallback: replace failed video tag with embed iframe rather than destroying window
+      video.remove();
+      const iframe = document.createElement("iframe");
+      iframe.src = url;
+      iframe.className = "ref-video-frame";
+      el.appendChild(iframe);
+    };
     el.appendChild(video);
+  } else {
+    // Generic web video link embed iframe
+    const iframe = document.createElement("iframe");
+    iframe.src = url;
+    iframe.className = "ref-video-frame";
+    el.appendChild(iframe);
   }
 
   referenceLayer.appendChild(el);
@@ -123,6 +146,7 @@ function createVideoReferenceWindow(url) {
   placeReferenceWindows();
   requestAnimationFrame(() => el.classList.add("show"));
 }
+
 
 export function showReferences(imageUrls = [], videoUrls = []) {
   const imgs = Array.isArray(imageUrls) ? imageUrls : [];

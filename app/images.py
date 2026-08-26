@@ -22,7 +22,7 @@ def extract_media_references(answer, max_media=6):
     image_urls = []
     seen_img = set()
     for m in img_matches:
-        url = m.group(1).strip()
+        url = m.group(1).strip().strip("<>()[]\"'").rstrip(".,;")
         if not re.match(r"^https?://", url, re.IGNORECASE) or url in seen_img:
             continue
         seen_img.add(url)
@@ -33,13 +33,14 @@ def extract_media_references(answer, max_media=6):
     video_urls = []
     seen_vid = set()
     for m in vid_matches:
-        url = m.group(1).strip()
+        url = m.group(1).strip().strip("<>()[]\"'").rstrip(".,;")
         if not re.match(r"^https?://", url, re.IGNORECASE) or url in seen_vid:
             continue
         seen_vid.add(url)
         video_urls.append(url)
         if len(video_urls) >= max_media:
             break
+
 
     return clean, image_urls, video_urls
 
