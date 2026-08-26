@@ -86,19 +86,9 @@ def call_anthropic(cfg, system_prompt, messages):
 
 
 def _parse_discord_send_intent(last_msg):
-    import re
+    import json, re, subprocess
     raw = last_msg.strip()
     channel = "general"
-    content = ""
-
-    q_match = re.search(r'["\']([^"\'\n]+)["\']', raw)
-    if q_match:
-        content = q_match.group(1).strip()
-
-    if not content:
-        s_match = re.search(r'(?:saying|that says|with content|content:?|message:?|with text)\s+(.+)$', raw, re.IGNORECASE)
-        if s_match:
-            content = s_match.group(1).strip()
 
     ch_match = re.search(r'(?:to|in|channel)\s+#?([A-Za-z0-9_\-]+)', raw, re.IGNORECASE)
     if ch_match:
@@ -106,19 +96,46 @@ def _parse_discord_send_intent(last_msg):
         if ch not in ["discord", "the", "a", "my", "server", "bot", "channel", "messages", "message"]:
             channel = ch
 
-    if not content:
-        cleaned = raw
-        cleaned = re.sub(r'^(?:please\s+)?(?:send|post|write|say|tell|publish)\b(?:\s+a|\s+the|\s+this)?(?:\s+message|\s+chat|\s+text|\s+notice)?', '', cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r'^(?:to|in|on)\s+(?:the\s+)?(?:discord\s+)?(?:server\s+)?(?:channel\s+)?(?:general|jarvis-notice|#?[A-Za-z0-9_\-]+)?(?:\s+in\s+discord|\s+on\s+discord|\s+to\s+discord)?\s*', '', cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r'^(?:in\s+discord|on\s+discord|to\s+discord|discord)\s*', '', cleaned, flags=re.IGNORECASE).strip()
+    # Check explicit quotes first: send "exact text" to channel
+    q_match = re.search(r'["\']([^"\'\n]{3,})["\']', raw)
+    if q_match:
+        return channel, q_match.group(1).strip()
 
-        if cleaned and len(cleaned) > 2:
-            content = cleaned
+    # Use LLM filtering to cleanly extract target channel & exact intended message
+    try:
+        sys_p = (
+            "You are an intent filter for a Discord integration. Extract the target Discord channel "
+            "(default 'general') and the exact clean message text that the user wants to send to Discord. "
+            "Filter out the command prefix (like 'send a message to general in discord'). "
+            "Respond ONLY with raw JSON: {\"channel\": \"...\", \"message\": \"...\"}"
+        )
+        res = subprocess.run(
+            ["claude", "-p", raw, "--system-prompt", sys_p],
+            capture_output=True, text=True, timeout=10
+        )
+        out = res.stdout.strip()
+        if "{" in out and "}" in out:
+            json_str = out[out.find("{"):out.rfind("}")+1]
+            parsed = json.loads(json_str)
+            filt_channel = parsed.get("channel") or channel
+            filt_msg = parsed.get("message")
+            if filt_msg:
+                return filt_channel, filt_msg
+    except Exception:
+        pass
 
-    if not content:
-        content = "Greetings from JARVIS! All systems operational, sir."
+    # Regex fallback if LLM is unavailable
+    s_match = re.search(r'(?:saying|that says|with content|content:?|message:?|with text)\s+(.+)$', raw, re.IGNORECASE)
+    if s_match:
+        return channel, s_match.group(1).strip()
 
-    return channel, content
+    cleaned = re.sub(
+        r'^(?:please\s+)?(?:send|post|write|say|tell|publish)\s+(?:a\s+)?(?:message|chat|text|notice)?\s*(?:to|in|on)?\s*(?:the\s+)?(?:discord\s+)?(?:server\s+)?(?:channel\s+)?(?:#?[A-Za-z0-9_\-]+\s+)?(?:in\s+discord|on\s+discord|to\s+discord)?\s*',
+        '', raw, flags=re.IGNORECASE
+    ).strip()
+
+    return channel, cleaned if cleaned else "Greetings from JARVIS! All systems operational, sir."
+
 
 
 def call_claude_cli(cfg, system_prompt, messages):
