@@ -15,7 +15,7 @@ from . import history, persona, retrieval
 from .graph import build_graph, regenerate_graph
 from .images import extract_media_references, extract_image_references
 from .providers.anthropic_provider import call_model
-from .providers.elevenlabs_provider import call_elevenlabs_tts
+from .providers.tts import get_tts_providers
 
 
 def _slugify_title(text, max_words=7):
@@ -69,10 +69,18 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
     system_prompt = persona.build_system_prompt(cfg)
     answer = call_model(cfg, system_prompt, messages, fallback)
     max_images = cfg.get("images.max_gallery", 6)
-    answer, image_urls, video_urls = extract_media_references(answer, max_images)
+    answer, image_urls, video_urls, source_urls = extract_media_references(answer, max_images)
+
+    # The spoken/displayed answer never contains URLs (persona rule — TTS would
+    # read them as gibberish), but later turns like "send that to Discord" need
+    # them, so stash them in the history copy only as a reference footnote.
+    hist_answer = answer
+    ref_links = source_urls + video_urls + image_urls
+    if ref_links:
+        hist_answer += "\n[reference links: " + ", ".join(ref_links[:4]) + "]"
 
     history.append_history(session_id, "user", user_content, max_turns)
-    history.append_history(session_id, "assistant", answer, max_turns)
+    history.append_history(session_id, "assistant", hist_answer, max_turns)
 
     return {
         "answer": answer,
@@ -147,13 +155,15 @@ def handle_speak(cfg, body):
     if not text:
         return "json", {"error": "empty text"}, 400
 
-    if not cfg.has_elevenlabs_key():
-        return "json", {"error": "no elevenlabs key configured"}, 404
+    providers = get_tts_providers(cfg)
+    if not providers:
+        return "json", {"error": "no TTS provider configured"}, 404
 
-    try:
-        audio, content_type = call_elevenlabs_tts(cfg, text)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError) as e:
-        print(f"[jarvis] ElevenLabs TTS failed ({e})", file=sys.stderr)
-        return "json", {"error": "tts failed"}, 502
+    for tts in providers:
+        try:
+            audio, content_type = tts.synthesize(text)
+            return "audio", (audio, content_type), 200
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError) as e:
+            print(f"[jarvis] {tts.name} TTS failed ({e})", file=sys.stderr)
 
-    return "audio", (audio, content_type), 200
+    return "json", {"error": "tts failed"}, 502

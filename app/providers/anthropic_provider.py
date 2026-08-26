@@ -85,74 +85,85 @@ def call_anthropic(cfg, system_prompt, messages):
     return ""
 
 
-def _parse_discord_send_intent(last_msg):
-    import json, re, subprocess
-    raw = last_msg.strip()
-    channel = "general"
+# Cheap pre-filter: only run the (slow) LLM tool-decision call when the recent
+# conversation plausibly involves a connector at all. Checked against the last
+# few turns, not just the last sentence — "now share it there too" must still
+# trigger when Discord came up a turn earlier.
+CONNECTOR_HINTS = (
+    "discord", "email", "gmail", "mail", "inbox", "send", "post",
+    "share", "message", "dm", "channel",
+)
 
-    ch_match = re.search(r'(?:to|in|channel)\s+#?([A-Za-z0-9_\-]+)', raw, re.IGNORECASE)
-    if ch_match:
-        ch = ch_match.group(1).lower()
-        if ch not in ["discord", "the", "a", "my", "server", "bot", "channel", "messages", "message"]:
-            channel = ch
 
-    # Check explicit quotes first: send "exact text" to channel
-    q_match = re.search(r'["\']([^"\'\n]{3,})["\']', raw)
-    if q_match:
-        return channel, q_match.group(1).strip()
-
-    # Use LLM filtering to cleanly extract target channel & exact intended message
+def _decide_connector_action(cfg, messages):
+    """One small `claude -p` call that decides whether the latest user turn
+    needs a connector tool (Gmail/Discord) and with what arguments, given the
+    whole recent conversation — replaces brittle keyword parsing of just the
+    last sentence. Returns {"tool": name, "input": {...}} or None."""
+    transcript = "\n\n".join(
+        f"{m['role'].upper()}: {m['content']}" for m in messages[-6:]
+    )
+    tool_specs = get_gmail_tools() + get_discord_tools()
+    tools_desc = json.dumps(
+        [{"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]}
+         for t in tool_specs]
+    )
+    sys_p = (
+        "You are the tool-routing brain for a voice assistant. Given a conversation, decide "
+        "whether the LAST user turn requires calling one of these tools:\n" + tools_desc + "\n\n"
+        "Rules:\n"
+        "- Respond ONLY with raw JSON, nothing else.\n"
+        '- No tool needed (questions, lookups, small talk): {"tool": "none"}\n'
+        '- Tool needed: {"tool": "<name>", "input": {<arguments matching its input_schema>}}\n'
+        "- Resolve every back-reference ('send this', 'that screenshot', 'what you found') "
+        "against the earlier turns: tool inputs must contain the ACTUAL resolved content, "
+        "self-contained and understandable with no other context — never the literal "
+        "referring words.\n"
+        "- When sharing content that has a '[reference links: ...]' footnote in the "
+        "conversation, append the most relevant link to the message/body being sent.\n"
+        "- For discord_send_message, channel_id may be a channel NAME like 'general' — it is "
+        "resolved automatically. Default to 'general' when the user names no channel.\n"
+    )
     try:
-        sys_p = (
-            "You are an intent filter for a Discord integration. Extract the target Discord channel "
-            "(default 'general') and the exact clean message text that the user wants to send to Discord. "
-            "Filter out the command prefix (like 'send a message to general in discord'). "
-            "Respond ONLY with raw JSON: {\"channel\": \"...\", \"message\": \"...\"}"
-        )
         res = subprocess.run(
-            ["claude", "-p", raw, "--system-prompt", sys_p],
-            capture_output=True, text=True, timeout=10
+            ["claude", "-p", transcript, "--system-prompt", sys_p],
+            capture_output=True, text=True, timeout=45,
+            stdin=subprocess.DEVNULL,
         )
         out = res.stdout.strip()
         if "{" in out and "}" in out:
-            json_str = out[out.find("{"):out.rfind("}")+1]
-            parsed = json.loads(json_str)
-            filt_channel = parsed.get("channel") or channel
-            filt_msg = parsed.get("message")
-            if filt_msg:
-                return filt_channel, filt_msg
-    except Exception:
-        pass
-
-    # Regex fallback if LLM is unavailable
-    s_match = re.search(r'(?:saying|that says|with content|content:?|message:?|with text)\s+(.+)$', raw, re.IGNORECASE)
-    if s_match:
-        return channel, s_match.group(1).strip()
-
-    cleaned = re.sub(
-        r'^(?:please\s+)?(?:send|post|write|say|tell|publish)\s+(?:a\s+)?(?:message|chat|text|notice)?\s*(?:to|in|on)?\s*(?:the\s+)?(?:discord\s+)?(?:server\s+)?(?:channel\s+)?(?:#?[A-Za-z0-9_\-]+\s+)?(?:in\s+discord|on\s+discord|to\s+discord)?\s*',
-        '', raw, flags=re.IGNORECASE
-    ).strip()
-
-    return channel, cleaned if cleaned else "Greetings from JARVIS! All systems operational, sir."
-
+            parsed = json.loads(out[out.find("{"):out.rfind("}")+1])
+            if parsed.get("tool") and parsed["tool"] != "none":
+                return parsed
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError) as e:
+        print(f"[jarvis] connector decision failed ({e})", file=sys.stderr)
+    return None
 
 
 def call_claude_cli(cfg, system_prompt, messages):
-    last_msg = str(messages[-1]["content"]) if messages else ""
-    last_msg_lower = last_msg.lower()
     extra_context = ""
-
-    if any(k in last_msg_lower for k in ["email", "inbox", "gmail", "mail"]):
-        res = execute_gmail_tool(cfg, "gmail_get_latest_emails", {"max_results": 5})
-        extra_context = f"\n\n[GMAIL CONNECTOR TOOL RESULT]:\n{json.dumps(res)}\n"
-    elif "discord" in last_msg_lower and any(k in last_msg_lower for k in ["send", "post", "write", "say", "message"]):
-        ch_target, msg_text = _parse_discord_send_intent(last_msg)
-        res = execute_discord_tool(cfg, "discord_send_message", {"channel_id": ch_target, "content": msg_text})
-        extra_context = f"\n\n[DISCORD CONNECTOR TOOL RESULT]:\n{json.dumps(res)}\n"
-    elif any(k in last_msg_lower for k in ["discord", "guild", "discord server", "discord chat"]):
-        res = execute_discord_tool(cfg, "discord_get_user_guilds", {})
-        extra_context = f"\n\n[DISCORD CONNECTOR TOOL RESULT]:\n{json.dumps(res)}\n"
+    recent_text = " ".join(str(m.get("content", "")) for m in messages[-5:]).lower()
+    if any(k in recent_text for k in CONNECTOR_HINTS):
+        action = _decide_connector_action(cfg, messages)
+        if action:
+            tool_name = action.get("tool", "")
+            tool_input = action.get("input") or {}
+            if tool_name.startswith("gmail_"):
+                result = execute_gmail_tool(cfg, tool_name, tool_input)
+            elif tool_name.startswith("discord_"):
+                result = execute_discord_tool(cfg, tool_name, tool_input)
+            else:
+                result = None
+            if result is not None:
+                print(f"[jarvis] connector call {tool_name}({json.dumps(tool_input)[:200]}) -> "
+                      f"{json.dumps(result)[:300]}", file=sys.stderr)
+                extra_context = (
+                    f"\n\n[CONNECTOR TOOL RESULT — {tool_name} was already executed by the "
+                    "system on the user's behalf. Report its outcome truthfully: on success, "
+                    "confirm what was done; on error, relay the stated reason. Do not claim "
+                    "anything is unconfigured unless this result says so.]:\n"
+                    f"{json.dumps(result)}\n"
+                )
 
     convo = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
     full_prompt = f"{convo}{extra_context}\n\nASSISTANT:"

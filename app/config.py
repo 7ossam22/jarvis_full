@@ -63,10 +63,6 @@ class Config:
         key = self.get("model.provider_api_key", "")
         return bool(key) and "PUT-YOUR-KEY-HERE" not in key and key.strip() != ""
 
-    def has_elevenlabs_key(self):
-        key = self.get("voice.elevenlabs_api_key", "")
-        return bool(key) and "PUT-YOUR" not in key and key.strip() != ""
-
     def public_dict(self):
         """Only what the browser needs — never provider_api_key or
         elevenlabs_api_key. Curated explicitly (not filtered from the full
