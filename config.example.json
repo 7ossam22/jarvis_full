@@ -40,8 +40,9 @@
     "max_gallery": 6
   },
   "brain": {
-    "radius": 150,
-    "shell_color": "#8a6bff",
-    "wire_color": "#6be3ff"
+    "radius": 140,
+    "shell_color": "#d4a373",
+    "wire_color": "#f4a261"
   }
 }
+

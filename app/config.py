@@ -91,8 +91,9 @@ class Config:
                 "max_gallery": self.get("images.max_gallery", 6),
             },
             "brain": {
-                "radius": self.get("brain.radius", 150),
-                "shell_color": self.get("brain.shell_color", "#8a6bff"),
-                "wire_color": self.get("brain.wire_color", "#6be3ff"),
+                "radius": self.get("brain.radius", 140),
+                "shell_color": self.get("brain.shell_color", "#d4a373"),
+                "wire_color": self.get("brain.wire_color", "#f4a261"),
             },
         }
+

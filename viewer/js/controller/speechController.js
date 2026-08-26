@@ -13,6 +13,7 @@
 import { speakRequest } from "../model/api.js";
 import { hideAnswer } from "../view/toast.js";
 import { startBrainGlow, stopBrainGlow } from "../view/scene.js";
+import { log as logLine } from "../view/console.js";
 
 let micHooks = { pauseMic: () => false, resumeMic: () => {} };
 export function setMicHooks(hooks) {
@@ -72,9 +73,11 @@ export async function speak(text) {
       onSpeechEnd(wasListening);
     };
     await audio.play();
+    logLine("Speaking (ElevenLabs voice).", "mic");
   } catch (err) {
     // No ElevenLabs key configured, network hiccup, autoplay block — fall back
     // to the browser's own voice rather than JARVIS going silent.
+    logLine("ElevenLabs unavailable — falling back to browser voice.", "error");
     speakWithBrowserVoice(text, wasListening);
   }
 }

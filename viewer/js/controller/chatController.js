@@ -13,6 +13,7 @@ import * as referenceWindows from "../view/referenceWindows.js";
 import * as scene from "../view/scene.js";
 import { speak } from "./speechController.js";
 import { standbyStatus } from "./voiceController.js";
+import { log as logLine } from "../view/console.js";
 
 const SESSION_KEY = "jarvis_session_id";
 let sessionId = sessionStorage.getItem(SESSION_KEY);
@@ -24,6 +25,17 @@ if (!sessionId) {
 const input = document.getElementById("chat-input");
 document.getElementById("send-btn").addEventListener("click", () => handleSubmit(input.value));
 input.addEventListener("keydown", (e) => { if (e.key === "Enter") handleSubmit(input.value); });
+
+// New session: the server keys conversation history off sessionId (see
+// app/history.py), so forgetting everything JARVIS remembers about this
+// conversation just means dropping the id and letting the top of this file
+// mint a new one on reload — no server call needed.
+document.getElementById("new-session-btn").addEventListener("click", () => {
+  logLine("New session requested — clearing conversation memory.", "system");
+  sessionStorage.removeItem(SESSION_KEY);
+  showAnswer("Starting fresh, sir.");
+  setTimeout(() => location.reload(), 700);
+});
 
 export async function handleSubmit(text) {
   text = (text || "").trim();
@@ -49,14 +61,16 @@ export async function handleSubmit(text) {
 
 async function handleChat(text) {
   setStatus("● thinking…");
+  logLine(`POST /chat "${text}"`, "net");
   try {
     const data = await chatRequest(text, sessionId);
     setStatus(standbyStatus());
+    logLine(data.answer || "(empty reply)", "reply");
     showAnswer(data.answer || "");
     speak(data.answer || "");
-    if (data.image_urls && data.image_urls.length) referenceWindows.showReferences(data.image_urls);
-    // No image(s) on this reply: leave whatever reference windows are already
-    // showing exactly as-is — they only change on a new batch or a dismiss.
+    if ((data.image_urls && data.image_urls.length) || (data.video_urls && data.video_urls.length)) {
+      referenceWindows.showReferences(data.image_urls, data.video_urls);
+    }
 
     const ids = data.nodes || [];
     if (ids.length >= 4) {
@@ -69,20 +83,24 @@ async function handleChat(text) {
     // small talk (ids.length === 0): no camera movement, per the personality spec.
   } catch (err) {
     setStatus(standbyStatus());
+    logLine(`/chat request failed: ${err}`, "error");
     showAnswer("I couldn't reach the server, sir. Is server.py still running?");
   }
 }
 
 async function handleRemember(text) {
   setStatus("● thinking…");
+  logLine(`POST /remember "${text}"`, "net");
   try {
     const data = await rememberRequest(text, sessionId);
     setStatus(standbyStatus());
     if (!data.node) {
+      logLine(data.confirmation || "(nothing filed)", "reply");
       showAnswer(data.confirmation || "I couldn't file that, sir.");
       speak(data.confirmation || "");
       return;
     }
+    logLine(data.confirmation || "(note captured)", "reply");
 
     const relatedNode = data.related_id != null ? nodeById(data.related_id) : null;
     const newNode = { ...data.node };
@@ -110,6 +128,7 @@ async function handleRemember(text) {
     setTimeout(scene.clearHighlight, 3200);
   } catch (err) {
     setStatus(standbyStatus());
+    logLine(`/remember request failed: ${err}`, "error");
     showAnswer("I couldn't file that, sir — is server.py still running?");
   }
 }

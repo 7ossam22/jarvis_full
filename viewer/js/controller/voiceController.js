@@ -13,6 +13,7 @@
 import { speak } from "./speechController.js";
 import { showAnswer } from "../view/toast.js";
 import { setStatus } from "../view/statusLine.js";
+import { log as logLine } from "../view/console.js";
 
 const micBtn = document.getElementById("mic-btn");
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -87,6 +88,7 @@ function armAwaitingCommand() {
 
 function endConversation() {
   conversationActive = false;
+  logLine("Conversation ended.", "mic");
   const bye = CONVO_CLOSINGS[Math.floor(Math.random() * CONVO_CLOSINGS.length)];
   showAnswer(bye);
   speak(bye);
@@ -95,6 +97,7 @@ function endConversation() {
 
 function processHeardText(text) {
   if (!text) return;
+  logLine(text, "heard");
 
   // Once a conversation is underway, no wake word is needed for follow-ups —
   // every utterance is either the closing phrase or a new command, until told
@@ -126,8 +129,10 @@ function processHeardText(text) {
   const command = text.slice(match.index + match[0].length).trim();
   if (command) {
     conversationActive = true;
+    logLine("Wake word detected — conversation started.", "mic");
     onCommand(command);
   } else {
+    logLine("Wake word detected — awaiting command…", "mic");
     speak("Yes, sir?");
     showAnswer("Yes, sir?");
     armAwaitingCommand();
@@ -187,7 +192,10 @@ export function initVoiceController(config, commandCallback) {
   };
   recognizer.onerror = (e) => {
     // "no-speech" fires constantly in continuous mode while idle — not a real error.
-    if (e.error !== "no-speech") console.warn("[jarvis] speech recognition error:", e.error);
+    if (e.error !== "no-speech") {
+      console.warn("[jarvis] speech recognition error:", e.error);
+      logLine(`Speech recognition error: ${e.error}`, "error");
+    }
   };
   recognizer.onend = () => {
     micBtn.classList.remove("recording");
@@ -226,6 +234,7 @@ export function initVoiceController(config, commandCallback) {
     listeningEnabled = !listeningEnabled;
     if (listeningEnabled) {
       try { recognizer.start(); } catch (e) { /* already running */ }
+      logLine("Mic enabled.", "mic");
     } else {
       awaitingCommand = false;
       conversationActive = false;
@@ -235,6 +244,7 @@ export function initVoiceController(config, commandCallback) {
       interimChunk = "";
       try { recognizer.stop(); } catch (e) { /* not running */ }
       setStatus("");
+      logLine("Mic disabled.", "mic");
     }
   });
 }

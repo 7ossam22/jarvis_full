@@ -13,7 +13,7 @@ import uuid
 
 from . import history, persona, retrieval
 from .graph import build_graph, regenerate_graph
-from .images import extract_image_references
+from .images import extract_media_references, extract_image_references
 from .providers.anthropic_provider import call_model
 from .providers.elevenlabs_provider import call_elevenlabs_tts
 
@@ -51,9 +51,12 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
         user_content = f"SOURCE NOTES:\n{context}\n\nUSER QUESTION: {question}"
     else:
         user_content = (
-            "No SOURCE NOTES were relevant to this message — treat it as small talk / "
-            f"general conversation, not a notes lookup.\n\nUSER MESSAGE: {question}"
+            "No SOURCE NOTES were relevant to this message.\n"
+            "If the user is asking to check, fetch, or send emails, or look up information, "
+            "use your available tools (such as Gmail tools or WebSearch) to fulfill the request.\n\n"
+            f"USER MESSAGE: {question}"
         )
+
 
     max_turns = cfg.get("retrieval.max_history_turns", 6)
     hist = history.get_history(session_id)
@@ -66,7 +69,7 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
     system_prompt = persona.build_system_prompt(cfg)
     answer = call_model(cfg, system_prompt, messages, fallback)
     max_images = cfg.get("images.max_gallery", 6)
-    answer, image_urls = extract_image_references(answer, max_images)
+    answer, image_urls, video_urls = extract_media_references(answer, max_images)
 
     history.append_history(session_id, "user", user_content, max_turns)
     history.append_history(session_id, "assistant", answer, max_turns)
@@ -76,7 +79,9 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
         "nodes": [n["id"] for n in relevant],
         "session_id": session_id,
         "image_urls": image_urls,
+        "video_urls": video_urls,
     }, 200
+
 
 
 def handle_remember(cfg, notes_dir, viewer_dir, body):

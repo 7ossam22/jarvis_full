@@ -3,7 +3,10 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>JARVIS — Neural Core</title>
+<title>JARVIS — Humanoid Neural Core (Vanilla Latte Edition)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/three@0.160.1/build/three.min.js"></script>
 <script src="https://unpkg.com/3d-force-graph@1.73.4/dist/3d-force-graph.min.js"></script>
 <script src="graph-data.js"></script>
@@ -13,14 +16,123 @@
 
 <div id="graph"></div>
 
-<div id="hud">
-  <div class="brand">J.A.R.V.I.S.</div>
-  <div id="note-count"></div>
+<!-- Top Navigation & System Status HUD -->
+<header id="hud">
+  <div class="hud-left">
+    <div class="brand">
+      <span class="brand-icon">🧠</span>
+      <span class="brand-name">J.A.R.V.I.S.</span>
+      <span class="brand-tag">VANILLA LATTE NEURAL CORE</span>
+    </div>
+    
+    <div class="hud-search">
+      <span class="search-icon">🔍</span>
+      <input id="graph-search" type="text" placeholder="Filter notes in 3D..." autocomplete="off" />
+    </div>
+
+    <div class="hud-metrics">
+      <span class="metric-badge"><span class="pulse-dot"></span> <span id="status-text">ONLINE</span></span>
+      <span class="metric-badge" id="note-count">0 notes indexed</span>
+      <span class="metric-badge" id="synapse-count">Pathways: Active</span>
+    </div>
+  </div>
+  
+  <div class="hud-right">
+    <div class="view-mode-group">
+      <button class="mode-btn active" id="mode-cortex" title="Humanoid Brain Cortex View">🧠 Cortex</button>
+      <button class="mode-btn" id="mode-network" title="Full Synaptic Network View">🕸️ Network</button>
+      <button class="mode-btn" id="mode-analytics" title="Neural Analytics Dashboard">📊 Analytics</button>
+    </div>
+    <div class="voice-viz-container" title="Audio Spectrum Visualizer">
+      <span class="viz-label">VOICE WAVE</span>
+      <canvas id="voice-waveform" width="100" height="18"></canvas>
+    </div>
+  </div>
+</header>
+
+<!-- Floating 3D Brain View Controls (Left Sidebar) -->
+<nav id="brain-toolbar">
+  <button id="tb-focus-brain" title="Focus Full Brain View" class="active">
+    <span class="icon">🧠</span>
+    <span class="label">Full Brain</span>
+  </button>
+  <button id="tb-pulse-synapses" title="Trigger Neural Pulse Glow">
+    <span class="icon">⚡</span>
+    <span class="label">Neural Pulse</span>
+  </button>
+  <button id="tb-toggle-wire" title="Toggle Outer Cortex Shell">
+    <span class="icon">🌐</span>
+    <span class="label">Cortex Shell</span>
+  </button>
+  <button id="tb-toggle-rotate" title="Toggle Auto Rotation">
+    <span class="icon">🔄</span>
+    <span class="label">Auto-Spin</span>
+  </button>
+  <button id="tb-reset-cam" title="Reset Camera View">
+    <span class="icon">🎯</span>
+    <span class="label">Reset View</span>
+  </button>
+</nav>
+
+<!-- Speaking Indicator Banner -->
+<div id="speaking-indicator" class="hidden">
+  <div class="speaking-wave">
+    <span></span><span></span><span></span><span></span><span></span>
+  </div>
+  <span class="speaking-text">JARVIS IS SPEAKING...</span>
 </div>
 
 <div id="status-line"></div>
 <div id="answer-toast"></div>
 
+<!-- System Log / Terminal Section (Positioned at Bottom Right) -->
+<div id="console-log">
+  <div id="console-log-header">
+    <div class="log-title">
+      <span class="log-dot"></span>
+      <span>SYSTEM TERMINAL LOG</span>
+    </div>
+    <span id="console-log-toggle" title="Collapse/expand">▾</span>
+  </div>
+  <div id="console-log-body"></div>
+</div>
+
+<!-- Neural Analytics Dashboard Overlay Modal -->
+<div id="analytics-modal" class="hidden">
+  <div class="analytics-card">
+    <div class="modal-header">
+      <div class="title-wrap">
+        <span>📊</span>
+        <h3>NEURAL SYSTEM ANALYTICS</h3>
+      </div>
+      <button id="analytics-close">✕</button>
+    </div>
+    <div class="analytics-grid">
+      <div class="stat-box">
+        <span class="stat-num" id="stat-total-notes">0</span>
+        <span class="stat-lbl">Total Memory Notes</span>
+      </div>
+      <div class="stat-box">
+        <span class="stat-num" id="stat-total-links">0</span>
+        <span class="stat-lbl">Synaptic Connections</span>
+      </div>
+      <div class="stat-box">
+        <span class="stat-num">99.8%</span>
+        <span class="stat-lbl">Neural Core Health</span>
+      </div>
+      <div class="stat-box">
+        <span class="stat-num">12ms</span>
+        <span class="stat-lbl">Memory Retrieval Latency</span>
+      </div>
+    </div>
+    <div class="cluster-section">
+      <h4>Topological Knowledge Clusters</h4>
+      <div id="cluster-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Detailed Note Inspector Side Panel (Top Right) -->
 <div id="panel">
   <span class="close" id="panel-close">✕</span>
   <div class="group-tag" id="panel-group"></div>
@@ -30,19 +142,43 @@
 
 <div id="reference-layer"></div>
 
-<div id="dock">
-  <button id="mic-btn" title="Toggle always-listening (say “Jarvis” to talk)">🎙</button>
-  <input id="chat-input" type="text" placeholder="Ask about your notes, or say “remember that…”" autocomplete="off" />
-  <button id="send-btn" title="Send">➤</button>
+<!-- Prompt Suggestion Chips & Bottom Chat Dock -->
+<div id="dock-container">
+  <div id="prompt-chips">
+    <button class="chip" data-prompt="Get my latest email">📧 Check Latest Email</button>
+    <button class="chip" data-prompt="List my Discord servers">💬 Discord Servers</button>
+    <button class="chip" data-prompt="Summarize my notes">⚡ Summarize Notes</button>
+    <button class="chip" data-prompt="Show me a video clip of coffee making">🎥 Video Demo</button>
+    <button class="chip" data-prompt="What projects am I working on?">🧠 Active Projects</button>
+    <button class="chip" data-prompt="List recent memory items">💡 Memory Items</button>
+    <button class="chip" data-prompt="Tell me about the neural graph">📊 Graph Overview</button>
+  </div>
+
+
+
+  <div id="dock">
+    <button id="mic-btn" title="Toggle always-listening (say “Jarvis” to talk)">🎙</button>
+    <input id="chat-input" type="text" placeholder="Ask about your notes, or say “remember that…”" autocomplete="off" />
+    <button id="send-btn" title="Send message">➤</button>
+    <button id="new-session-btn" title="Start a fresh session">⟲</button>
+  </div>
 </div>
 
+<!-- Boot Overlay -->
 <div id="boot">
-  <div class="ring"></div>
-  <h1>Neural Core</h1>
-  <button id="wake-btn">Wake JARVIS</button>
-  <small>Browsers block audio until you interact with the page once — click above to boot JARVIS and unlock his voice. Once awake, he's always listening — just say “Jarvis” before your question.</small>
+  <div class="boot-card">
+    <div class="latte-brain-ring">
+      <span class="core-icon">🧠</span>
+    </div>
+    <h1>JARVIS NEURAL CORE</h1>
+    <p class="subtitle">Vanilla Latte Intelligence System</p>
+    <button id="wake-btn">Wake JARVIS</button>
+    <small>Click above to initialize the Humanoid Neural Core & unlock voice synthesis. JARVIS is always listening — just say “Jarvis” before your prompt.</small>
+  </div>
 </div>
 
 <script type="module" src="js/main.js"></script>
 </body>
 </html>
+
+
