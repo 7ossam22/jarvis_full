@@ -52,15 +52,39 @@ function speakWithBrowserVoice(text, wasListening) {
 }
 
 let currentAudio = null;
-export async function speak(text) {
+let currentWasListening = false;
+
+export function isSpeaking() {
+  return !!currentAudio || ("speechSynthesis" in window && speechSynthesis.speaking);
+}
+
+export function stopSpeaking() {
+  if (currentAudio) {
+    try {
+      currentAudio.pause();
+      currentAudio.currentTime = 0;
+    } catch (e) {}
+    currentAudio = null;
+  }
+  if ("speechSynthesis" in window) {
+    try { speechSynthesis.cancel(); } catch (e) {}
+  }
+  clearTimeout(speak._safety);
+  stopBrainGlow();
+  hideAnswer();
+  logLine("Speech interrupted by user.", "mic");
+  micHooks.resumeMic(currentWasListening);
+}
+
+export async function speak(text, options = {}) {
   if (!text) return;
-  if (currentAudio) { try { currentAudio.pause(); } catch (e) {} currentAudio = null; }
-  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  if (isSpeaking()) {
+    stopSpeaking();
+  }
 
   const wasListening = onSpeechStart();
-  // Safety net only — if playback somehow never fires onended/onerror (a stuck
-  // stream, a browser quirk), don't leave the mic paused and the toast stuck
-  // forever. Harmless if the real completion already fired first.
+  currentWasListening = wasListening;
+
   clearTimeout(speak._safety);
   speak._safety = setTimeout(() => onSpeechEnd(wasListening), 45000);
 
@@ -75,9 +99,8 @@ export async function speak(text) {
     await audio.play();
     logLine("Speaking (ElevenLabs voice).", "mic");
   } catch (err) {
-    // No ElevenLabs key configured, network hiccup, autoplay block — fall back
-    // to the browser's own voice rather than JARVIS going silent.
     logLine("ElevenLabs unavailable — falling back to browser voice.", "error");
     speakWithBrowserVoice(text, wasListening);
   }
 }
+

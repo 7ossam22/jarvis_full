@@ -11,9 +11,23 @@ import { setNoteCount } from "../view/hud.js";
 import { closePanel } from "../view/panel.js";
 import * as referenceWindows from "../view/referenceWindows.js";
 import * as scene from "../view/scene.js";
-import { speak } from "./speechController.js";
+import { speak, stopSpeaking, isSpeaking } from "./speechController.js";
 import { standbyStatus } from "./voiceController.js";
 import { log as logLine } from "../view/console.js";
+
+const THINKING_CUES = [
+  "Allow me a moment, sir...",
+  "Processing that for you, sir...",
+  "Let me look into that, sir...",
+  "Checking on that right now, sir...",
+  "On it, sir...",
+  "Just a moment, sir..."
+];
+
+function getRandomThinkingCue() {
+  return THINKING_CUES[Math.floor(Math.random() * THINKING_CUES.length)];
+}
+
 
 const SESSION_KEY = "jarvis_session_id";
 let sessionId = sessionStorage.getItem(SESSION_KEY);
@@ -42,6 +56,10 @@ export async function handleSubmit(text) {
   if (!text) return;
   input.value = "";
 
+  if (isSpeaking()) {
+    stopSpeaking();
+  }
+
   // Only intercept as a dismiss command if there's actually a reference
   // window open — otherwise a stray "close that" falls through to Claude
   // like any other question, rather than silently swallowing it.
@@ -60,7 +78,11 @@ export async function handleSubmit(text) {
 }
 
 async function handleChat(text) {
-  setStatus("● thinking…");
+  const cue = getRandomThinkingCue();
+  setStatus(`● thinking… (${cue})`);
+  showAnswer(cue);
+  speak(cue);
+
   logLine(`POST /chat "${text}"`, "net");
   try {
     const data = await chatRequest(text, sessionId);
@@ -80,7 +102,6 @@ async function handleChat(text) {
       const node = nodeById(ids[0]);
       if (node) scene.flyToNode(node, { openPanel: true });
     }
-    // small talk (ids.length === 0): no camera movement, per the personality spec.
   } catch (err) {
     setStatus(standbyStatus());
     logLine(`/chat request failed: ${err}`, "error");
@@ -89,11 +110,16 @@ async function handleChat(text) {
 }
 
 async function handleRemember(text) {
-  setStatus("● thinking…");
+  const cue = getRandomThinkingCue();
+  setStatus(`● thinking… (${cue})`);
+  showAnswer(cue);
+  speak(cue);
+
   logLine(`POST /remember "${text}"`, "net");
   try {
     const data = await rememberRequest(text, sessionId);
     setStatus(standbyStatus());
+
     if (!data.node) {
       logLine(data.confirmation || "(nothing filed)", "reply");
       showAnswer(data.confirmation || "I couldn't file that, sir.");

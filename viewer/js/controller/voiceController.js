@@ -10,7 +10,8 @@
 // standbyStatus() — circular). Instead it calls the onCommand callback
 // injected via initVoiceController(); main.js wires that to
 // chatController.handleSubmit at boot.
-import { speak } from "./speechController.js";
+import { speak, stopSpeaking, isSpeaking } from "./speechController.js";
+
 import { showAnswer } from "../view/toast.js";
 import { setStatus } from "../view/statusLine.js";
 import { log as logLine } from "../view/console.js";
@@ -211,6 +212,9 @@ export function initVoiceController(config, commandCallback) {
     }
   };
   recognizer.onresult = (e) => {
+    if (isSpeaking()) {
+      stopSpeaking();
+    }
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const result = e.results[i];
       if (result.isFinal) {
@@ -220,6 +224,7 @@ export function initVoiceController(config, commandCallback) {
         interimChunk = result[0].transcript;
       }
     }
+
     // Any speech activity — final or still-interim — pushes back the commit,
     // rather than acting on the first final chunk immediately.
     clearTimeout(silenceCommitTimer);
