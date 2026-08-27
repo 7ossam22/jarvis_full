@@ -12,7 +12,7 @@ import { initConsole, log as logLine } from "./view/console.js";
 import {
   initVoiceController, pauseMic, resumeMic, enableListening, hasRecognizer,
 } from "./controller/voiceController.js";
-import { handleSubmit } from "./controller/chatController.js";
+import { handleSubmit, cancelPendingRequests } from "./controller/chatController.js";
 
 async function boot() {
   initConsole();
@@ -28,7 +28,7 @@ async function boot() {
   // playback, voiceController needs to speak() its own acknowledgments —
   // neither module imports the other directly.
   setMicHooks({ pauseMic, resumeMic });
-  initVoiceController(config, handleSubmit);
+  initVoiceController(config, handleSubmit, cancelPendingRequests);
 
   document.getElementById("wake-btn").addEventListener("click", () => {
     document.getElementById("boot").style.display = "none";

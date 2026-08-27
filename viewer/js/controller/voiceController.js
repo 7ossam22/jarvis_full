@@ -34,7 +34,7 @@ let CONVO_CLOSINGS = ["Very good, sir. I'll be here when you need me."];
 // Loosely-matched, unambiguous session-enders — safe to match anywhere at the
 // start of the utterance since they essentially never open a genuine follow-up
 // request in the same breath.
-const CONVO_END_STRONG_RE = /^(?:ok(?:ay)?[,.]?\s*)?(bye|goodbye|good\s*bye|see\s+you|we'?re\s+done|i'?m\s+done|(you'?re\s+|you\s+are\s+|you\s+)?good\s+to\s+go|no(?:thing)?\s+else(?:\s+for\s+now)?|that'?s?\s+(?:all|it|everything)(?:\s+for\s+now)?|that(?:'?ll|\s+will)\s+be\s+all|stop\s+listening|go\s+to\s+(?:sleep|standby))\b/i;
+const CONVO_END_STRONG_RE = /^(?:ok(?:ay)?[,.]?\s*)?(bye|goodbye|good\s*bye|see\s+you|we'?re\s+done|i'?m\s+done|(you'?re\s+|you\s+are\s+|you\s+)?good\s+to\s+go|no(?:thing)?\s+else(?:\s+for\s+now)?|that'?s?\s+(?:all|it|everything)(?:\s+for\s+now)?|that(?:'?ll|\s+will)\s+be\s+all|stop(?:\s+(?:it|that|listening|everything))?|cancel(?:\s+(?:it|that|everything))?|never\s*mind|forget\s+(?:it|that)|enough|stand\s+down|go\s+to\s+(?:sleep|standby))[.!]?\s*$/i;
 // "Thanks"/"thank you" are closing signals but genuinely ambiguous mid-conversation
 // ("thanks, and also check the weather") — only treat them as a goodbye when they
 // ARE the utterance (plus minor trailing pleasantries or his name), not just its
@@ -63,6 +63,7 @@ let conversationActive = false; // true once a real exchange has happened — wh
                                  // no "Jarvis" prefix is needed for follow-ups, until a
                                  // closing phrase (see isConversationClosing) ends it.
 let onCommand = () => {};
+let onCancel = () => {};        // injected: orphans in-flight requests (chatController)
 
 export function standbyStatus() {
   if (!listeningEnabled) return "";
@@ -89,7 +90,10 @@ function armAwaitingCommand() {
 
 function endConversation() {
   conversationActive = false;
-  logLine("Conversation ended.", "mic");
+  // A closing phrase means "stand down": whatever is still being worked on —
+  // an in-flight /chat, a reply about to be spoken — is cancelled with it.
+  onCancel();
+  logLine("Conversation ended — pending work cancelled.", "mic");
   const bye = CONVO_CLOSINGS[Math.floor(Math.random() * CONVO_CLOSINGS.length)];
   showAnswer(bye);
   speak(bye);
@@ -159,13 +163,17 @@ export function enableListening() {
   listeningEnabled = true;
 }
 
-export function initVoiceController(config, commandCallback) {
+export function initVoiceController(config, commandCallback, cancelCallback) {
   onCommand = commandCallback;
+  if (cancelCallback) onCancel = cancelCallback;
 
   const wakePattern = config?.wake_word?.pattern || "jarvis";
   WAKE_RE = new RegExp(`\\b${escapeRegExp(wakePattern)}\\b[,:]?\\s*`, "i");
   AWAIT_COMMAND_MS = config?.wake_word?.await_command_ms ?? 6000;
-  SILENCE_COMMIT_MS = config?.wake_word?.silence_commit_ms ?? 1300;
+  // Floors, not literal values: below these the recognizer commits mid-word
+  // fragments, each firing its own /chat request — the failure mode that made
+  // JARVIS "lose his brain" under a storm of overlapping model calls.
+  SILENCE_COMMIT_MS = Math.max(600, config?.wake_word?.silence_commit_ms ?? 1300);
   if (config?.conversation?.closing_lines?.length) {
     CONVO_CLOSINGS = config.conversation.closing_lines;
   }
@@ -227,6 +235,19 @@ export function initVoiceController(config, commandCallback) {
 
     // Any speech activity — final or still-interim — pushes back the commit,
     // rather than acting on the first final chunk immediately.
+    //
+    // A prior version shortened this wait once a chunk came back `isFinal`,
+    // on the theory that Chrome's endpointer had already decided the sentence
+    // was over. That was wrong and broke ordinary follow-up commands: Chrome's
+    // continuous-mode finalization is known to fire well before a person is
+    // actually done talking (see the top-of-file note), and the gap between
+    // that early final and the next chunk of the SAME sentence regularly
+    // exceeded the shortened window — so real commands kept getting commit
+    // ted (and sent to the model) mid-sentence, fragment by fragment, while
+    // only short one-shot utterances like the wake word or a bare "stop"
+    // happened to fit inside the narrow window and kept working. Reaction
+    // speed is tuned by lowering SILENCE_COMMIT_MS itself (see the floor
+    // above), not by trusting isFinal as a completion signal.
     clearTimeout(silenceCommitTimer);
     silenceCommitTimer = setTimeout(commitUtterance, SILENCE_COMMIT_MS);
     // Speech is actively arriving, so cancel the separate "gave up waiting for

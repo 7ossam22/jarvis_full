@@ -121,9 +121,9 @@ Almost every behavior tunable lives in `config.json` — see
 | Section | Controls |
 |---|---|
 | `server` | Port and bind address (`0.0.0.0` reaches your LAN, `127.0.0.1` is local-only) |
-| `model` | Anthropic API key and model ID |
+| `model` | Two interchangeable LLM backends behind one interface (`app/providers/llm.py`) — Anthropic Claude (`provider_api_key`, `model_id`; falls back to the local `claude` CLI with no key) and Google Gemini (`gemini_api_key`, `gemini_model_id`). Set `"provider": "gemini"` or `"anthropic"` to pick which one is tried first; whichever is configured but not chosen is kept as automatic failover. Leave `provider` unset and Anthropic goes first, for backward compatibility. |
 | `persona` | Name, address term ("sir"), tone description, and a free-text `system_prompt_extra` for tweaks that don't need a code change |
-| `voice` | ElevenLabs API key, voice ID, and TTS model ID |
+| `voice` | Three interchangeable TTS backends behind one interface (`app/providers/tts.py`) — ElevenLabs, Fish Audio, and local Kokoro. Set `"tts_provider"` to pick which one is tried first, same failover behavior as `model.provider` above. |
 | `wake_word` | The wake word itself, how long to wait for a command after a bare "Jarvis", and how long to wait for silence before treating a sentence as finished |
 | `conversation` | Extra closing phrases to end conversation mode, and the spoken sign-off lines |
 | `retrieval` | How many notes to retrieve per question, how many turns of history to keep |
@@ -195,8 +195,8 @@ notes/captures/                notes JARVIS writes for you via "remember that…
 | Mic button does nothing | Chrome → lock icon in the address bar → allow Microphone. Must be Chrome or Edge. |
 | No sound | Click **Wake JARVIS** once — browsers block audio before the first interaction. |
 | Page looks stale after a change | Hard reload: `Cmd+Shift+R` / `Ctrl+Shift+R`. |
-| "I appear to be without a working brain" | You haven't set `model.provider_api_key` in `config.json`, or the `claude` CLI isn't installed/logged in either. |
-| JARVIS uses the browser voice instead of ElevenLabs | No `voice.elevenlabs_api_key` configured, or the ElevenLabs call failed — check the server's console output. |
+| "I appear to be without a working brain" | Neither LLM backend is usable: no `model.provider_api_key` (Anthropic) or `model.gemini_api_key` (Gemini) in `config.json`, and the `claude` CLI isn't installed/logged in either. |
+| JARVIS uses the browser voice instead of a real one | None of the three TTS backends (ElevenLabs/Fish Audio/Kokoro) are configured, or all of them failed — check the server's console output. |
 | Answers are generic / off-topic | Your notes folder is thin on that topic, or you pointed `build.py` at the wrong path — re-run `python3 build.py /full/path/to/notes`. |
 | Port 4700 already in use | Another `server.py` is still running — stop it, or edit `server.port` in `config.json`. |
 | Mic cuts off while you're still talking | Should no longer happen — see `wake_word.silence_commit_ms` in `config.json` if you want it more/less patient. |

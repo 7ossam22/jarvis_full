@@ -3,7 +3,7 @@
 const referenceLayer = document.getElementById("reference-layer");
 let referenceWindows = []; // [{ el }]
 
-const DISMISS_RE = /^(dismiss|close|hide|remove|clear)\b.*\b(that|those|it|them|image|images|picture|pictures|photo|photos|video|videos|clip|clips|movie|movies|reference|window|windows|gallery)\b|^(dismiss|close|hide)\s+(that|it|those|them)$/i;
+const DISMISS_RE = /^(dismiss|close|hide|remove|clear)\b.*\b(that|those|it|them|image|images|picture|pictures|photo|photos|video|videos|clip|clips|movie|movies|reference|window|windows|gallery|page|site|viewer|screen)\b|^(dismiss|close|hide)\s+(that|it|those|them)$/i;
 
 export function isDismissCommand(text) {
   return DISMISS_RE.test(text);

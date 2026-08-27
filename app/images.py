@@ -10,6 +10,7 @@ import re
 IMAGE_LINE_RE = re.compile(r"^[ \t]*IMAGE:[ \t]*(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 VIDEO_LINE_RE = re.compile(r"^[ \t]*VIDEO:[ \t]*(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 SOURCE_LINE_RE = re.compile(r"^[ \t]*SOURCE:[ \t]*(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+SHOW_LINE_RE = re.compile(r"^[ \t]*SHOW:[ \t]*(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 
 
 def _clean_urls(matches, max_urls):
@@ -26,25 +27,29 @@ def _clean_urls(matches, max_urls):
 
 
 def extract_media_references(answer, max_media=6):
-    """Pulls trailing 'IMAGE: <url>', 'VIDEO: <url>' and 'SOURCE: <url>' lines
-    out of reply. Returns (clean_answer, image_urls, video_urls, source_urls)."""
+    """Pulls trailing 'IMAGE: <url>', 'VIDEO: <url>', 'SOURCE: <url>' and
+    'SHOW: <url>' lines out of reply. Returns (clean_answer, image_urls,
+    video_urls, source_urls, show_url)."""
     img_matches = list(IMAGE_LINE_RE.finditer(answer))
     vid_matches = list(VIDEO_LINE_RE.finditer(answer))
     src_matches = list(SOURCE_LINE_RE.finditer(answer))
+    show_matches = list(SHOW_LINE_RE.finditer(answer))
 
     clean = IMAGE_LINE_RE.sub("", answer)
     clean = VIDEO_LINE_RE.sub("", clean)
-    clean = SOURCE_LINE_RE.sub("", clean).strip()
+    clean = SOURCE_LINE_RE.sub("", clean)
+    clean = SHOW_LINE_RE.sub("", clean).strip()
     clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
 
     image_urls = _clean_urls(img_matches, max_media)
     video_urls = _clean_urls(vid_matches, max_media)
     source_urls = _clean_urls(src_matches, 3)
+    show_urls = _clean_urls(show_matches, 1)
 
-    return clean, image_urls, video_urls, source_urls
+    return clean, image_urls, video_urls, source_urls, (show_urls[0] if show_urls else None)
 
 
 def extract_image_references(answer, max_images=6):
-    clean, images, _, _ = extract_media_references(answer, max_images)
+    clean, images, _, _, _ = extract_media_references(answer, max_images)
     return clean, images
 

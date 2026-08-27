@@ -11,7 +11,9 @@ viewer/graph-data.js
 __pycache__/
 *.py[cod]
 .venv/
+.venv-browser/
 venv/
+tools/browser_daemon.log
 
 # OS
 .DS_Store

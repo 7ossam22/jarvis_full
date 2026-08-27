@@ -1,0 +1,136 @@
+"""app/providers/gemini_provider.py — Google Gemini text generation (Model
+layer): the GeminiProvider implementation of the LLMProvider interface in
+llm.py. Direct Gemini API (generateContent) with its own function-calling
+tool-use loop, reusing the same Gmail/Discord/browser connector tool
+definitions as the Anthropic provider — only the request/response shapes
+differ, so the two providers behave identically to the rest of the app.
+
+Standard library only (urllib), same as every other provider here. No CLI
+fallback: unlike Anthropic (which can fall back to a locally logged-in
+`claude` subscription), there is no equivalent free local fallback for
+Gemini in this app, so this provider is simply skipped when unconfigured.
+"""
+import json
+import urllib.request
+
+from .llm import LLMProvider
+from ..connectors.gmail import get_gmail_tools, execute_gmail_tool
+from ..connectors.discord import get_discord_tools, execute_discord_tool
+from ..connectors.browser import get_browser_tools, execute_browser_tool
+
+DEFAULT_MODEL = "gemini-flash-latest"
+API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+
+def _to_gemini_schema(tools):
+    """Anthropic-style tool specs ({"name", "description", "input_schema"})
+    to Gemini's functionDeclarations ({"name", "description", "parameters"}).
+    Both use an OpenAPI-subset JSON Schema for the parameter object, so this
+    is a rename, not a translation."""
+    return [
+        {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}
+        for t in tools
+    ]
+
+
+def _execute_tool(cfg, tool_name, tool_input):
+    if tool_name.startswith("gmail_"):
+        return execute_gmail_tool(cfg, tool_name, tool_input)
+    elif tool_name.startswith("discord_"):
+        return execute_discord_tool(cfg, tool_name, tool_input)
+    elif tool_name.startswith("browser_") or tool_name == "system_open":
+        return execute_browser_tool(cfg, tool_name, tool_input)
+    return {"error": f"Tool {tool_name} not found"}
+
+
+def _to_gemini_contents(messages):
+    """Our internal messages are plain {"role": "user"|"assistant", "content":
+    str} turns (the tool-call back-and-forth stays local to each provider's own
+    loop and never enters this list) — Gemini just wants "model" instead of
+    "assistant"."""
+    contents = []
+    for m in messages:
+        role = "model" if m.get("role") == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": str(m.get("content", ""))}]})
+    return contents
+
+
+def call_gemini(cfg, system_prompt, messages):
+    api_key = cfg.get("model.gemini_api_key")
+    model = cfg.get("model.gemini_model_id") or DEFAULT_MODEL
+
+    tool_specs = get_gmail_tools() + get_discord_tools() + get_browser_tools()
+    tools = [
+        {"google_search": {}},
+        {"function_declarations": _to_gemini_schema(tool_specs)},
+    ]
+
+    contents = _to_gemini_contents(messages)
+    payload_dict = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": contents,
+        "tools": tools,
+        # Required as of the current API whenever a built-in tool (google_search)
+        # is combined with custom function_declarations in one request — without
+        # it Gemini rejects the call with a 400 INVALID_ARGUMENT.
+        "tool_config": {"include_server_side_tool_invocations": True},
+    }
+
+    url = f"{API_BASE}/{model}:generateContent?key={api_key}"
+
+    for turn in range(5):
+        payload = json.dumps(payload_dict).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=payload, method="POST",
+            headers={"content-type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=35) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+
+        candidates = body.get("candidates") or []
+        if not candidates:
+            block_reason = (body.get("promptFeedback") or {}).get("blockReason")
+            raise ValueError(f"Gemini returned no candidates (block reason: {block_reason})")
+
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        function_calls = [p["functionCall"] for p in parts if "functionCall" in p]
+
+        if function_calls:
+            # The model's turn (including its thoughtSignature) must be echoed
+            # back verbatim before the tool results, or the next call 400s.
+            contents.append({"role": "model", "parts": parts})
+            response_parts = []
+            for call in function_calls:
+                tool_name = call.get("name", "")
+                tool_input = call.get("args") or {}
+                result_data = _execute_tool(cfg, tool_name, tool_input)
+                response_parts.append({
+                    "functionResponse": {
+                        "name": tool_name,
+                        "response": {"result": result_data},
+                        # Echoes the functionCall's own "id" — required to match
+                        # the call it answers, the same role tool_use_id plays
+                        # on the Anthropic side.
+                        "id": call.get("id"),
+                    }
+                })
+            # Tool results go back as role "user", not "function" — the
+            # Gemini API rejects a "function" role turn with a 400.
+            contents.append({"role": "user", "parts": response_parts})
+            payload_dict["contents"] = contents
+            continue
+
+        return "".join(p.get("text", "") for p in parts)
+
+    return ""
+
+
+class GeminiProvider(LLMProvider):
+    name = "gemini"
+
+    def is_configured(self):
+        key = self._cfg.get("model.gemini_api_key") or ""
+        return bool(key.strip()) and "PUT-YOUR" not in key
+
+    def converse(self, system_prompt, messages):
+        return call_gemini(self._cfg, system_prompt, messages)

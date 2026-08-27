@@ -4,8 +4,11 @@
     "bind": "0.0.0.0"
   },
   "model": {
+    "provider": "",
     "provider_api_key": "PUT-YOUR-KEY-HERE",
-    "model_id": "claude-sonnet-5"
+    "model_id": "claude-sonnet-5",
+    "gemini_api_key": "PUT-YOUR-GEMINI-KEY-HERE",
+    "gemini_model_id": "gemini-flash-latest"
   },
   "persona": {
     "name": "JARVIS",
@@ -28,8 +31,8 @@
   },
   "wake_word": {
     "pattern": "jarvis",
-    "await_command_ms": 6000,
-    "silence_commit_ms": 1300
+    "await_command_ms": 3000,
+    "silence_commit_ms": 900
   },
   "conversation": {
     "extra_closing_phrases": [],

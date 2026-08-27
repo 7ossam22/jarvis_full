@@ -1,15 +1,20 @@
-"""app/providers/anthropic_provider.py — model calling (Model layer):
-direct Anthropic API with custom tool-use loop & remote MCP server support,
-falling back to `claude -p` CLI or canned response.
+"""app/providers/anthropic_provider.py — Anthropic Claude text generation
+(Model layer): the AnthropicProvider implementation of the LLMProvider
+interface in llm.py. Direct API with a custom tool-use loop & remote MCP
+server support, falling back to the `claude -p` CLI (useful with no API key
+but a logged-in Claude Code subscription) when the API is unreachable.
 """
 import json
+import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 
+from .llm import LLMProvider
 from ..connectors.gmail import get_gmail_tools, execute_gmail_tool
 from ..connectors.discord import get_discord_tools, execute_discord_tool
+from ..connectors.browser import get_browser_tools, execute_browser_tool
 
 
 def call_anthropic(cfg, system_prompt, messages):
@@ -21,6 +26,7 @@ def call_anthropic(cfg, system_prompt, messages):
     ]
     tools.extend(get_gmail_tools())
     tools.extend(get_discord_tools())
+    tools.extend(get_browser_tools())
 
     curr_messages = list(messages)
     payload_dict = {
@@ -67,6 +73,8 @@ def call_anthropic(cfg, system_prompt, messages):
                         result_data = execute_gmail_tool(cfg, tool_name, tool_input)
                     elif tool_name.startswith("discord_"):
                         result_data = execute_discord_tool(cfg, tool_name, tool_input)
+                    elif tool_name.startswith("browser_") or tool_name == "system_open":
+                        result_data = execute_browser_tool(cfg, tool_name, tool_input)
                     else:
                         result_data = {"error": f"Tool {tool_name} not found"}
 
@@ -92,6 +100,7 @@ def call_anthropic(cfg, system_prompt, messages):
 CONNECTOR_HINTS = (
     "discord", "email", "gmail", "mail", "inbox", "send", "post",
     "share", "message", "dm", "channel",
+    "open", "close", "browser", "tab", "website", "launch",
 )
 
 
@@ -103,7 +112,7 @@ def _decide_connector_action(cfg, messages):
     transcript = "\n\n".join(
         f"{m['role'].upper()}: {m['content']}" for m in messages[-6:]
     )
-    tool_specs = get_gmail_tools() + get_discord_tools()
+    tool_specs = get_gmail_tools() + get_discord_tools() + get_browser_tools()
     tools_desc = json.dumps(
         [{"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]}
          for t in tool_specs]
@@ -123,6 +132,10 @@ def _decide_connector_action(cfg, messages):
         "conversation, append the most relevant link to the message/body being sent.\n"
         "- For discord_send_message, channel_id may be a channel NAME like 'general' — it is "
         "resolved automatically. Default to 'general' when the user names no channel.\n"
+        "- browser_open_url / browser_close are for a real on-screen browser window: use them "
+        "when the user says to OPEN a website/video/page as a window, or to close what was "
+        "opened. Do NOT use them when the user says 'show me X' — showing happens inside the "
+        "assistant's own interface, so that is {\"tool\": \"none\"}.\n"
     )
     try:
         res = subprocess.run(
@@ -152,6 +165,8 @@ def call_claude_cli(cfg, system_prompt, messages):
                 result = execute_gmail_tool(cfg, tool_name, tool_input)
             elif tool_name.startswith("discord_"):
                 result = execute_discord_tool(cfg, tool_name, tool_input)
+            elif tool_name.startswith("browser_") or tool_name == "system_open":
+                result = execute_browser_tool(cfg, tool_name, tool_input)
             else:
                 result = None
             if result is not None:
@@ -180,16 +195,19 @@ def call_claude_cli(cfg, system_prompt, messages):
 
 
 
-def call_model(cfg, system_prompt, messages, fallback_text):
-    if cfg.has_real_api_key():
-        try:
-            return call_anthropic(cfg, system_prompt, messages)
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError) as e:
-            print(f"[jarvis] Anthropic API call failed ({e}); trying claude CLI…", file=sys.stderr)
-    try:
+class AnthropicProvider(LLMProvider):
+    name = "anthropic"
+
+    def is_configured(self):
+        return self._cfg.has_real_api_key() or shutil.which("claude") is not None
+
+    def converse(self, system_prompt, messages):
+        cfg = self._cfg
+        if cfg.has_real_api_key():
+            try:
+                return call_anthropic(cfg, system_prompt, messages)
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError) as e:
+                print(f"[jarvis] Anthropic API call failed ({e}); trying claude CLI…", file=sys.stderr)
         return call_claude_cli(cfg, system_prompt, messages)
-    except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, OSError) as e:
-        print(f"[jarvis] claude CLI fallback failed ({e})", file=sys.stderr)
-    return fallback_text
 
 

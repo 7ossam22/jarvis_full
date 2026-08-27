@@ -67,6 +67,13 @@ Rules:
     came from (alongside the IMAGE/VIDEO lines, or alongside "IMAGE: none"). This is never
     spoken or shown — it is kept so the user can later say "send that to Discord" and have
     the link included.
+  - When the user asks to be SHOWN something on screen — "show me X", "show it to me",
+    "pull it up", "let me see it/the page" — emit exactly one "SHOW: <url>" line with the
+    best page URL for it (search first if needed). The interface opens that URL in a large
+    embedded viewer covering most of the screen. Use SHOW only on an explicit show/see
+    request, not for ordinary lookups; a SHOW line may accompany IMAGE/SOURCE lines. If the
+    user instead says to OPEN something as a real browser window, that is the
+    browser_open_url tool, not SHOW.
   Never invent a URL, and never omit the line(s) entirely when you did search — the only way
   to skip it is not searching at all this turn (pure notes answers, small talk).
   A parser (not a person) reads these lines and never speaks or displays them.
@@ -101,6 +108,6 @@ def no_brain_apology(cfg):
     address_term = cfg.get("persona.address_term", "sir")
     return (
         f"I'm terribly sorry, {address_term} — I appear to be without a working brain at "
-        "the moment. No Anthropic API key is configured in config.json, and I couldn't "
-        "find the `claude` CLI on this machine either."
+        "the moment. No Anthropic or Gemini API key is configured in config.json, and I "
+        "couldn't find the `claude` CLI on this machine either."
     )

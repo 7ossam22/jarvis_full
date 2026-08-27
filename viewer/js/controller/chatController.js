@@ -14,6 +14,7 @@ import * as scene from "../view/scene.js";
 import { speak, stopSpeaking, isSpeaking } from "./speechController.js";
 import { standbyStatus } from "./voiceController.js";
 import { log as logLine } from "../view/console.js";
+import { openShowWindow, closeShowWindow, isShowWindowOpen } from "../view/showWindow.js";
 
 const THINKING_CUES = [
   "Allow me a moment, sir...",
@@ -34,6 +35,17 @@ let sessionId = sessionStorage.getItem(SESSION_KEY);
 if (!sessionId) {
   sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
   sessionStorage.setItem(SESSION_KEY, sessionId);
+}
+
+// Generation counter for in-flight requests. Each submitted command bumps it;
+// a reply is only acted on (spoken, shown, camera-flown) if it still belongs
+// to the newest command — so answering command #2 never gets cut off by the
+// late-arriving reply to command #1. Bumping it alone (cancelPendingRequests)
+// orphans everything in flight.
+let requestSeq = 0;
+
+export function cancelPendingRequests() {
+  requestSeq++;
 }
 
 const input = document.getElementById("chat-input");
@@ -61,10 +73,12 @@ export async function handleSubmit(text) {
   }
 
   // Only intercept as a dismiss command if there's actually a reference
-  // window open — otherwise a stray "close that" falls through to Claude
-  // like any other question, rather than silently swallowing it.
-  if (referenceWindows.hasOpenReferences() && referenceWindows.isDismissCommand(text)) {
+  // window or viewer open — otherwise a stray "close that" falls through to
+  // Claude like any other question, rather than silently swallowing it.
+  if ((referenceWindows.hasOpenReferences() || isShowWindowOpen()) && referenceWindows.isDismissCommand(text)) {
     referenceWindows.clearReferences();
+    closeShowWindow();
+    logLine("Viewer dismissed.", "system");
     showAnswer("Dismissed, sir.");
     speak("Dismissed, sir.");
     return;
@@ -78,6 +92,7 @@ export async function handleSubmit(text) {
 }
 
 async function handleChat(text) {
+  const seq = ++requestSeq;
   const cue = getRandomThinkingCue();
   setStatus(`● thinking… (${cue})`);
   showAnswer(cue);
@@ -86,12 +101,20 @@ async function handleChat(text) {
   logLine(`POST /chat "${text}"`, "net");
   try {
     const data = await chatRequest(text, sessionId);
+    if (seq !== requestSeq) {
+      logLine(`(stale reply dropped: "${(data.answer || "").slice(0, 60)}…")`, "system");
+      return;
+    }
     setStatus(standbyStatus());
     logLine(data.answer || "(empty reply)", "reply");
     showAnswer(data.answer || "");
     speak(data.answer || "");
     if ((data.image_urls && data.image_urls.length) || (data.video_urls && data.video_urls.length)) {
       referenceWindows.showReferences(data.image_urls, data.video_urls);
+    }
+    if (data.show_url) {
+      logLine(`Opening viewer: ${data.show_url}`, "system");
+      openShowWindow(data.show_url);
     }
 
     const ids = data.nodes || [];
@@ -103,6 +126,7 @@ async function handleChat(text) {
       if (node) scene.flyToNode(node, { openPanel: true });
     }
   } catch (err) {
+    if (seq !== requestSeq) return; // superseded — stay quiet
     setStatus(standbyStatus());
     logLine(`/chat request failed: ${err}`, "error");
     showAnswer("I couldn't reach the server, sir. Is server.py still running?");
@@ -110,6 +134,7 @@ async function handleChat(text) {
 }
 
 async function handleRemember(text) {
+  const seq = ++requestSeq;
   const cue = getRandomThinkingCue();
   setStatus(`● thinking… (${cue})`);
   showAnswer(cue);
@@ -118,6 +143,13 @@ async function handleRemember(text) {
   logLine(`POST /remember "${text}"`, "net");
   try {
     const data = await rememberRequest(text, sessionId);
+    // Note capture still lands in the graph even if superseded — the note WAS
+    // filed server-side — but a stale confirmation shouldn't talk over the
+    // newer command.
+    if (seq !== requestSeq) {
+      logLine("(stale /remember confirmation dropped)", "system");
+      return;
+    }
     setStatus(standbyStatus());
 
     if (!data.node) {
@@ -153,6 +185,7 @@ async function handleRemember(text) {
     setTimeout(() => scene.flyToNode(newNode, { openPanel: true }), 400);
     setTimeout(scene.clearHighlight, 3200);
   } catch (err) {
+    if (seq !== requestSeq) return; // superseded — stay quiet
     setStatus(standbyStatus());
     logLine(`/remember request failed: ${err}`, "error");
     showAnswer("I couldn't file that, sir — is server.py still running?");

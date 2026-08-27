@@ -14,7 +14,7 @@ import uuid
 from . import history, persona, retrieval
 from .graph import build_graph, regenerate_graph
 from .images import extract_media_references, extract_image_references
-from .providers.anthropic_provider import call_model
+from .providers.llm import call_model
 from .providers.tts import get_tts_providers
 
 
@@ -69,13 +69,15 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
     system_prompt = persona.build_system_prompt(cfg)
     answer = call_model(cfg, system_prompt, messages, fallback)
     max_images = cfg.get("images.max_gallery", 6)
-    answer, image_urls, video_urls, source_urls = extract_media_references(answer, max_images)
+    answer, image_urls, video_urls, source_urls, show_url = extract_media_references(answer, max_images)
 
     # The spoken/displayed answer never contains URLs (persona rule — TTS would
     # read them as gibberish), but later turns like "send that to Discord" need
     # them, so stash them in the history copy only as a reference footnote.
     hist_answer = answer
     ref_links = source_urls + video_urls + image_urls
+    if show_url and show_url not in ref_links:
+        ref_links.insert(0, show_url)
     if ref_links:
         hist_answer += "\n[reference links: " + ", ".join(ref_links[:4]) + "]"
 
@@ -88,6 +90,7 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
         "session_id": session_id,
         "image_urls": image_urls,
         "video_urls": video_urls,
+        "show_url": show_url,
     }, 200
 
 
