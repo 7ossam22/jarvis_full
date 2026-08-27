@@ -225,7 +225,15 @@ def cmd_screenshot(payload):
         save_path = os.path.join(captures_dir, f"browser_{ts}.png")
 
     page.screenshot(path=save_path, full_page=full_page)
-    return {"status": "screenshot_saved", "path": save_path, "url": page.url, "title": page.title()}
+    filename = os.path.basename(save_path)
+    return {
+        "status": "screenshot_saved",
+        "path": save_path,
+        "filename": filename,
+        "screenshot_url": f"/captures/{filename}",
+        "url": page.url,
+        "title": page.title()
+    }
 
 
 COMMANDS = {

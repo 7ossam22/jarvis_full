@@ -377,6 +377,25 @@ def _exec_lock_screen():
     return {"error": "Could not lock screen (neither loginctl nor xdg-screensaver succeeded)."}
 
 
+_last_screenshot = None
+
+
+def get_last_screenshot():
+    global _last_screenshot
+    return _last_screenshot
+
+
+def _set_last_screenshot(path):
+    global _last_screenshot
+    filename = os.path.basename(path)
+    _last_screenshot = {
+        "path": path,
+        "filename": filename,
+        "url": f"/captures/{filename}",
+        "timestamp": time.time(),
+    }
+
+
 def _exec_screenshot(save_path):
     captures_dir = os.path.join(ROOT, "notes", "captures")
     os.makedirs(captures_dir, exist_ok=True)
@@ -386,35 +405,49 @@ def _exec_screenshot(save_path):
     else:
         save_path = os.path.expanduser(save_path)
 
+    tool_used = None
     if shutil.which("scrot"):
         ok, _, _ = _run_cmd(["scrot", save_path])
         if ok and os.path.exists(save_path):
-            return {"status": "saved", "path": save_path, "tool": "scrot"}
+            tool_used = "scrot"
 
-    if shutil.which("maim"):
+    if not tool_used and shutil.which("maim"):
         ok, _, _ = _run_cmd(["maim", save_path])
         if ok and os.path.exists(save_path):
-            return {"status": "saved", "path": save_path, "tool": "maim"}
+            tool_used = "maim"
 
-    if shutil.which("import"):
+    if not tool_used and shutil.which("import"):
         ok, _, _ = _run_cmd(["import", "-window", "root", save_path])
         if ok and os.path.exists(save_path):
-            return {"status": "saved", "path": save_path, "tool": "import"}
+            tool_used = "import"
 
-    if shutil.which("gnome-screenshot"):
+    if not tool_used and shutil.which("gnome-screenshot"):
         ok, _, _ = _run_cmd(["gnome-screenshot", "-f", save_path])
         if ok and os.path.exists(save_path):
-            return {"status": "saved", "path": save_path, "tool": "gnome-screenshot"}
+            tool_used = "gnome-screenshot"
 
-    try:
-        from PIL import ImageGrab
-        img = ImageGrab.grab()
-        img.save(save_path)
-        return {"status": "saved", "path": save_path, "tool": "PIL"}
-    except Exception:
-        pass
+    if not tool_used:
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grab()
+            img.save(save_path)
+            tool_used = "PIL"
+        except Exception:
+            pass
+
+    if tool_used and os.path.exists(save_path):
+        _set_last_screenshot(save_path)
+        filename = os.path.basename(save_path)
+        return {
+            "status": "saved",
+            "path": save_path,
+            "filename": filename,
+            "url": f"/captures/{filename}",
+            "tool": tool_used,
+        }
 
     return {"error": "No screenshot capture utility found (install scrot or maim)."}
+
 
 
 def _exec_run_command(tool_input):

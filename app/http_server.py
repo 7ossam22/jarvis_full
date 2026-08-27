@@ -52,6 +52,26 @@ class JarvisHandler(BaseHTTPRequestHandler):
             self._send_json(controllers.get_public_config(Config.load()))
             return
 
+        if url_path.startswith("/captures/"):
+            rel_file = url_path[len("/captures/"):].lstrip("/")
+            captures_dir = os.path.join(NOTES_DIR, "captures")
+            target = os.path.normpath(os.path.join(captures_dir, rel_file))
+            if not (target == captures_dir or target.startswith(captures_dir + os.sep)):
+                self.send_error(403, "Forbidden")
+                return
+            if not os.path.isfile(target):
+                self.send_error(404, "Not found")
+                return
+            content_type = self._guess_content_type(target)
+            with open(target, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if url_path == "/":
             url_path = "/index.html"
 

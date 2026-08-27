@@ -16,6 +16,7 @@ import { standbyStatus } from "./voiceController.js";
 import { log as logLine } from "../view/console.js";
 import { openShowWindow, closeShowWindow, isShowWindowOpen } from "../view/showWindow.js";
 import { renderJiraData, closeJiraDeck, isJiraDeckOpen, openJiraDeck } from "../view/jiraDeck.js";
+import { openScreenshot, closeScreenshot, isScreenshotOpen } from "../view/screenshotViewer.js";
 
 const THINKING_CUES = [
   "Allow me a moment, sir...",
@@ -74,11 +75,12 @@ export async function handleSubmit(text) {
   }
 
   // Only intercept as a dismiss command if there's actually a reference
-  // window, viewer, or Jira deck open.
-  if ((referenceWindows.hasOpenReferences() || isShowWindowOpen() || isJiraDeckOpen()) && referenceWindows.isDismissCommand(text)) {
+  // window, viewer, Jira deck, or screenshot viewer open.
+  if ((referenceWindows.hasOpenReferences() || isShowWindowOpen() || isJiraDeckOpen() || isScreenshotOpen()) && referenceWindows.isDismissCommand(text)) {
     referenceWindows.clearReferences();
     closeShowWindow();
     closeJiraDeck();
+    closeScreenshot();
     logLine("Viewers dismissed.", "system");
     showAnswer("Dismissed, sir.");
     speak("Dismissed, sir.");
@@ -120,6 +122,10 @@ async function handleChat(text) {
     if (data.jira_data) {
       logLine("Rendering interactive Jira Workspace deck...", "system");
       renderJiraData(data.jira_data);
+    }
+    if (data.screenshot_url) {
+      logLine(`Displaying screenshot reference: ${data.screenshot_url}`, "system");
+      openScreenshot(data.screenshot_url);
     }
 
     const ids = data.nodes || [];

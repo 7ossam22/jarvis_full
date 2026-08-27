@@ -81,11 +81,21 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
     if last_jira and last_jira.get("timestamp", 0) >= (t0 - 1.0):
         jira_data = last_jira
 
+    from .connectors.system import get_last_screenshot
+
+    # Check if a screenshot was taken during this turn
+    last_screen = get_last_screenshot()
+    screenshot_url = None
+    if last_screen and last_screen.get("timestamp", 0) >= (t0 - 1.0):
+        screenshot_url = last_screen.get("url")
+
     # The spoken/displayed answer never contains URLs (persona rule — TTS would
     # read them as gibberish), but later turns like "send that to Discord" need
     # them, so stash them in the history copy only as a reference footnote.
     hist_answer = answer
     ref_links = source_urls + video_urls + image_urls
+    if screenshot_url:
+        ref_links.insert(0, screenshot_url)
     if show_url and show_url not in ref_links:
         ref_links.insert(0, show_url)
     if ref_links:
@@ -102,6 +112,7 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
         "video_urls": video_urls,
         "show_url": show_url,
         "jira_data": jira_data,
+        "screenshot_url": screenshot_url,
     }, 200
 
 
