@@ -10,7 +10,7 @@ const FALLBACK_CONFIG = {
     closing_lines: ["Very good, sir. I'll be here when you need me."],
   },
   images: { max_gallery: 6 },
-  brain: { radius: 150, shell_color: "#8a6bff", wire_color: "#6be3ff" },
+  brain: { radius: 140, shell_color: "#e2e8f0", wire_color: "#94a3b8" },
 };
 
 export async function fetchConfig() {

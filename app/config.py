@@ -88,8 +88,8 @@ class Config:
             },
             "brain": {
                 "radius": self.get("brain.radius", 140),
-                "shell_color": self.get("brain.shell_color", "#d4a373"),
-                "wire_color": self.get("brain.wire_color", "#f4a261"),
+                "shell_color": self.get("brain.shell_color", "#e2e8f0"),
+                "wire_color": self.get("brain.wire_color", "#94a3b8"),
             },
         }
 

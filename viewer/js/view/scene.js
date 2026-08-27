@@ -1,14 +1,20 @@
-// js/view/scene.js — Vanilla Latte 3D Humanoid Brain Scene (View layer).
+// js/view/scene.js — Zen White Glass 3D Humanoid Brain Scene (View layer).
 // Renders an anatomical 3D Humanoid Brain (dual cerebral hemispheres,
 // cortical gyri/sulci folds, cerebellum, brainstem, corpus callosum internal
-// axon pathways) with glowing neurons inside that surge with warm energy
+// axon pathways) with glowing pearl neurons inside that surge with Zen energy
 // when speaking.
 import { graphData, neighborsOf, linkKey } from "../model/graphData.js";
 import { openPanel, closePanel } from "./panel.js";
 
 const GROUP_PALETTE = [
-  "#f4a261", "#e6ccb2", "#d4a373", "#e9c46a",
-  "#faedcd", "#ccd5ae", "#ddb892", "#b08968"
+  "#d94a38", // Zen Akane / Vermilion
+  "#2563eb", // Zen Aizome / Royal Indigo
+  "#059669", // Zen Matcha / Jade Green
+  "#d97706", // Zen Yamabuki / Warm Amber
+  "#7c3aed", // Zen Fuji / Wisteria Violet
+  "#0891b2", // Zen Asagi / Teal Cyan
+  "#db2777", // Zen Sakura / Blossom Rose
+  "#475569"  // Zen Sumi / Ink Slate
 ];
 const groupColorCache = {};
 function groupColor(group) {
@@ -46,16 +52,17 @@ function refreshStyles() {
   Graph.linkDirectionalParticles(Graph.linkDirectionalParticles());
 }
 
-// Warm golden radial-gradient glow texture for neuron soma points
+// Radiant pearl radial-gradient glow texture for neuron soma points
 const glowTexture = (() => {
   const size = 128;
   const c = document.createElement("canvas");
   c.width = c.height = size;
   const ctx = c.getContext("2d");
   const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-  g.addColorStop(0, "rgba(254, 250, 224, 1)");
-  g.addColorStop(0.35, "rgba(244, 162, 97, 0.6)");
-  g.addColorStop(1, "rgba(212, 163, 115, 0)");
+  g.addColorStop(0, "rgba(255, 255, 255, 1)");
+  g.addColorStop(0.35, "rgba(255, 255, 255, 0.9)");
+  g.addColorStop(0.7, "rgba(147, 197, 253, 0.45)");
+  g.addColorStop(1, "rgba(217, 74, 56, 0)");
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, size, size);
   return new THREE.CanvasTexture(c);
@@ -63,8 +70,8 @@ const glowTexture = (() => {
 
 let Graph;
 let BRAIN_RADIUS = 140;
-let BRAIN_SHELL_BASE_OPACITY = 0.12;
-let BRAIN_WIRE_BASE_OPACITY = 0.22;
+let BRAIN_SHELL_BASE_OPACITY = 0.16;
+let BRAIN_WIRE_BASE_OPACITY = 0.32;
 let brainShell, brainWire, brainStemMesh;
 
 // ---------------------------------------------------------------------
@@ -149,7 +156,7 @@ function buildHumanoidBrainMesh(radius, detail, opacity, color, wireframe) {
   geometry.computeVertexNormals();
   const material = new THREE.MeshBasicMaterial({
     color, transparent: true, opacity, wireframe,
-    blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+    blending: THREE.NormalBlending, depthWrite: false, side: THREE.DoubleSide,
   });
   return new THREE.Mesh(geometry, material);
 }
@@ -168,7 +175,7 @@ function addNeuralDust() {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   const material = new THREE.PointsMaterial({
-    color: 0xf4a261, size: 1.4, transparent: true, opacity: 0.45, blending: THREE.AdditiveBlending
+    color: 0x94a3b8, size: 1.4, transparent: true, opacity: 0.5, blending: THREE.NormalBlending
   });
   Graph.scene().add(new THREE.Points(geometry, material));
 }
@@ -181,18 +188,18 @@ function hexToInt(hex, fallback) {
 
 export function initScene(config) {
   BRAIN_RADIUS = config?.brain?.radius ?? 140;
-  const shellColor = hexToInt(config?.brain?.shell_color, 0xd4a373);
-  const wireColor = hexToInt(config?.brain?.wire_color, 0xf4a261);
+  const shellColor = hexToInt(config?.brain?.shell_color, 0xe2e8f0);
+  const wireColor = hexToInt(config?.brain?.wire_color, 0x94a3b8);
 
   Graph = ForceGraph3D()(document.getElementById("graph"))
     .graphData(graphData)
-    .backgroundColor("#15110f")
-    .nodeLabel(n => `<div style="background: rgba(28,23,20,0.9); padding: 4px 10px; border-radius: 8px; border: 1px solid #d4a373; font-family: Outfit, sans-serif; color: #faedcd;">${n.label}</div>`)
-    .nodeColor(n => (highlightNodes.size === 0 || highlightNodes.has(n.id)) ? groupColor(n.group) : "rgba(168,152,136,0.2)")
+    .backgroundColor("rgba(0,0,0,0)")
+    .nodeLabel(n => `<div style="background: rgba(255,255,255,0.92); backdrop-filter: blur(14px); padding: 5px 14px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.95); box-shadow: 0 4px 20px rgba(24,39,75,0.08); font-family: var(--font-main, sans-serif); color: #1e293b; font-size: 12px; font-weight: 600;">${n.label}</div>`)
+    .nodeColor(n => (highlightNodes.size === 0 || highlightNodes.has(n.id)) ? groupColor(n.group) : "rgba(148,163,184,0.28)")
     .nodeVal(n => highlightNodes.has(n.id) ? 9.5 : (brainGlowActive ? 7.0 : 4.8))
     .nodeResolution(16)
     .nodeOpacity(0.95)
-    .linkColor(l => highlightLinks.has(linkKey(l)) ? "rgba(254,250,224,0.95)" : (brainGlowActive ? "rgba(244,162,97,0.55)" : "rgba(212,163,115,0.2)"))
+    .linkColor(l => highlightLinks.has(linkKey(l)) ? "rgba(217,74,56,0.95)" : (brainGlowActive ? "rgba(217,74,56,0.6)" : "rgba(148,163,184,0.32)"))
     .linkWidth(l => highlightLinks.has(linkKey(l)) ? 2.4 : (brainGlowActive ? 1.0 : 0.6))
     .linkDirectionalParticles(l => highlightLinks.has(linkKey(l)) ? (brainGlowActive ? 5 : 3) : (brainGlowActive ? 2 : 0))
     .linkDirectionalParticleWidth(2.5)
@@ -201,7 +208,7 @@ export function initScene(config) {
     .nodeThreeObject(n => {
       const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
         map: glowTexture, color: groupColor(n.group), transparent: true,
-        opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false,
+        opacity: 0.9, blending: THREE.NormalBlending, depthWrite: false,
       }));
       sprite.scale.set(12, 12, 1);
       return sprite;
@@ -223,7 +230,7 @@ export function initScene(config) {
   brainWire = buildHumanoidBrainMesh(BRAIN_RADIUS + 3, 2, BRAIN_WIRE_BASE_OPACITY, wireColor, true);
   Graph.scene().add(brainShell);
   Graph.scene().add(brainWire);
-  Graph.scene().fog = new THREE.FogExp2(0x15110f, 0.0015);
+  Graph.scene().fog = new THREE.FogExp2(0xeef2f7, 0.0012);
 
   addNeuralDust();
 
@@ -506,7 +513,7 @@ function initVoiceWaveformCanvas() {
         h = 3 + Math.abs(Math.sin(now * 0.4 + i * 0.4)) * 3;
       }
       const y = (canvas.height - h) / 2;
-      ctx.fillStyle = brainGlowActive ? "#f4a261" : "#d4a373";
+      ctx.fillStyle = brainGlowActive ? "#d94a38" : "#94a3b8";
       ctx.beginPath();
       ctx.roundRect(x, y, barWidth, h, 2);
       ctx.fill();
