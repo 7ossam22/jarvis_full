@@ -2,17 +2,21 @@
 
 Provides standard Discord tools (discord_get_recent_messages, discord_send_message,
 discord_get_user_guilds, discord_get_guild_channels) interfacing directly with the
-Discord REST API (v10). Standard library only — zero pip dependencies.
+Discord REST API (v10). Supports text messages and file/image/screenshot attachments.
+Standard library only — zero pip dependencies.
 """
 import json
+import mimetypes
 import os
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Channel-name → ID cache. Resolving a name costs one API call per guild
 # (listing every channel), and Discord rate-limits those routes hard —
@@ -41,7 +45,7 @@ def get_discord_tools():
                 "properties": {
                     "channel_id": {
                         "type": "string",
-                        "description": "The Discord channel ID (numeric ID string)."
+                        "description": "The Discord channel ID or name."
                     },
                     "limit": {
                         "type": "integer",
@@ -54,20 +58,27 @@ def get_discord_tools():
         },
         {
             "name": "discord_send_message",
-            "description": "Send a text message to a specific Discord channel.",
+            "description": (
+                "Send a message, screenshot, image, or file attachment to a specific Discord channel. "
+                "To attach an image or file, specify 'file_path' with the local path to the file (e.g. from a recent screenshot)."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "channel_id": {
                         "type": "string",
-                        "description": "The Discord channel ID."
+                        "description": "The Discord channel ID or channel name (e.g. 'general', '#screenshots', or numeric ID)."
                     },
                     "content": {
                         "type": "string",
-                        "description": "The message text content to send."
+                        "description": "The message text content or caption to accompany the file."
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional local file path or screenshot image path to upload as an attachment (e.g. '/tmp/browser_screenshot_123.png', 'notes/captures/browser_20260827_133000.png')."
                     }
                 },
-                "required": ["channel_id", "content"]
+                "required": ["channel_id"]
             }
         },
         {
@@ -132,6 +143,79 @@ def _make_discord_request(token, endpoint, params=None, method="GET", body_data=
         raise DiscordAPIError(e.code, detail)
 
 
+def _make_discord_multipart_request(token, endpoint, payload_dict, file_path, _retried=False):
+    """Sends a multipart/form-data request to Discord with file attachment and JSON payload."""
+    url = f"{DISCORD_API_BASE}/{endpoint}"
+    auth_header = token if token.startswith("Bot ") or token.startswith("Bearer ") else f"Bot {token}"
+
+    boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+    filename = os.path.basename(file_path)
+    mime_type, _ = mimetypes.guess_type(file_path)
+    if not mime_type:
+        mime_type = "application/octet-stream"
+
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    body = bytearray()
+
+    # payload_json part
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(b'Content-Disposition: form-data; name="payload_json"\r\n')
+    body.extend(b'Content-Type: application/json\r\n\r\n')
+    body.extend(json.dumps(payload_dict).encode("utf-8"))
+    body.extend(b"\r\n")
+
+    # files[0] part
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'.encode("utf-8"))
+    body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
+    body.extend(file_bytes)
+    body.extend(b"\r\n")
+
+    # closing boundary
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+
+    headers = {
+        "Authorization": auth_header,
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "User-Agent": "JarvisDiscordConnector/1.0"
+    }
+
+    req = urllib.request.Request(url, data=bytes(body), headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8")[:300]
+        except Exception:
+            detail = e.reason
+        if e.code == 429 and not _retried:
+            try:
+                wait = float(e.headers.get("Retry-After") or json.loads(detail).get("retry_after") or 1.0)
+            except (ValueError, TypeError, json.JSONDecodeError):
+                wait = 1.0
+            time.sleep(min(wait, 5.0))
+            return _make_discord_multipart_request(token, endpoint, payload_dict, file_path, _retried=True)
+        raise DiscordAPIError(e.code, detail)
+
+
+def _resolve_file_path(file_path):
+    if not file_path:
+        return None
+    file_path = os.path.expanduser(file_path.strip())
+    if os.path.isabs(file_path) and os.path.exists(file_path):
+        return file_path
+    root_path = os.path.join(ROOT, file_path)
+    if os.path.exists(root_path):
+        return root_path
+    if os.path.exists(file_path):
+        return os.path.abspath(file_path)
+    return file_path
+
+
 def _resolve_channel_id(token, channel_input):
     """Resolves channel name (e.g. 'general' or '#general') or channel ID to
     numeric ID. Caches every text channel seen during the scan so repeated
@@ -193,12 +277,33 @@ def execute_discord_tool(cfg, tool_name, tool_input):
                 })
             return {"channel_id": channel_id, "messages": messages}
 
-        elif tool_name == "discord_send_message":
+        elif tool_name in ("discord_send_message", "discord_send_file"):
             raw_channel = tool_input.get("channel_id")
-            content = tool_input.get("content") or "Greetings from JARVIS! Neural core online, sir."
+            content = tool_input.get("content") or ""
+            file_path = tool_input.get("file_path") or tool_input.get("image_path") or tool_input.get("path")
             channel_id = _resolve_channel_id(token, raw_channel)
-            res = _make_discord_request(token, f"channels/{channel_id}/messages", method="POST", body_data={"content": content})
-            return {"status": "sent", "channel_id": channel_id, "message_id": res.get("id"), "content": content}
+
+            if file_path:
+                resolved = _resolve_file_path(file_path)
+                if not resolved or not os.path.exists(resolved):
+                    return {"error": f"File not found on local disk: {file_path}"}
+                res = _make_discord_multipart_request(
+                    token, f"channels/{channel_id}/messages", {"content": content}, resolved
+                )
+                return {
+                    "status": "sent",
+                    "channel_id": channel_id,
+                    "message_id": res.get("id"),
+                    "file_attached": os.path.basename(resolved),
+                    "content": content
+                }
+            else:
+                if not content:
+                    content = "Greetings from JARVIS! Neural core online, sir."
+                res = _make_discord_request(
+                    token, f"channels/{channel_id}/messages", method="POST", body_data={"content": content}
+                )
+                return {"status": "sent", "channel_id": channel_id, "message_id": res.get("id"), "content": content}
 
         elif tool_name == "discord_get_user_guilds":
             guilds = _make_discord_request(token, "users/@me/guilds")
@@ -228,4 +333,5 @@ def execute_discord_tool(cfg, tool_name, tool_input):
         return {"error": friendly}
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return {"error": f"Discord API request failed: {e}"}
+
 
