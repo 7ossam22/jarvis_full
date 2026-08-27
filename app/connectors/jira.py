@@ -14,6 +14,24 @@ import urllib.parse
 import urllib.request
 
 
+_last_jira_result = None
+
+
+def get_last_jira_result():
+    global _last_jira_result
+    return _last_jira_result
+
+
+def _set_last_jira_result(tool_name, tool_input, result):
+    global _last_jira_result
+    _last_jira_result = {
+        "tool": tool_name,
+        "input": tool_input,
+        "data": result,
+        "timestamp": time.time(),
+    }
+
+
 class JiraAPIError(Exception):
     def __init__(self, code, detail):
         self.code = code
@@ -267,8 +285,7 @@ def _make_jira_request(domain, email, token, endpoint, params=None, method="GET"
         raise JiraAPIError(e.code, detail)
 
 
-def execute_jira_tool(cfg, tool_name, tool_input):
-    """Executes a Jira Cloud tool call using configured domain, email, and API token."""
+def _raw_execute_jira_tool(cfg, tool_name, tool_input):
     domain, email, token = _get_jira_credentials(cfg)
     if not domain or not email or not token:
         return {
@@ -490,3 +507,11 @@ def execute_jira_tool(cfg, tool_name, tool_input):
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         print(f"[jarvis] Jira connection error on {tool_name}: {e}", file=sys.stderr)
         return {"error": f"Jira connection failed: {e}"}
+
+
+def execute_jira_tool(cfg, tool_name, tool_input):
+    """Executes a Jira Cloud tool call and caches the latest result for UI presentation."""
+    res = _raw_execute_jira_tool(cfg, tool_name, tool_input)
+    if isinstance(res, dict) and not res.get("error"):
+        _set_last_jira_result(tool_name, tool_input, res)
+    return res

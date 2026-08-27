@@ -96,8 +96,20 @@ class JarvisHandler(BaseHTTPRequestHandler):
             self._handle_remember()
         elif self.path == "/speak":
             self._handle_speak()
+        elif self.path == "/jira/action":
+            self._handle_jira_action()
         else:
             self.send_error(404, "Not found")
+
+    def _handle_jira_action(self):
+        from .connectors.jira import execute_jira_tool
+        body = self._read_json_body()
+        cfg = Config.load()
+        action = body.get("action", "")
+        payload = body.get("payload", {})
+        result = execute_jira_tool(cfg, action, payload)
+        self._send_json(result)
+
 
     def _handle_speak(self):
         # Proxies ElevenLabs TTS so the API key never reaches the browser (and

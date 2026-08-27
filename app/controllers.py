@@ -66,10 +66,20 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
     if relevant:
         fallback += f" By keyword match alone, the closest note is '{relevant[0]['label']}'."
 
+    import time
+    from .connectors.jira import get_last_jira_result
+
+    t0 = time.time()
     system_prompt = persona.build_system_prompt(cfg)
     answer = call_model(cfg, system_prompt, messages, fallback)
     max_images = cfg.get("images.max_gallery", 6)
     answer, image_urls, video_urls, source_urls, show_url = extract_media_references(answer, max_images)
+
+    # Check if Jira was interacted with during this turn
+    last_jira = get_last_jira_result()
+    jira_data = None
+    if last_jira and last_jira.get("timestamp", 0) >= (t0 - 1.0):
+        jira_data = last_jira
 
     # The spoken/displayed answer never contains URLs (persona rule — TTS would
     # read them as gibberish), but later turns like "send that to Discord" need
@@ -91,6 +101,7 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
         "image_urls": image_urls,
         "video_urls": video_urls,
         "show_url": show_url,
+        "jira_data": jira_data,
     }, 200
 
 

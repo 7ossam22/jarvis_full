@@ -15,6 +15,7 @@ import { speak, stopSpeaking, isSpeaking } from "./speechController.js";
 import { standbyStatus } from "./voiceController.js";
 import { log as logLine } from "../view/console.js";
 import { openShowWindow, closeShowWindow, isShowWindowOpen } from "../view/showWindow.js";
+import { renderJiraData, closeJiraDeck, isJiraDeckOpen, openJiraDeck } from "../view/jiraDeck.js";
 
 const THINKING_CUES = [
   "Allow me a moment, sir...",
@@ -73,12 +74,12 @@ export async function handleSubmit(text) {
   }
 
   // Only intercept as a dismiss command if there's actually a reference
-  // window or viewer open — otherwise a stray "close that" falls through to
-  // Claude like any other question, rather than silently swallowing it.
-  if ((referenceWindows.hasOpenReferences() || isShowWindowOpen()) && referenceWindows.isDismissCommand(text)) {
+  // window, viewer, or Jira deck open.
+  if ((referenceWindows.hasOpenReferences() || isShowWindowOpen() || isJiraDeckOpen()) && referenceWindows.isDismissCommand(text)) {
     referenceWindows.clearReferences();
     closeShowWindow();
-    logLine("Viewer dismissed.", "system");
+    closeJiraDeck();
+    logLine("Viewers dismissed.", "system");
     showAnswer("Dismissed, sir.");
     speak("Dismissed, sir.");
     return;
@@ -115,6 +116,10 @@ async function handleChat(text) {
     if (data.show_url) {
       logLine(`Opening viewer: ${data.show_url}`, "system");
       openShowWindow(data.show_url);
+    }
+    if (data.jira_data) {
+      logLine("Rendering interactive Jira Workspace deck...", "system");
+      renderJiraData(data.jira_data);
     }
 
     const ids = data.nodes || [];
