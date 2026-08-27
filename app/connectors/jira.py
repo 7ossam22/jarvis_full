@@ -303,7 +303,7 @@ def _raw_execute_jira_tool(cfg, tool_name, tool_input):
                 if query:
                     jql = f'text ~ "{query}" ORDER BY created DESC'
                 else:
-                    jql = "order by created DESC"
+                    jql = "created is not EMPTY ORDER BY created DESC"
 
             limit = min(max(1, int(tool_input.get("max_results", 10))), 50)
             params = {
