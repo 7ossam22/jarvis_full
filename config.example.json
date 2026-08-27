@@ -54,6 +54,17 @@
     "radius": 140,
     "shell_color": "#e2e8f0",
     "wire_color": "#94a3b8"
+  },
+  "jira": {
+    "domain": "https://your-domain.atlassian.net",
+    "email": "your-email@example.com",
+    "api_token": "YOUR-ATLASSIAN-API-TOKEN"
+  },
+  "discord": {
+    "bot_token": "YOUR-DISCORD-BOT-TOKEN"
+  },
+  "gmail": {
+    "access_token": "YOUR-GMAIL-OAUTH-ACCESS-TOKEN"
   }
 }
 

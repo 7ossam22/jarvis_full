@@ -15,6 +15,8 @@ from .llm import LLMProvider
 from ..connectors.gmail import get_gmail_tools, execute_gmail_tool
 from ..connectors.discord import get_discord_tools, execute_discord_tool
 from ..connectors.browser import get_browser_tools, execute_browser_tool
+from ..connectors.system import get_system_tools, execute_system_tool
+from ..connectors.jira import get_jira_tools, execute_jira_tool
 
 
 def call_anthropic(cfg, system_prompt, messages):
@@ -27,6 +29,8 @@ def call_anthropic(cfg, system_prompt, messages):
     tools.extend(get_gmail_tools())
     tools.extend(get_discord_tools())
     tools.extend(get_browser_tools())
+    tools.extend(get_system_tools())
+    tools.extend(get_jira_tools())
 
     curr_messages = list(messages)
     payload_dict = {
@@ -75,6 +79,10 @@ def call_anthropic(cfg, system_prompt, messages):
                         result_data = execute_discord_tool(cfg, tool_name, tool_input)
                     elif tool_name.startswith("browser_") or tool_name == "system_open":
                         result_data = execute_browser_tool(cfg, tool_name, tool_input)
+                    elif tool_name.startswith("system_"):
+                        result_data = execute_system_tool(cfg, tool_name, tool_input)
+                    elif tool_name.startswith("jira_"):
+                        result_data = execute_jira_tool(cfg, tool_name, tool_input)
                     else:
                         result_data = {"error": f"Tool {tool_name} not found"}
 

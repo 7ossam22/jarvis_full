@@ -20,7 +20,7 @@ const micBtn = document.getElementById("mic-btn");
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 let WAKE_RE = /\bjarvis\b[,:]?\s*/i;
-let AWAIT_COMMAND_MS = 6000;
+let AWAIT_COMMAND_MS = 3000;
 // How long to wait after the user stops producing new speech events before
 // treating an utterance as complete. This — not Chrome's own internal segment
 // finalization — is what decides "is he done talking": acting on the first
@@ -28,7 +28,7 @@ let AWAIT_COMMAND_MS = 6000;
 // interim chunk just keeps extending this timer instead of being acted on
 // directly, so a long sentence spanning several internal segments (or even a
 // background recognizer restart — see onend below) reads as one utterance.
-let SILENCE_COMMIT_MS = 1300;
+let SILENCE_COMMIT_MS = 1100;
 let CONVO_CLOSINGS = ["Very good, sir. I'll be here when you need me."];
 
 // Loosely-matched, unambiguous session-enders — safe to match anywhere at the
