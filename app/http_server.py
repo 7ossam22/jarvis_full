@@ -9,7 +9,11 @@ reachable — path-traversal guard unchanged from the original server.py).
 import json
 import os
 import sys
+import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from . import controllers
 from .config import Config
@@ -20,6 +24,38 @@ VIEWER_DIR = os.path.join(ROOT, "viewer")
 NOTES_DIR = os.path.join(ROOT, "notes")
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
+# Long tool-using chat runs (e.g. filling a 20+ question form) outlive the
+# browser's own request timeout (~5 min in Chrome), so the viewer starts the
+# chat as a background job and polls /chat/result for the answer instead of
+# holding one request open for the whole run.
+_chat_jobs = {}
+_chat_jobs_lock = threading.Lock()
+_CHAT_JOB_TTL = 15 * 60          # forget finished jobs after 15 min
+_CHAT_JOB_MAX_AGE = 60 * 60      # give up on a job that somehow never finishes
+
+
+def _prune_chat_jobs():
+    now = time.time()
+    with _chat_jobs_lock:
+        for job_id in list(_chat_jobs):
+            job = _chat_jobs[job_id]
+            finished = job.get("finished")
+            if (finished and now - finished > _CHAT_JOB_TTL) or now - job["created"] > _CHAT_JOB_MAX_AGE:
+                del _chat_jobs[job_id]
+
+
+def _run_chat_job(job_id, cfg, body):
+    try:
+        result, status = controllers.handle_chat(cfg, NOTES_DIR, VIEWER_DIR, body)
+    except Exception as e:
+        sys.stderr.write(f"[jarvis] chat job {job_id} failed: {e}\n")
+        result, status = {"answer": f"I hit an internal error, sir: {e}", "error": str(e)}, 500
+    with _chat_jobs_lock:
+        job = _chat_jobs.get(job_id)
+        if job is not None:
+            job.update({"status": "done", "result": result, "http_status": status,
+                        "finished": time.time()})
+
 
 class JarvisHandler(BaseHTTPRequestHandler):
     server_version = "JarvisServer/1.0"
@@ -27,13 +63,22 @@ class JarvisHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[jarvis] " + (fmt % args) + "\n")
 
+    def _send_bytes(self, data, content_type, status=200):
+        # The client may have given up (page refresh, browser request timeout)
+        # long before a slow tool-using answer finished — the work is already
+        # done at this point, so a vanished socket is not an error worth a
+        # thread-killing traceback.
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            self.log_message("client disconnected before the response to %s could be sent", self.path)
+
     def _send_json(self, payload, status=200):
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_bytes(json.dumps(payload).encode("utf-8"), "application/json", status=status)
 
     def _read_json_body(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -46,10 +91,15 @@ class JarvisHandler(BaseHTTPRequestHandler):
     # ---- static file serving, viewer/ only, plus GET /config ---------------
 
     def do_GET(self):
-        url_path = self.path.split("?", 1)[0]
+        parsed = urlparse(self.path)
+        url_path = parsed.path
 
         if url_path == "/config":
             self._send_json(controllers.get_public_config(Config.load()))
+            return
+
+        if url_path == "/chat/result":
+            self._handle_chat_result(parsed.query)
             return
 
         if url_path.startswith("/captures/"):
@@ -65,11 +115,7 @@ class JarvisHandler(BaseHTTPRequestHandler):
             content_type = self._guess_content_type(target)
             with open(target, "rb") as f:
                 data = f.read()
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_bytes(data, content_type)
             return
 
         if url_path == "/":
@@ -88,11 +134,7 @@ class JarvisHandler(BaseHTTPRequestHandler):
         content_type = self._guess_content_type(target)
         with open(target, "rb") as f:
             data = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self._send_bytes(data, content_type)
 
     @staticmethod
     def _guess_content_type(path):
@@ -141,17 +183,43 @@ class JarvisHandler(BaseHTTPRequestHandler):
             self._send_json(payload, status=status)
             return
         audio, content_type = payload
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(audio)))
-        self.end_headers()
-        self.wfile.write(audio)
+        self._send_bytes(audio, content_type, status=status)
 
     def _handle_chat(self):
         body = self._read_json_body()
         cfg = Config.load()
-        result, status = controllers.handle_chat(cfg, NOTES_DIR, VIEWER_DIR, body)
+
+        # Async mode (used by the viewer): start the run in a worker thread and
+        # return a job id right away; the answer is fetched via /chat/result.
+        if body.get("async"):
+            _prune_chat_jobs()
+            job_id = uuid.uuid4().hex
+            with _chat_jobs_lock:
+                _chat_jobs[job_id] = {"status": "pending", "created": time.time(), "finished": None}
+            threading.Thread(target=_run_chat_job, args=(job_id, cfg, body), daemon=True).start()
+            self._send_json({"job_id": job_id, "status": "pending"}, status=202)
+            return
+
+        # Synchronous mode kept for other clients (curl, scripts, apps).
+        try:
+            result, status = controllers.handle_chat(cfg, NOTES_DIR, VIEWER_DIR, body)
+        except Exception as e:
+            sys.stderr.write(f"[jarvis] chat handling failed: {e}\n")
+            result, status = {"answer": f"I hit an internal error, sir: {e}", "error": str(e)}, 500
         self._send_json(result, status=status)
+
+    def _handle_chat_result(self, query):
+        job_id = (parse_qs(query).get("job_id") or [""])[0]
+        with _chat_jobs_lock:
+            job = _chat_jobs.get(job_id)
+            snapshot = dict(job) if job else None
+        if snapshot is None:
+            self._send_json({"status": "unknown"}, status=404)
+        elif snapshot["status"] == "pending":
+            self._send_json({"status": "pending"})
+        else:
+            self._send_json({"status": "done", "http_status": snapshot["http_status"],
+                             "result": snapshot["result"]})
 
     def _handle_remember(self):
         body = self._read_json_body()

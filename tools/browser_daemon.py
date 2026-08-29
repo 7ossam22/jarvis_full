@@ -38,12 +38,42 @@ from playwright.async_api import (
 PORT = 4701
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+class _TimestampedStream:
+    """Prefixes every log line with a timestamp so incidents in the append-only
+    daemon log can be told apart from stale entries of past runs."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._at_line_start = True
+
+    def write(self, text):
+        if not text:
+            return
+        out = []
+        for chunk in text.splitlines(keepends=True):
+            if self._at_line_start and chunk.strip():
+                out.append(time.strftime("[%Y-%m-%d %H:%M:%S] "))
+            out.append(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        self._stream.write("".join(out))
+        self._stream.flush()
+
+    def flush(self):
+        self._stream.flush()
+
+
+sys.stderr = _TimestampedStream(sys.stderr)
+
 state = {
     "pw": None,
     "browser": None,
     "context": None,
     "current_profile": None,
     "active_tab_index": 0,
+    # True while cmd_upload_file drives a chooser itself; the auto-handler
+    # stays out of the way so the explicit file wins.
+    "expecting_file_chooser": False,
 }
 
 
@@ -241,15 +271,27 @@ async def ensure_browser(profile=None):
     ):
         pages = get_open_pages()
         if pages:
-            return
-        try:
-            await state["context"].new_page()
-            state["active_tab_index"] = 0
-            return
-        except Exception:
-            state["context"] = None
+            # is_closed() is client-side bookkeeping and can be stale after the
+            # browser dies out from under us — probe the real connection so a
+            # dead browser triggers a relaunch instead of endless
+            # "Target page has been closed" errors on every command.
+            try:
+                await asyncio.wait_for(pages[0].evaluate("1"), timeout=3)
+                return
+            except asyncio.TimeoutError:
+                return  # slow page, but the connection is alive
+            except Exception:
+                print("[browser-daemon] browser state is stale (liveness probe failed); relaunching…", file=sys.stderr)
+                state["context"] = None
+        else:
+            try:
+                await state["context"].new_page()
+                state["active_tab_index"] = 0
+                return
+            except Exception:
+                state["context"] = None
 
-    if state["context"] is not None and state["current_profile"] != req_profile_name:
+    if state["context"] is not None:
         try:
             await state["context"].close()
         except Exception:
@@ -326,6 +368,47 @@ async def build_tab_list():
     return tabs
 
 
+def _first_pdf_for_auto_upload():
+    """Picks the file to hand to an auto-intercepted file chooser: the consent
+    template if present, else the first PDF found in the usual places."""
+    consent = os.path.join(ROOT, "Informed_Consent Template.pdf")
+    if os.path.isfile(consent):
+        return consent
+    for d in (ROOT, os.path.expanduser("~/Downloads"),
+              os.path.expanduser("~/Documents"), os.path.expanduser("~")):
+        try:
+            pdfs = sorted(f for f in os.listdir(d) if f.lower().endswith(".pdf"))
+        except OSError:
+            continue
+        if pdfs:
+            return os.path.join(d, pdfs[0])
+    return None
+
+
+def _attach_auto_file_chooser(page):
+    """Makes sure a file chooser opened by a plain click (outside the explicit
+    upload_file flow) never blocks the page: Playwright intercepts it (so the
+    native file manager never appears) and the first available PDF is selected."""
+    if getattr(page, "_auto_chooser_attached", False):
+        return
+
+    async def _auto_choose(chooser):
+        if state.get("expecting_file_chooser"):
+            return
+        pdf = _first_pdf_for_auto_upload()
+        if not pdf:
+            print("[browser-daemon] file chooser opened but no PDF found to auto-select", file=sys.stderr)
+            return
+        try:
+            await chooser.set_files(pdf)
+            print(f"[browser-daemon] auto-selected '{pdf}' in file chooser", file=sys.stderr)
+        except Exception as e:
+            print(f"[browser-daemon] auto file chooser selection failed: {e}", file=sys.stderr)
+
+    page.on("filechooser", _auto_choose)
+    page._auto_chooser_attached = True
+
+
 async def get_active_page(tab_index=None, profile=None):
     """Retrieves the active page (or specific tab_index) and brings it to front."""
     await ensure_browser(profile=profile)
@@ -347,6 +430,7 @@ async def get_active_page(tab_index=None, profile=None):
     idx = max(0, min(state.get("active_tab_index", 0), len(pages) - 1))
     state["active_tab_index"] = idx
     page = pages[idx]
+    _attach_auto_file_chooser(page)
     try:
         await page.bring_to_front()
     except Exception:
@@ -374,20 +458,26 @@ async def is_flutter_page(page):
 async def enable_flutter_semantics(page):
     """Enables Flutter accessibility and semantics tree for full widget inspection."""
     try:
-        await page.evaluate("""() => {
-            const ph = document.querySelector('flt-semantics-placeholder, [role="button"][aria-label*="accessibility" i]');
-            if (ph) {
-                ph.click();
+        already_live = await page.evaluate("""() => {
+            const host = document.querySelector('flt-semantics-host');
+            const alreadyLive = !!(host && host.childElementCount > 0);
+            if (!alreadyLive) {
+                const ph = document.querySelector('flt-semantics-placeholder, [role="button"][aria-label*="accessibility" i]');
+                if (ph) {
+                    ph.click();
+                }
             }
             try {
                 window.dispatchEvent(new Event('flutter-semantics-update'));
             } catch (e) {}
-            const host = document.querySelector('flt-semantics-host');
             if (host) {
                 host.focus();
             }
+            return alreadyLive;
         }""")
-        await page.wait_for_timeout(350)
+        # Full settle only on first activation; once the tree is live a short
+        # refresh window is enough between actions.
+        await page.wait_for_timeout(100 if already_live else 350)
     except Exception:
         pass
 
@@ -444,8 +534,11 @@ async def extract_flutter_widgets(page):
 
 
 async def find_flutter_widget_coords(page, target):
-    """Finds exact viewport (center_x, center_y) coordinates for a Flutter widget target."""
-    await enable_flutter_semantics(page)
+    """Finds exact viewport (center_x, center_y) coordinates for a Flutter widget target.
+
+    Semantics enabling happens inside extract_flutter_widgets; the coords()
+    fast path below needs no semantics at all.
+    """
     target_clean = str(target or "").strip()
 
     coord_match = re.search(r"coords?\(?(\d+)[,\s]+(\d+)\)?", target_clean, re.IGNORECASE)
@@ -572,7 +665,7 @@ async def cmd_flutter_click(payload):
     else:
         await page.mouse.click(cx, cy)
 
-    await page.wait_for_timeout(350)
+    await page.wait_for_timeout(250)
     title = await page.title()
     return {
         "status": "flutter_clicked",
@@ -604,13 +697,13 @@ async def cmd_flutter_type(payload):
         }
 
     await page.mouse.click(cx, cy)
-    await page.wait_for_timeout(250)
+    await page.wait_for_timeout(150)
 
     if clear:
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Backspace")
 
-    await page.keyboard.type(text, delay=20)
+    await page.keyboard.type(text, delay=12)
     if press_enter:
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(350)
@@ -974,7 +1067,7 @@ async def cmd_click(payload):
                 await page.mouse.dblclick(cx, cy)
             else:
                 await page.mouse.click(cx, cy)
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(200)
             title = await page.title()
             return {
                 "status": "clicked",
@@ -993,7 +1086,7 @@ async def cmd_click(payload):
         await loc.dblclick(timeout=timeout_ms)
     else:
         await loc.click(timeout=timeout_ms)
-    await page.wait_for_timeout(300)
+    await page.wait_for_timeout(200)
 
     title = await page.title()
     return {
@@ -1023,11 +1116,11 @@ async def cmd_type(payload):
         cx, cy, matched_label = await find_flutter_widget_coords(page, selector)
         if cx is not None and cy is not None:
             await page.mouse.click(cx, cy)
-            await page.wait_for_timeout(250)
+            await page.wait_for_timeout(150)
             if clear:
                 await page.keyboard.press("Control+A")
                 await page.keyboard.press("Backspace")
-            await page.keyboard.type(text, delay=20)
+            await page.keyboard.type(text, delay=12)
             if press_enter:
                 await page.keyboard.press("Enter")
                 await page.wait_for_timeout(300)
@@ -1082,7 +1175,7 @@ async def cmd_press_key(payload):
             await page.locator(selector).first.focus()
 
     await page.keyboard.press(key)
-    await page.wait_for_timeout(300)
+    await page.wait_for_timeout(200)
 
     title = await page.title()
     return {
@@ -1309,6 +1402,7 @@ async def cmd_upload_file(payload):
 
     page = await get_active_page(tab_index=tab_index)
 
+    state["expecting_file_chooser"] = True
     try:
         # If active page is Flutter Web or selector indicates Flutter
         if (await is_flutter_page(page)):
@@ -1392,6 +1486,8 @@ async def cmd_upload_file(payload):
         }
     except Exception as e:
         return {"error": f"Failed to upload file '{file_path}': {e}"}
+    finally:
+        state["expecting_file_chooser"] = False
 
 
 COMMANDS = {

@@ -84,7 +84,7 @@ def call_gemini(cfg, system_prompt, messages):
 
     url = f"{API_BASE}/{model}:generateContent?key={api_key}"
 
-    for turn in range(20):
+    for turn in range(80):
         payload = json.dumps(payload_dict).encode("utf-8")
         req = urllib.request.Request(
             url, data=payload, method="POST",

@@ -45,7 +45,7 @@ def call_anthropic(cfg, system_prompt, messages):
     if mcp_servers:
         payload_dict["mcp_servers"] = mcp_servers
 
-    for turn in range(20):
+    for turn in range(80):
         payload = json.dumps(payload_dict).encode("utf-8")
         req = urllib.request.Request(
             "https://api.anthropic.com/v1/messages",

@@ -106,7 +106,7 @@ def call_lmstudio(cfg, system_prompt, messages):
         payload["tool_choice"] = "auto"
 
     url = f"{base}/chat/completions"
-    for turn in range(20):
+    for turn in range(80):
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"), method="POST",
             headers={"content-type": "application/json", "authorization": f"Bearer {api_key}"},
