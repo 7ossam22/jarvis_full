@@ -121,7 +121,7 @@ Almost every behavior tunable lives in `config.json` — see
 | Section | Controls |
 |---|---|
 | `server` | Port and bind address (`0.0.0.0` reaches your LAN, `127.0.0.1` is local-only) |
-| `model` | Two interchangeable LLM backends behind one interface (`app/providers/llm.py`) — Anthropic Claude (`provider_api_key`, `model_id`; falls back to the local `claude` CLI with no key) and Google Gemini (`gemini_api_key`, `gemini_model_id`). Set `"provider": "gemini"` or `"anthropic"` to pick which one is tried first; whichever is configured but not chosen is kept as automatic failover. Leave `provider` unset and Anthropic goes first, for backward compatibility. |
+| `model` | Three interchangeable LLM backends behind one interface (`app/providers/llm.py`) — Anthropic Claude (`provider_api_key`, `model_id`; falls back to the local `claude` CLI with no key), Google Gemini (`gemini_api_key`, `gemini_model_id`), and a **local model over the LAN via LM Studio** (`lmstudio_base_url`, e.g. `http://192.168.1.50:1234/v1`; optional `lmstudio_model_id`, `lmstudio_api_key`, `lmstudio_use_tools`). Set `"provider"` to `"gemini"`, `"anthropic"`, or `"lmstudio"` to pick which one is tried first; whichever is configured but not chosen is kept as automatic failover. Leave `provider` unset and Anthropic goes first, for backward compatibility. The local model runs the same connector tool loop (Gmail/Discord/Jira/browser/system) but has no web search. |
 | `persona` | Name, address term ("sir"), tone description, and a free-text `system_prompt_extra` for tweaks that don't need a code change |
 | `voice` | Three interchangeable TTS backends behind one interface (`app/providers/tts.py`) — ElevenLabs, Fish Audio, and local Kokoro. Set `"tts_provider"` to pick which one is tried first, same failover behavior as `model.provider` above. |
 | `wake_word` | The wake word itself, how long to wait for a command after a bare "Jarvis", and how long to wait for silence before treating a sentence as finished |
@@ -168,6 +168,8 @@ app/                         backend (Model + Controller)
   images.py                    parses the model's IMAGE: lines into gallery URLs
   providers/
     anthropic_provider.py        Claude API call + `claude -p` CLI fallback
+    gemini_provider.py           Google Gemini API call
+    lmstudio_provider.py         local model on the LAN via LM Studio (OpenAI-compatible)
     elevenlabs_provider.py       ElevenLabs text-to-speech
   controllers.py                request handling logic (no HTTP specifics)
   http_server.py                HTTP routing, static file serving, GET /config
@@ -195,7 +197,7 @@ notes/captures/                notes JARVIS writes for you via "remember that…
 | Mic button does nothing | Chrome → lock icon in the address bar → allow Microphone. Must be Chrome or Edge. |
 | No sound | Click **Wake JARVIS** once — browsers block audio before the first interaction. |
 | Page looks stale after a change | Hard reload: `Cmd+Shift+R` / `Ctrl+Shift+R`. |
-| "I appear to be without a working brain" | Neither LLM backend is usable: no `model.provider_api_key` (Anthropic) or `model.gemini_api_key` (Gemini) in `config.json`, and the `claude` CLI isn't installed/logged in either. |
+| "I appear to be without a working brain" | No LLM backend is usable: no `model.provider_api_key` (Anthropic), `model.gemini_api_key` (Gemini), or `model.lmstudio_base_url` (LM Studio) in `config.json`, and the `claude` CLI isn't installed/logged in either. |
 | JARVIS uses the browser voice instead of a real one | None of the three TTS backends (ElevenLabs/Fish Audio/Kokoro) are configured, or all of them failed — check the server's console output. |
 | Answers are generic / off-topic | Your notes folder is thin on that topic, or you pointed `build.py` at the wrong path — re-run `python3 build.py /full/path/to/notes`. |
 | Port 4700 already in use | Another `server.py` is still running — stop it, or edit `server.port` in `config.json`. |

@@ -115,6 +115,6 @@ def no_brain_apology(cfg):
     address_term = cfg.get("persona.address_term", "sir")
     return (
         f"I'm terribly sorry, {address_term} — I appear to be without a working brain at "
-        "the moment. No Anthropic or Gemini API key is configured in config.json, and I "
-        "couldn't find the `claude` CLI on this machine either."
+        "the moment. No Anthropic or Gemini API key, and no LM Studio server URL, is "
+        "configured in config.json, and I couldn't find the `claude` CLI on this machine either."
     )

@@ -13,9 +13,12 @@ Available providers (app/providers/*_provider.py):
     is set or the API call fails. is_configured() is true if EITHER exists.
   - "gemini" (gemini_provider.py) — Google Gemini via the direct API
     (model.gemini_api_key + model.gemini_model_id). No local CLI fallback.
+  - "lmstudio" (lmstudio_provider.py) — a local model on the LAN served by
+    LM Studio's OpenAI-compatible server (model.lmstudio_base_url, e.g.
+    http://192.168.1.50:1234/v1). No web-search tool; connector tools work.
 
 How to switch, in config.json:
-    "model": { "provider": "gemini" }     # or "anthropic"
+    "model": { "provider": "gemini" }     # or "anthropic" / "lmstudio"
 Leave "provider" empty/unset and Anthropic is tried first (backward-compatible
 default) with Gemini as silent failover — or vice versa, whichever backend
 IS configured if only one has a real key. Either way, an unconfigured
@@ -50,13 +53,17 @@ class LLMProvider(ABC):
 
 def get_llm_providers(cfg):
     """Returns the usable LLMProvider instances in the order they should be
-    tried: the one `model.provider` ("anthropic" | "gemini") names first, then
-    any other configured backend as failover. With no explicit choice the
-    order is Anthropic first, for backward compatibility."""
+    tried: the one `model.provider` ("anthropic" | "gemini" | "lmstudio") names
+    first, then any other configured backend as failover. With no explicit
+    choice the order is Anthropic first, for backward compatibility."""
     from .anthropic_provider import AnthropicProvider
     from .gemini_provider import GeminiProvider
+    from .lmstudio_provider import LMStudioProvider
 
-    ordered = [p for p in (AnthropicProvider(cfg), GeminiProvider(cfg)) if p.is_configured()]
+    ordered = [
+        p for p in (AnthropicProvider(cfg), GeminiProvider(cfg), LMStudioProvider(cfg))
+        if p.is_configured()
+    ]
 
     choice = (cfg.get("model.provider") or "").strip().lower()
     ordered.sort(key=lambda p: p.name != choice)  # stable: chosen one first
