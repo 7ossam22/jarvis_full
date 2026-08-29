@@ -111,6 +111,7 @@ CONNECTOR_HINTS = (
     "open", "close", "browser", "tab", "tabs", "website", "launch", "chrome",
     "profile", "profiles", "switch", "click", "type", "scroll", "screenshot",
     "jira", "ticket", "issue", "volume", "sound", "stats", "app",
+    "flutter", "patrol", "canvaskit", "widget", "widgets", "semantics",
 )
 
 
@@ -148,8 +149,9 @@ def _decide_connector_action(cfg, messages):
         "conversation, append the most relevant link to the message/body being sent.\n"
         "- For discord_send_message, channel_id may be a channel NAME like 'general' — it is "
         "resolved automatically. Default to 'general' when the user names no channel.\n"
-        "- browser_open_url, browser_list_tabs, browser_switch_tab, browser_close are for a real on-screen browser window: "
-        "use them when the user asks to open a website, check open tabs, switch tabs, or close tabs/browser.\n"
+        "- browser_open_url, browser_list_tabs, browser_switch_tab, browser_close, browser_detect_app_type, "
+        "browser_flutter_get_widgets, browser_flutter_click, browser_flutter_type, flutter_run_test are for browser & Flutter apps: "
+        "use them when the user asks to open a website/Flutter app, check open tabs, interact with widgets, or run Flutter tests.\n"
     )
     try:
         res = subprocess.run(
@@ -179,7 +181,7 @@ def call_claude_cli(cfg, system_prompt, messages):
                 result = execute_gmail_tool(cfg, tool_name, tool_input)
             elif tool_name.startswith("discord_"):
                 result = execute_discord_tool(cfg, tool_name, tool_input)
-            elif tool_name.startswith("browser_") or tool_name == "system_open":
+            elif tool_name.startswith("browser_") or tool_name.startswith("flutter_") or tool_name == "system_open":
                 result = execute_browser_tool(cfg, tool_name, tool_input)
             elif tool_name.startswith("system_"):
                 result = execute_system_tool(cfg, tool_name, tool_input)

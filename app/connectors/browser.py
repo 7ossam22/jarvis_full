@@ -1,16 +1,21 @@
-"""app/connectors/browser.py — system UI and browser control tools (Connector layer).
+"""app/connectors/browser.py — system UI, browser control, and Flutter Web automation tools (Connector layer).
 
-Lets JARVIS control and interact with the user's on-screen browser:
+Lets JARVIS control and interact with the user's on-screen browser and Flutter Web applications:
 - browser_open_url: Opens or navigates a visible Chromium/Chrome window/tab on the user's screen.
 - browser_list_profiles: Lists discovered Chrome profiles on the host machine.
 - browser_list_tabs: Lists open browser tabs with their indices, titles, URLs, and active status.
 - browser_switch_tab: Switches active view to a specific open tab.
 - browser_close: Closes the active tab, a specific tab index, or the entire browser.
-- browser_click: Clicks any button, link, or element using CSS, text, or ARIA selectors.
-- browser_type: Types or fills text into search boxes, forms, and textareas.
+- browser_detect_app_type: Detects whether the active page is Flutter Web or standard HTML web app.
+- browser_flutter_get_widgets: Inspects Flutter semantics tree and extracts widgets, labels, and coordinates.
+- browser_flutter_click: Clicks a Flutter widget by label, text, tooltip, role, or coordinates on CanvasKit canvas.
+- browser_flutter_type: Types text into a Flutter text field on the CanvasKit canvas.
+- flutter_run_test: Runs Patrol, Flutter integration tests, or Flutter driver tests via the local Flutter SDK.
+- browser_click: Clicks any button, link, or element using CSS, text, or auto-detected Flutter semantics.
+- browser_type: Types or fills text into search boxes, forms, textareas, and Flutter text fields.
 - browser_press_key: Presses keyboard keys like Enter, Escape, Tab, Arrow keys.
 - browser_scroll: Scrolls the active page up, down, or to a specific element.
-- browser_get_content: Reads page text or discovers clickable elements & selectors.
+- browser_get_content: Reads page text or discovers clickable elements / Flutter widgets & selectors.
 - browser_screenshot: Captures a PNG screenshot of the visible screen/page.
 - system_open: Opens files, folders, or desktop app URLs with xdg-open.
 
@@ -33,7 +38,7 @@ DAEMON_LOG = os.path.join(ROOT, "tools", "browser_daemon.log")
 
 
 def get_browser_tools():
-    """Returns tool definitions for on-screen browser automation and system control."""
+    """Returns tool definitions for on-screen browser automation, Flutter Web, and system control."""
     return [
         {
             "name": "browser_open_url",
@@ -48,7 +53,7 @@ def get_browser_tools():
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "The URL to open (e.g. 'https://google.com', 'https://youtube.com'). Defaults to Google.",
+                        "description": "The URL to open (e.g. 'https://google.com', 'https://youtube.com', 'http://localhost:8080'). Defaults to Google.",
                     },
                     "new_tab": {
                         "type": "boolean",
@@ -61,6 +66,130 @@ def get_browser_tools():
                     "tab_index": {
                         "type": "integer",
                         "description": "Optional specific tab index to navigate in.",
+                    },
+                },
+            },
+        },
+        {
+            "name": "browser_detect_app_type",
+            "description": (
+                "Detect whether the currently active browser page is a Flutter Web application "
+                "(rendered via CanvasKit/HTML5 canvas with semantics) or a standard HTML/DOM website. "
+                "Returns app type, Flutter renderer, semantics status, and recommended interaction tools."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to inspect (defaults to active tab).",
+                    },
+                },
+            },
+        },
+        {
+            "name": "browser_flutter_get_widgets",
+            "description": (
+                "Inspect a Flutter Web application's semantics tree to discover interactive Flutter widgets "
+                "(buttons, text fields, checkboxes, tabs, list tiles) with their labels, roles, values, and canvas coordinates."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to inspect.",
+                    },
+                },
+            },
+        },
+        {
+            "name": "browser_flutter_click",
+            "description": (
+                "Click an interactive Flutter widget on a Flutter Web page (CanvasKit canvas). "
+                "Target can be a widget label (e.g. 'Login', 'Submit'), tooltip, role, or coordinates 'flutter:coords(x,y)'."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Flutter widget label, text, tooltip, role, or coordinate (e.g. 'Login', 'Search', 'role=button', 'coords:250,400').",
+                    },
+                    "double_click": {
+                        "type": "boolean",
+                        "description": "Whether to perform a double-click (default false).",
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to click on.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+        {
+            "name": "browser_flutter_type",
+            "description": (
+                "Type text into a Flutter text field / input on a Flutter Web page (CanvasKit canvas). "
+                "Target can be the input label, placeholder, or widget description."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Flutter text field label, placeholder, or selector (e.g. 'Email', 'Password', 'Search', 'Username').",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The text to enter.",
+                    },
+                    "press_enter": {
+                        "type": "boolean",
+                        "description": "Whether to press Enter after typing to submit immediately (default false).",
+                    },
+                    "clear": {
+                        "type": "boolean",
+                        "description": "Whether to clear existing text before typing (default true).",
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to type on.",
+                    },
+                },
+                "required": ["target", "text"],
+            },
+        },
+        {
+            "name": "flutter_run_test",
+            "description": (
+                "Run a Patrol test, Flutter integration test, or Flutter driver test on a Flutter project using the host's Flutter SDK."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "test_type": {
+                        "type": "string",
+                        "enum": ["integration_test", "patrol", "flutter_drive", "unit_test"],
+                        "description": "Type of test to execute (default 'integration_test').",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Target test file path (e.g. 'integration_test/app_test.dart', 'patrol_test/flow_test.dart').",
+                    },
+                    "device": {
+                        "type": "string",
+                        "description": "Target device (e.g. 'chrome', 'linux', 'android', 'web-server'). Default 'chrome'.",
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Optional absolute path to the Flutter project directory.",
+                    },
+                    "extra_args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional additional command line arguments.",
                     },
                 },
             },
@@ -117,15 +246,14 @@ def get_browser_tools():
             "name": "browser_click",
             "description": (
                 "Click a clickable element (button, link, input, tab, or menu item) on the active on-screen browser page. "
-                "Supports text selectors (e.g. 'text=Search', 'button:has-text(\"Submit\")'), "
-                "CSS selectors (e.g. '#search-btn', '.nav-link'), or tag names."
+                "Auto-detects Flutter Web vs standard HTML DOM and clicks Flutter widgets or DOM elements accordingly."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "selector": {
                         "type": "string",
-                        "description": "Selector or text of the element to click (e.g. 'text=Log In', '#submit', 'a.pricing').",
+                        "description": "Selector, text, or Flutter label of the element to click (e.g. 'text=Log In', '#submit', 'Submit', 'flutter:label(\"Submit\")').",
                     },
                     "double_click": {
                         "type": "boolean",
@@ -142,15 +270,15 @@ def get_browser_tools():
         {
             "name": "browser_type",
             "description": (
-                "Type text into an input field, search box, or textarea on the active browser page. "
-                "Optionally press Enter immediately after typing to submit a search or form."
+                "Type text into an input field, search box, textarea, or Flutter text field on the active browser page. "
+                "Auto-detects Flutter Web vs standard HTML DOM."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "selector": {
                         "type": "string",
-                        "description": "Selector of the input or textarea (e.g. 'input[name=\"q\"]', '#search-input', 'textarea').",
+                        "description": "Selector or Flutter field label (e.g. 'input[name=\"q\"]', '#search-input', 'Search', 'Email').",
                     },
                     "text": {
                         "type": "string",
@@ -199,7 +327,7 @@ def get_browser_tools():
         {
             "name": "browser_scroll",
             "description": (
-                "Scroll the active browser page up, down, to the top, or to the bottom, or scroll a specific element into view."
+                "Scroll the active browser page up, down, to the top, or to the bottom, or scroll a specific element / Flutter widget into view."
             ),
             "input_schema": {
                 "type": "object",
@@ -215,7 +343,7 @@ def get_browser_tools():
                     },
                     "selector": {
                         "type": "string",
-                        "description": "Optional selector of a specific element to scroll into view.",
+                        "description": "Optional selector of a specific element or Flutter widget to scroll into view.",
                     },
                     "tab_index": {
                         "type": "integer",
@@ -228,15 +356,16 @@ def get_browser_tools():
             "name": "browser_get_content",
             "description": (
                 "Read the content of the currently active browser page. Use 'text' to read clean page text, "
-                "or 'elements' to get a list of interactive clickable buttons, links, inputs, and their selectors."
+                "'elements' to get interactive UI elements (or Flutter widgets if Flutter Web is running), "
+                "or 'flutter_widgets' to explicitly extract the Flutter semantics widget tree."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["text", "elements", "html"],
-                        "description": "'text' for clean readable text (default), 'elements' for interactive UI elements with selector hints, 'html' for raw HTML.",
+                        "enum": ["text", "elements", "flutter_widgets", "html"],
+                        "description": "'text' for clean readable text (default), 'elements' for interactive UI elements / Flutter widgets, 'flutter_widgets' for Flutter widget tree, 'html' for raw HTML.",
                     },
                     "max_chars": {
                         "type": "integer",
@@ -291,7 +420,7 @@ def get_browser_tools():
     ]
 
 
-def _daemon_request(path, payload=None, timeout=35):
+def _daemon_request(path, payload=None, timeout=65):
     data = json.dumps(payload or {}).encode("utf-8") if path != "/health" else None
     req = urllib.request.Request(
         f"{DAEMON_URL}{path}",
@@ -334,7 +463,7 @@ def _ensure_daemon():
 
 
 def execute_browser_tool(cfg, tool_name, tool_input):
-    """Executes a browser/system UI tool call."""
+    """Executes a browser, Flutter automation, or system UI tool call."""
     try:
         if tool_name == "system_open":
             target = (tool_input.get("target") or "").strip()
@@ -357,6 +486,36 @@ def execute_browser_tool(cfg, tool_name, tool_input):
                 "new_tab": bool(tool_input.get("new_tab", False)),
                 "profile": tool_input.get("profile"),
                 "tab_index": tool_input.get("tab_index"),
+            })
+        elif tool_name == "browser_detect_app_type":
+            return _daemon_request("/detect_app_type", {
+                "tab_index": tool_input.get("tab_index"),
+            })
+        elif tool_name == "browser_flutter_get_widgets":
+            return _daemon_request("/flutter_widgets", {
+                "tab_index": tool_input.get("tab_index"),
+            })
+        elif tool_name == "browser_flutter_click":
+            return _daemon_request("/flutter_click", {
+                "target": tool_input.get("target", ""),
+                "double_click": bool(tool_input.get("double_click", False)),
+                "tab_index": tool_input.get("tab_index"),
+            })
+        elif tool_name == "browser_flutter_type":
+            return _daemon_request("/flutter_type", {
+                "target": tool_input.get("target", ""),
+                "text": tool_input.get("text", ""),
+                "press_enter": bool(tool_input.get("press_enter", False)),
+                "clear": bool(tool_input.get("clear", True)),
+                "tab_index": tool_input.get("tab_index"),
+            })
+        elif tool_name == "flutter_run_test":
+            return _daemon_request("/flutter_run_test", {
+                "test_type": tool_input.get("test_type", "integration_test"),
+                "target": tool_input.get("target", ""),
+                "device": tool_input.get("device", "chrome"),
+                "project_path": tool_input.get("project_path", ""),
+                "extra_args": tool_input.get("extra_args", []),
             })
         elif tool_name == "browser_list_profiles":
             return _daemon_request("/list_profiles")
@@ -424,5 +583,6 @@ def execute_browser_tool(cfg, tool_name, tool_input):
     except (urllib.error.URLError, TimeoutError, OSError, FileNotFoundError) as e:
         print(f"[jarvis] browser tool {tool_name} failed: {e}", file=sys.stderr)
         return {"error": f"browser control failed: {e}"}
+
 
 

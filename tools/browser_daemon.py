@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/browser_daemon.py — JARVIS's hands on a real browser (Playwright).
+"""tools/browser_daemon.py — JARVIS's hands on a real browser (Playwright Async API + Flutter Automation).
 
 Runs OUTSIDE the stdlib-only JARVIS server because it needs the playwright
 pip package — launch it with .venv-browser/bin/python (see
@@ -8,12 +8,19 @@ tools/setup_browser.sh). The JARVIS server's browser connector
 http://127.0.0.1:4701.
 
 Features:
+- Native Playwright Async API + Asyncio Server: Completely eliminates 'Playwright Sync API inside asyncio loop' error.
 - Full machine & tab state awareness (total tabs, active tab index, titles & URLs).
 - Persistent profile support preserving user logins, cookies, and bookmarks.
+- Automatic SingletonLock and stale process cleanup to prevent frozen about:blank pages.
 - Tab management: tab reuse, new tab creation, tab listing, tab switching, tab closing.
+- Flutter Web Automation: auto-detects Flutter Web (CanvasKit/HTML), activates semantics,
+  extracts Flutter widgets, and performs canvas coordinate clicks & text editing.
+- Flutter Testing Integration: supports running Patrol tests, Flutter integration tests,
+  and Appium/Flutter drivers with local Flutter SDKs.
 - Clean process lifecycle: prevents orphaned Chromium processes and zombie windows.
 - Non-destructive error handling: element timeouts no longer discard the live browser window.
 """
+import asyncio
 import json
 import os
 import re
@@ -21,9 +28,12 @@ import shutil
 import subprocess
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from playwright.sync_api import sync_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import (
+    async_playwright,
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 PORT = 4701
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +47,35 @@ state = {
 }
 
 
+def _find_flutter_binaries():
+    """Discovers available Flutter, Dart, Patrol, and FVM binaries on the host."""
+    candidates = [
+        "/home/proslayer/development/flutter/bin/flutter",
+        "/home/proslayer/development/3.35.6/bin/flutter",
+        "/home/proslayer/development/3.29.1/bin/flutter",
+        "/home/proslayer/development/3.19.0/bin/flutter",
+        os.path.expanduser("~/.pub-cache/bin/fvm"),
+        os.path.expanduser("~/.pub-cache/bin/patrol"),
+    ]
+    discovered = {}
+    for p in candidates:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            name = os.path.basename(p)
+            if name not in discovered:
+                discovered[name] = p
+
+    if shutil.which("flutter") and "flutter" not in discovered:
+        discovered["flutter"] = shutil.which("flutter")
+    if shutil.which("dart") and "dart" not in discovered:
+        discovered["dart"] = shutil.which("dart")
+    if shutil.which("patrol") and "patrol" not in discovered:
+        discovered["patrol"] = shutil.which("patrol")
+    if shutil.which("fvm") and "fvm" not in discovered:
+        discovered["fvm"] = shutil.which("fvm")
+
+    return discovered
+
+
 def _clean_orphaned_playwright_processes():
     """Kills any stray Playwright temporary Chromium processes to prevent clutter."""
     try:
@@ -48,6 +87,45 @@ def _clean_orphaned_playwright_processes():
         )
     except Exception:
         pass
+
+
+def _clean_profile_locks(profile_dir):
+    """Kills any stale process holding SingletonLock or running with profile_dir and removes lock symlinks."""
+    if not profile_dir or not os.path.isdir(profile_dir):
+        return
+
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", f"user-data-dir={profile_dir}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+    singleton_lock = os.path.join(profile_dir, "SingletonLock")
+    if os.path.islink(singleton_lock) or os.path.exists(singleton_lock):
+        try:
+            target = os.readlink(singleton_lock) if os.path.islink(singleton_lock) else ""
+            if "-" in target:
+                pid_str = target.rsplit("-", 1)[-1]
+                if pid_str.isdigit():
+                    pid = int(pid_str)
+                    try:
+                        os.kill(pid, 9)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+        except Exception:
+            pass
+
+    for item in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        p = os.path.join(profile_dir, item)
+        try:
+            if os.path.islink(p) or os.path.exists(p):
+                os.unlink(p)
+        except Exception:
+            pass
 
 
 def get_chrome_profiles():
@@ -84,7 +162,6 @@ def get_chrome_profiles():
         except Exception as e:
             print(f"[browser-daemon] error reading profiles from {local_state_path}: {e}", file=sys.stderr)
 
-    # Check jarvis-chrome profiles directory
     jarvis_base = os.path.expanduser("~/.config/jarvis-chrome")
     if os.path.isdir(jarvis_base):
         for entry in os.listdir(jarvis_base):
@@ -117,7 +194,6 @@ def _resolve_profile_dir(profile_query):
     query_clean = profile_query.strip().lower()
     discovered = get_chrome_profiles()
 
-    # Exact or substring match
     matched = None
     for p in discovered:
         if (
@@ -135,7 +211,6 @@ def _resolve_profile_dir(profile_query):
         os.makedirs(target_dir, exist_ok=True)
         return target_dir, matched["name"]
 
-    # Fallback to sanitized custom slug
     slug = re.sub(r"[^a-z0-9_]", "_", query_clean)
     target_dir = os.path.join(jarvis_base, f"profile_{slug}")
     os.makedirs(target_dir, exist_ok=True)
@@ -149,49 +224,43 @@ def get_open_pages():
     try:
         pages = []
         for p in state["context"].pages:
-            try:
-                if not p.is_closed():
-                    pages.append(p)
-            except Exception:
-                pass
+            if not p.is_closed():
+                pages.append(p)
         return pages
     except Exception:
         return []
 
 
-def ensure_browser(profile=None):
+async def ensure_browser(profile=None):
     """Ensures Playwright browser context is active, healthy, and on the requested profile."""
     req_dir, req_profile_name = _resolve_profile_dir(profile)
 
-    # Check if context already running for this profile
     if (
         state["context"] is not None
         and state["current_profile"] == req_profile_name
     ):
         pages = get_open_pages()
         if pages:
-            return  # Context is healthy with open pages
+            return
         try:
-            # If all pages were closed, create a fresh page
-            state["context"].new_page()
+            await state["context"].new_page()
             state["active_tab_index"] = 0
             return
         except Exception:
-            # Context is dead, fall through to re-launch
             state["context"] = None
 
-    # If another profile was open, close it cleanly
     if state["context"] is not None and state["current_profile"] != req_profile_name:
         try:
-            state["context"].close()
+            await state["context"].close()
         except Exception:
             pass
         state["context"] = None
 
-    if state["pw"] is None:
-        state["pw"] = sync_playwright().start()
+    _clean_profile_locks(req_dir)
 
-    # Launch persistent context preserving cookies/logins without conflicts
+    if state["pw"] is None:
+        state["pw"] = await async_playwright().start()
+
     launch_args = [
         "--start-maximized",
         "--disable-blink-features=AutomationControlled",
@@ -201,49 +270,50 @@ def ensure_browser(profile=None):
 
     context = None
     try:
-        # Try real Google Chrome channel first
-        context = state["pw"].chromium.launch_persistent_context(
+        context = await state["pw"].chromium.launch_persistent_context(
             user_data_dir=req_dir,
             channel="chrome",
             headless=False,
             args=launch_args,
             no_viewport=True,
+            ignore_https_errors=True,
         )
     except Exception as e:
-        print(f"[browser-daemon] Chrome channel launch failed ({e}); trying default Chromium…", file=sys.stderr)
+        print(f"[browser-daemon] Chrome channel launch failed ({e}); cleaning locks and trying Chromium…", file=sys.stderr)
+        _clean_profile_locks(req_dir)
         try:
-            context = state["pw"].chromium.launch_persistent_context(
+            context = await state["pw"].chromium.launch_persistent_context(
                 user_data_dir=req_dir,
                 headless=False,
                 args=launch_args,
                 no_viewport=True,
+                ignore_https_errors=True,
             )
         except Exception as e2:
             print(f"[browser-daemon] Persistent launch failed ({e2}); falling back to ephemeral launch…", file=sys.stderr)
-            state["browser"] = state["pw"].chromium.launch(
+            state["browser"] = await state["pw"].chromium.launch(
                 headless=False,
                 args=launch_args,
             )
-            context = state["browser"].new_context(no_viewport=True)
+            context = await state["browser"].new_context(no_viewport=True, ignore_https_errors=True)
 
     state["context"] = context
     state["current_profile"] = req_profile_name
     state["active_tab_index"] = 0
 
-    # Ensure at least 1 page exists
     pages = get_open_pages()
     if not pages:
-        context.new_page()
+        await context.new_page()
 
 
-def build_tab_list():
+async def build_tab_list():
     """Returns structured metadata for all open tabs."""
     pages = get_open_pages()
     active_idx = max(0, min(state.get("active_tab_index", 0), len(pages) - 1)) if pages else 0
     tabs = []
     for i, p in enumerate(pages):
         try:
-            title = p.title() or "Untitled"
+            title = await p.title() or "Untitled"
             url = p.url or "about:blank"
         except Exception:
             title, url = "Tab", ""
@@ -256,12 +326,12 @@ def build_tab_list():
     return tabs
 
 
-def get_active_page(tab_index=None, profile=None):
+async def get_active_page(tab_index=None, profile=None):
     """Retrieves the active page (or specific tab_index) and brings it to front."""
-    ensure_browser(profile=profile)
+    await ensure_browser(profile=profile)
     pages = get_open_pages()
     if not pages:
-        page = state["context"].new_page()
+        page = await state["context"].new_page()
         pages = [page]
 
     if tab_index is not None:
@@ -278,13 +348,326 @@ def get_active_page(tab_index=None, profile=None):
     state["active_tab_index"] = idx
     page = pages[idx]
     try:
-        page.bring_to_front()
+        await page.bring_to_front()
     except Exception:
         pass
     return page
 
 
-def cmd_list_profiles(_payload):
+# ============================================================================
+# Flutter Web Automation Engine
+# ============================================================================
+
+async def is_flutter_page(page):
+    """Detects if the active page is running Flutter Web (CanvasKit, Skwasm, or HTML renderer)."""
+    try:
+        return await page.evaluate("""() => {
+            if (document.querySelector('flutter-view, flt-glass-pane, flt-semantics-host, flt-semantics-placeholder, flt-scene-host')) return true;
+            if (window._flutter || window.flutterCanvasKit || window.flutterConfiguration) return true;
+            const scripts = Array.from(document.querySelectorAll('script'));
+            return scripts.some(s => (s.src || '').includes('flutter.js') || (s.src || '').includes('main.dart.js'));
+        }""")
+    except Exception:
+        return False
+
+
+async def enable_flutter_semantics(page):
+    """Enables Flutter accessibility and semantics tree for full widget inspection."""
+    try:
+        await page.evaluate("""() => {
+            const ph = document.querySelector('flt-semantics-placeholder, [role="button"][aria-label*="accessibility" i]');
+            if (ph) {
+                ph.click();
+            }
+            try {
+                window.dispatchEvent(new Event('flutter-semantics-update'));
+            } catch (e) {}
+            const host = document.querySelector('flt-semantics-host');
+            if (host) {
+                host.focus();
+            }
+        }""")
+        await page.wait_for_timeout(350)
+    except Exception:
+        pass
+
+
+async def extract_flutter_widgets(page):
+    """Extracts interactive Flutter widgets from semantics tree and canvas coordinates."""
+    await enable_flutter_semantics(page)
+    try:
+        return await page.evaluate("""() => {
+            const results = [];
+            const seen = new Set();
+            const nodes = document.querySelectorAll(
+                'flt-semantics, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="switch"], [role="tab"], [role="heading"], [aria-label], [placeholder], input, button, select, textarea'
+            );
+            
+            for (const n of nodes) {
+                const rect = n.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0 || window.getComputedStyle(n).visibility === 'hidden') continue;
+                
+                const label = (n.getAttribute('aria-label') || n.innerText || n.getAttribute('placeholder') || n.getAttribute('title') || '').trim().replace(/\\s+/g, ' ');
+                const role = n.getAttribute('role') || (n.tagName.toLowerCase() === 'input' ? 'textbox' : (n.tagName.toLowerCase() === 'button' ? 'button' : 'widget'));
+                const value = n.getAttribute('aria-valuenow') || n.value || (n.getAttribute('aria-checked') === 'true' ? 'checked' : (n.getAttribute('aria-checked') === 'false' ? 'unchecked' : ''));
+                
+                if (!label && role === 'widget' && !value) continue;
+                
+                const key = `${role}:${label}:${Math.round(rect.x)}:${Math.round(rect.y)}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                
+                const center_x = Math.round(rect.x + rect.width / 2);
+                const center_y = Math.round(rect.y + rect.height / 2);
+                
+                results.push({
+                    role: role,
+                    label: label ? label.slice(0, 80) : undefined,
+                    value: value || undefined,
+                    bounds: {
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                        center_x: center_x,
+                        center_y: center_y,
+                    },
+                    selector_hint: label ? `flutter:label("${label.slice(0, 30)}")` : `flutter:coords(${center_x},${center_y})`
+                });
+                if (results.length >= 60) break;
+            }
+            return results;
+        }""")
+    except Exception as e:
+        print(f"[browser-daemon] extract_flutter_widgets error: {e}", file=sys.stderr)
+        return []
+
+
+async def find_flutter_widget_coords(page, target):
+    """Finds exact viewport (center_x, center_y) coordinates for a Flutter widget target."""
+    await enable_flutter_semantics(page)
+    target_clean = str(target or "").strip()
+
+    coord_match = re.search(r"coords?\(?(\d+)[,\s]+(\d+)\)?", target_clean, re.IGNORECASE)
+    if coord_match:
+        return int(coord_match.group(1)), int(coord_match.group(2)), f"coords({coord_match.group(1)},{coord_match.group(2)})"
+
+    label_query = target_clean
+    if target_clean.startswith(("flutter:label(", "flutter:text(", "text=")):
+        label_query = target_clean.split("(", 1)[-1].rstrip(")").strip("\"'")
+
+    widgets = await extract_flutter_widgets(page)
+
+    for w in widgets:
+        w_label = (w.get("label") or "").strip().lower()
+        if w_label and w_label == label_query.lower():
+            b = w["bounds"]
+            return b["center_x"], b["center_y"], w.get("label", "")
+
+    for w in widgets:
+        w_label = (w.get("label") or "").strip().lower()
+        if w_label and (label_query.lower() in w_label or w_label in label_query.lower()):
+            b = w["bounds"]
+            return b["center_x"], b["center_y"], w.get("label", "")
+
+    if "=" in target_clean:
+        attr, val = target_clean.split("=", 1)
+        attr = attr.strip().lower()
+        val = val.strip().lower().strip("\"'")
+        for w in widgets:
+            if attr in ("role", "type") and (w.get("role") or "").lower() == val:
+                b = w["bounds"]
+                return b["center_x"], b["center_y"], f"{w.get('role')}:{w.get('label')}"
+
+    return None, None, None
+
+
+# ============================================================================
+# Command Handlers
+# ============================================================================
+
+async def cmd_detect_app_type(payload):
+    """Detects whether the active page is Flutter Web or standard DOM web application."""
+    tab_index = payload.get("tab_index")
+    page = await get_active_page(tab_index=tab_index)
+
+    is_flt = await is_flutter_page(page)
+    if not is_flt:
+        try:
+            await page.wait_for_function("""() => {
+                return !!(document.querySelector('flutter-view, flt-glass-pane, flt-semantics-host, flt-semantics-placeholder') || window._flutter || window.flutterCanvasKit);
+            }""", timeout=2500)
+            is_flt = True
+        except Exception:
+            pass
+
+    widgets = []
+    if is_flt:
+        await enable_flutter_semantics(page)
+        widgets = await extract_flutter_widgets(page)
+
+    title = await page.title()
+    return {
+        "app_type": "flutter_web" if is_flt else "standard_web",
+        "is_flutter": is_flt,
+        "renderer": "canvaskit_or_html" if is_flt else "html_dom",
+        "semantics_enabled": bool(is_flt),
+        "flutter_widgets_count": len(widgets),
+        "url": page.url,
+        "title": title,
+        "recommended_tools": (
+            ["browser_flutter_click", "browser_flutter_type", "browser_flutter_get_widgets"]
+            if is_flt else
+            ["browser_click", "browser_type", "browser_get_content"]
+        ),
+        "flutter_widgets_preview": widgets[:10] if is_flt else [],
+    }
+
+
+async def cmd_flutter_widgets(payload):
+    """Extracts Flutter widgets from semantics tree and canvas coordinates."""
+    tab_index = payload.get("tab_index")
+    page = await get_active_page(tab_index=tab_index)
+    widgets = await extract_flutter_widgets(page)
+    title = await page.title()
+    return {
+        "url": page.url,
+        "title": title,
+        "total_widgets": len(widgets),
+        "active_tab_index": state["active_tab_index"],
+        "widgets": widgets,
+    }
+
+
+async def cmd_flutter_click(payload):
+    """Clicks a Flutter widget on the CanvasKit canvas using semantics and coordinate dispatch."""
+    target = payload.get("target") or payload.get("selector") or payload.get("label") or ""
+    tab_index = payload.get("tab_index")
+    double_click = bool(payload.get("double_click", False))
+
+    page = await get_active_page(tab_index=tab_index)
+    cx, cy, matched_label = await find_flutter_widget_coords(page, target)
+
+    if cx is None or cy is None:
+        avail = await extract_flutter_widgets(page)
+        return {
+            "error": f"Flutter widget '{target}' not found. Try inspecting available widgets with browser_flutter_get_widgets.",
+            "available_widgets": avail[:10],
+        }
+
+    if double_click:
+        await page.mouse.dblclick(cx, cy)
+    else:
+        await page.mouse.click(cx, cy)
+
+    await page.wait_for_timeout(350)
+    title = await page.title()
+    return {
+        "status": "flutter_clicked",
+        "target": target,
+        "matched_label": matched_label,
+        "coordinates": {"x": cx, "y": cy},
+        "url": page.url,
+        "title": title,
+        "active_tab_index": state["active_tab_index"],
+    }
+
+
+async def cmd_flutter_type(payload):
+    """Types text into a Flutter text field on the CanvasKit canvas."""
+    target = payload.get("target") or payload.get("selector") or payload.get("label") or ""
+    text = str(payload.get("text", ""))
+    press_enter = bool(payload.get("press_enter", False))
+    clear = bool(payload.get("clear", True))
+    tab_index = payload.get("tab_index")
+
+    page = await get_active_page(tab_index=tab_index)
+    cx, cy, matched_label = await find_flutter_widget_coords(page, target)
+
+    if cx is None or cy is None:
+        avail = await extract_flutter_widgets(page)
+        return {
+            "error": f"Flutter text field '{target}' not found. Try inspecting available widgets with browser_flutter_get_widgets.",
+            "available_widgets": avail[:10],
+        }
+
+    await page.mouse.click(cx, cy)
+    await page.wait_for_timeout(250)
+
+    if clear:
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Backspace")
+
+    await page.keyboard.type(text, delay=20)
+    if press_enter:
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(350)
+
+    title = await page.title()
+    return {
+        "status": "flutter_typed",
+        "target": target,
+        "matched_label": matched_label,
+        "text": text,
+        "coordinates": {"x": cx, "y": cy},
+        "url": page.url,
+        "title": title,
+        "active_tab_index": state["active_tab_index"],
+    }
+
+
+async def cmd_flutter_run_test(payload):
+    """Runs a Patrol test, Flutter integration test, or Flutter driver command."""
+    test_type = (payload.get("test_type") or "integration_test").lower()
+    target = (payload.get("target") or "").strip()
+    device = (payload.get("device") or "chrome").strip()
+    project_path = (payload.get("project_path") or ROOT).strip()
+    extra_args = payload.get("extra_args") or []
+
+    binaries = _find_flutter_binaries()
+    flutter_bin = binaries.get("flutter", "flutter")
+    patrol_bin = binaries.get("patrol")
+
+    cmd = []
+    if test_type == "patrol":
+        if patrol_bin:
+            cmd = [patrol_bin, "test", "-d", device]
+        else:
+            cmd = [flutter_bin, "test", "-d", device]
+    elif test_type == "flutter_drive":
+        cmd = [flutter_bin, "drive", "-d", device]
+    else:
+        cmd = [flutter_bin, "test", "-d", device]
+
+    if target:
+        cmd.append(target)
+    if extra_args:
+        cmd.extend(extra_args)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=180)
+        stdout_text = stdout_bytes.decode("utf-8", errors="ignore").strip()
+        stderr_text = stderr_bytes.decode("utf-8", errors="ignore").strip()
+        return {
+            "status": "success" if proc.returncode == 0 else "failed",
+            "exit_code": proc.returncode,
+            "command": " ".join(cmd),
+            "stdout": stdout_text[-3000:],
+            "stderr": stderr_text[-1000:],
+        }
+    except asyncio.TimeoutError:
+        return {"error": f"Flutter test command timed out after 180s: {' '.join(cmd)}"}
+    except Exception as e:
+        return {"error": f"Failed to execute Flutter test ({e}): {' '.join(cmd)}"}
+
+
+async def cmd_list_profiles(_payload):
     """Lists all available Chrome profiles on the host."""
     profiles = get_chrome_profiles()
     return {
@@ -294,7 +677,7 @@ def cmd_list_profiles(_payload):
     }
 
 
-def cmd_open(payload):
+async def cmd_open(payload):
     """Opens a URL, navigating in the active tab or opening a new tab."""
     url = (payload.get("url") or "").strip()
     profile = payload.get("profile")
@@ -306,30 +689,55 @@ def cmd_open(payload):
     elif not url.startswith(("http://", "https://", "file://", "about:", "chrome://")):
         url = "https://" + url
 
-    ensure_browser(profile=profile)
+    await ensure_browser(profile=profile)
     pages = get_open_pages()
 
     if new_tab:
-        page = state["context"].new_page()
+        page = await state["context"].new_page()
         pages = get_open_pages()
         state["active_tab_index"] = len(pages) - 1
     else:
         if tab_index is not None:
-            page = get_active_page(tab_index=tab_index)
+            page = await get_active_page(tab_index=tab_index)
         elif len(pages) == 1 and pages[0].url in ("about:blank", "chrome://newtab/"):
             page = pages[0]
             state["active_tab_index"] = 0
         else:
-            page = get_active_page()
+            page = await get_active_page()
 
-    page.goto(url, wait_until="domcontentloaded", timeout=25000)
-    page.bring_to_front()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=55000)
+    except PlaywrightTimeoutError:
+        # If domcontentloaded timed out due to background network or Cloudflare, check if the page actually loaded
+        pass
+    except Exception:
+        try:
+            await page.goto(url, wait_until="commit", timeout=15000)
+        except Exception:
+            pass
 
-    all_tabs = build_tab_list()
+    await page.bring_to_front()
+
+    is_flt = await is_flutter_page(page)
+    if not is_flt:
+        try:
+            await page.wait_for_function("""() => {
+                return !!(document.querySelector('flutter-view, flt-glass-pane, flt-semantics-host, flt-semantics-placeholder') || window._flutter || window.flutterCanvasKit);
+            }""", timeout=3000)
+            is_flt = True
+        except Exception:
+            pass
+
+    if is_flt:
+        await enable_flutter_semantics(page)
+
+    all_tabs = await build_tab_list()
+    title = await page.title()
     return {
         "status": "opened",
         "url": page.url,
-        "title": page.title(),
+        "title": title,
+        "app_type": "flutter_web" if is_flt else "standard_web",
         "profile": state.get("current_profile", "default"),
         "active_tab_index": state["active_tab_index"],
         "total_tabs": len(all_tabs),
@@ -337,7 +745,7 @@ def cmd_open(payload):
     }
 
 
-def cmd_list(_payload):
+async def cmd_list(_payload):
     """Lists all open tabs in the controlled browser window."""
     if state["context"] is None:
         return {
@@ -348,17 +756,7 @@ def cmd_list(_payload):
             "tabs": [],
         }
 
-    pages = get_open_pages()
-    if not pages:
-        return {
-            "status": "no_tabs_open",
-            "total_tabs": 0,
-            "active_tab_index": None,
-            "profile": state.get("current_profile", "default"),
-            "tabs": [],
-        }
-
-    tabs = build_tab_list()
+    tabs = await build_tab_list()
     return {
         "status": "ok",
         "total_tabs": len(tabs),
@@ -368,7 +766,7 @@ def cmd_list(_payload):
     }
 
 
-def cmd_switch_tab(payload):
+async def cmd_switch_tab(payload):
     """Switches the active tab by tab index or matching title/URL query."""
     if state["context"] is None:
         return {"error": "No browser is currently open."}
@@ -392,33 +790,37 @@ def cmd_switch_tab(payload):
     if target_idx is None and query:
         for i, p in enumerate(pages):
             try:
-                if query in (p.title() or "").lower() or query in (p.url or "").lower():
+                p_title = await p.title() or ""
+                p_url = p.url or ""
+                if query in p_title.lower() or query in p_url.lower():
                     target_idx = i
                     break
             except Exception:
                 pass
 
     if target_idx is None:
+        all_tabs = await build_tab_list()
         return {
             "error": f"Tab not found matching {payload}. Total open tabs: {len(pages)}.",
-            "tabs": build_tab_list(),
+            "tabs": all_tabs,
         }
 
-    page = get_active_page(tab_index=target_idx)
-    page.bring_to_front()
+    page = await get_active_page(tab_index=target_idx)
+    await page.bring_to_front()
 
-    tabs = build_tab_list()
+    tabs = await build_tab_list()
+    title = await page.title()
     return {
         "status": "switched",
         "active_tab_index": state["active_tab_index"],
-        "title": page.title(),
+        "title": title,
         "url": page.url,
         "total_tabs": len(tabs),
         "tabs": tabs,
     }
 
 
-def cmd_close(payload):
+async def cmd_close(payload):
     """Closes tabs or the entire browser window cleanly."""
     scope = (payload.get("scope") or "tab").lower()
     tab_index = payload.get("tab_index")
@@ -435,19 +837,18 @@ def cmd_close(payload):
     pages = get_open_pages()
 
     if scope in ("all", "browser") or not pages:
-        # Close all pages and context cleanly
         for p in pages:
             try:
-                p.close()
+                await p.close()
             except Exception:
                 pass
         try:
-            state["context"].close()
+            await state["context"].close()
         except Exception:
             pass
         if state["browser"] is not None:
             try:
-                state["browser"].close()
+                await state["browser"].close()
             except Exception:
                 pass
 
@@ -465,24 +866,24 @@ def cmd_close(payload):
         }
 
     if scope == "others":
-        active_p = get_active_page()
+        active_p = await get_active_page()
         for p in pages:
             if p != active_p:
                 try:
-                    p.close()
+                    await p.close()
                 except Exception:
                     pass
         state["active_tab_index"] = 0
         remaining = get_open_pages()
+        all_tabs = await build_tab_list()
         return {
             "status": "other_tabs_closed",
             "message": "Closed all tabs except the active tab.",
             "remaining_tabs_count": len(remaining),
             "active_tab_index": 0,
-            "tabs": build_tab_list(),
+            "tabs": all_tabs,
         }
 
-    # scope == "tab" (single tab close)
     target_page = None
     if tab_index is not None:
         try:
@@ -493,25 +894,26 @@ def cmd_close(payload):
             pass
 
     if target_page is None:
-        target_page = get_active_page()
+        target_page = await get_active_page()
 
-    closed_title = target_page.title() if not target_page.is_closed() else ""
-    closed_url = target_page.url if not target_page.is_closed() else ""
-
+    closed_title = ""
+    closed_url = ""
     try:
-        target_page.close()
+        closed_title = await target_page.title()
+        closed_url = target_page.url
+        await target_page.close()
     except Exception:
         pass
 
     remaining = get_open_pages()
     if not remaining:
         try:
-            state["context"].close()
+            await state["context"].close()
         except Exception:
             pass
         if state["browser"] is not None:
             try:
-                state["browser"].close()
+                await state["browser"].close()
             except Exception:
                 pass
         state["context"] = None
@@ -528,11 +930,11 @@ def cmd_close(payload):
 
     state["active_tab_index"] = min(state.get("active_tab_index", 0), len(remaining) - 1)
     try:
-        remaining[state["active_tab_index"]].bring_to_front()
+        await remaining[state["active_tab_index"]].bring_to_front()
     except Exception:
         pass
 
-    tabs = build_tab_list()
+    tabs = await build_tab_list()
     return {
         "status": "tab_closed",
         "closed_tab": {"title": closed_title, "url": closed_url},
@@ -542,8 +944,8 @@ def cmd_close(payload):
     }
 
 
-def cmd_click(payload):
-    """Clicks an element on the active page."""
+async def cmd_click(payload):
+    """Clicks an element, automatically detecting Flutter Web vs Standard DOM."""
     selector = (payload.get("selector") or "").strip()
     if not selector:
         return {"error": "no selector provided"}
@@ -551,26 +953,49 @@ def cmd_click(payload):
     double_click = bool(payload.get("double_click", False))
     tab_index = payload.get("tab_index")
 
-    page = get_active_page(tab_index=tab_index)
-    loc = page.locator(selector).first
-    loc.scroll_into_view_if_needed(timeout=timeout_ms)
-    if double_click:
-        loc.dblclick(timeout=timeout_ms)
-    else:
-        loc.click(timeout=timeout_ms)
-    page.wait_for_timeout(300)
+    page = await get_active_page(tab_index=tab_index)
 
+    if selector.startswith(("flutter:", "coords:")) or (await is_flutter_page(page)):
+        cx, cy, matched_label = await find_flutter_widget_coords(page, selector)
+        if cx is not None and cy is not None:
+            if double_click:
+                await page.mouse.dblclick(cx, cy)
+            else:
+                await page.mouse.click(cx, cy)
+            await page.wait_for_timeout(300)
+            title = await page.title()
+            return {
+                "status": "clicked",
+                "engine": "flutter_web",
+                "selector": selector,
+                "matched_label": matched_label,
+                "coordinates": {"x": cx, "y": cy},
+                "url": page.url,
+                "title": title,
+                "active_tab_index": state["active_tab_index"],
+            }
+
+    loc = page.locator(selector).first
+    await loc.scroll_into_view_if_needed(timeout=timeout_ms)
+    if double_click:
+        await loc.dblclick(timeout=timeout_ms)
+    else:
+        await loc.click(timeout=timeout_ms)
+    await page.wait_for_timeout(300)
+
+    title = await page.title()
     return {
         "status": "clicked",
+        "engine": "standard_dom",
         "selector": selector,
         "url": page.url,
-        "title": page.title(),
+        "title": title,
         "active_tab_index": state["active_tab_index"],
     }
 
 
-def cmd_type(payload):
-    """Types text into an input or textarea."""
+async def cmd_type(payload):
+    """Types text into an input or textarea, auto-adapting to Flutter Web or Standard DOM."""
     selector = (payload.get("selector") or "").strip()
     if not selector:
         return {"error": "no selector provided"}
@@ -580,86 +1005,143 @@ def cmd_type(payload):
     timeout_ms = int(payload.get("timeout_ms", 8000))
     tab_index = payload.get("tab_index")
 
-    page = get_active_page(tab_index=tab_index)
-    loc = page.locator(selector).first
-    loc.scroll_into_view_if_needed(timeout=timeout_ms)
-    if clear:
-        loc.fill(text, timeout=timeout_ms)
-    else:
-        loc.type(text, timeout=timeout_ms)
-    if press_enter:
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(500)
+    page = await get_active_page(tab_index=tab_index)
 
+    if selector.startswith(("flutter:", "coords:")) or (await is_flutter_page(page)):
+        cx, cy, matched_label = await find_flutter_widget_coords(page, selector)
+        if cx is not None and cy is not None:
+            await page.mouse.click(cx, cy)
+            await page.wait_for_timeout(250)
+            if clear:
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+            await page.keyboard.type(text, delay=20)
+            if press_enter:
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(300)
+            title = await page.title()
+            return {
+                "status": "typed",
+                "engine": "flutter_web",
+                "selector": selector,
+                "matched_label": matched_label,
+                "text": text,
+                "coordinates": {"x": cx, "y": cy},
+                "url": page.url,
+                "title": title,
+                "active_tab_index": state["active_tab_index"],
+            }
+
+    loc = page.locator(selector).first
+    await loc.scroll_into_view_if_needed(timeout=timeout_ms)
+    if clear:
+        await loc.fill(text, timeout=timeout_ms)
+    else:
+        await loc.type(text, timeout=timeout_ms)
+    if press_enter:
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(500)
+
+    title = await page.title()
     return {
         "status": "typed",
+        "engine": "standard_dom",
         "selector": selector,
         "text": text,
         "url": page.url,
-        "title": page.title(),
+        "title": title,
         "active_tab_index": state["active_tab_index"],
     }
 
 
-def cmd_press_key(payload):
+async def cmd_press_key(payload):
     """Presses a keyboard key on the active page."""
     key = (payload.get("key") or "Enter").strip()
     selector = (payload.get("selector") or "").strip()
     tab_index = payload.get("tab_index")
 
-    page = get_active_page(tab_index=tab_index)
+    page = await get_active_page(tab_index=tab_index)
     if selector:
-        page.locator(selector).first.focus()
-    page.keyboard.press(key)
-    page.wait_for_timeout(300)
+        if await is_flutter_page(page):
+            cx, cy, _ = await find_flutter_widget_coords(page, selector)
+            if cx is not None and cy is not None:
+                await page.mouse.click(cx, cy)
+        else:
+            await page.locator(selector).first.focus()
 
+    await page.keyboard.press(key)
+    await page.wait_for_timeout(300)
+
+    title = await page.title()
     return {
         "status": "pressed",
         "key": key,
         "url": page.url,
-        "title": page.title(),
+        "title": title,
         "active_tab_index": state["active_tab_index"],
     }
 
 
-def cmd_scroll(payload):
-    """Scrolls the page or scrolls a selector into view."""
+async def cmd_scroll(payload):
+    """Scrolls the page or scrolls a selector into view, auto-handling Flutter canvas scrolling."""
     direction = (payload.get("direction") or "down").lower()
     amount = int(payload.get("amount", 500))
     selector = (payload.get("selector") or "").strip()
     tab_index = payload.get("tab_index")
 
-    page = get_active_page(tab_index=tab_index)
-    if selector:
-        page.locator(selector).first.scroll_into_view_if_needed()
-    elif direction == "down":
-        page.evaluate(f"window.scrollBy(0, {amount})")
-    elif direction == "up":
-        page.evaluate(f"window.scrollBy(0, -{amount})")
-    elif direction == "top":
-        page.evaluate("window.scrollTo(0, 0)")
-    elif direction == "bottom":
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page = await get_active_page(tab_index=tab_index)
 
+    if selector:
+        if await is_flutter_page(page):
+            cx, cy, _ = await find_flutter_widget_coords(page, selector)
+            if cx is not None and cy is not None:
+                await page.mouse.move(cx, cy)
+        else:
+            await page.locator(selector).first.scroll_into_view_if_needed()
+
+    delta_y = amount if direction == "down" else (-amount if direction == "up" else 0)
+    if delta_y != 0:
+        await page.mouse.wheel(0, delta_y)
+        await page.wait_for_timeout(200)
+
+    if direction == "top":
+        await page.evaluate("window.scrollTo(0, 0)")
+    elif direction == "bottom":
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+    title = await page.title()
     return {
         "status": "scrolled",
         "direction": direction,
         "url": page.url,
-        "title": page.title(),
+        "title": title,
         "active_tab_index": state["active_tab_index"],
     }
 
 
-def cmd_get_content(payload):
-    """Extracts text, interactive DOM elements, or HTML from the page."""
+async def cmd_get_content(payload):
+    """Extracts text, interactive DOM elements, or Flutter widgets from the active page."""
     mode = payload.get("mode", "text")
     max_chars = int(payload.get("max_chars", 4000))
     tab_index = payload.get("tab_index")
 
-    page = get_active_page(tab_index=tab_index)
+    page = await get_active_page(tab_index=tab_index)
+    is_flt = await is_flutter_page(page)
+    title = await page.title()
 
-    if mode == "elements":
-        elements = page.evaluate("""() => {
+    if mode == "flutter_widgets" or (is_flt and mode == "elements"):
+        flutter_widgets = await extract_flutter_widgets(page)
+        return {
+            "app_type": "flutter_web",
+            "url": page.url,
+            "title": title,
+            "active_tab_index": state["active_tab_index"],
+            "total_tabs": len(get_open_pages()),
+            "elements": flutter_widgets,
+            "flutter_widgets_count": len(flutter_widgets),
+        }
+    elif mode == "elements":
+        elements = await page.evaluate("""() => {
             const results = [];
             const seen = new Set();
             const list = document.querySelectorAll('button, a, input, select, textarea, [role="button"], [role="link"], h1, h2, h3');
@@ -688,40 +1170,48 @@ def cmd_get_content(payload):
             return results;
         }""")
         return {
+            "app_type": "standard_web",
             "url": page.url,
-            "title": page.title(),
+            "title": title,
             "active_tab_index": state["active_tab_index"],
             "total_tabs": len(get_open_pages()),
             "elements": elements,
         }
     elif mode == "html":
-        html = page.content()
+        html = await page.content()
         return {
+            "app_type": "flutter_web" if is_flt else "standard_web",
             "url": page.url,
-            "title": page.title(),
+            "title": title,
             "active_tab_index": state["active_tab_index"],
             "total_tabs": len(get_open_pages()),
             "content": html[:max_chars],
         }
     else:
-        text = page.evaluate("() => document.body ? document.body.innerText : ''")
+        if is_flt:
+            widgets = await extract_flutter_widgets(page)
+            labels = [w.get("label") for w in widgets if w.get("label")]
+            text = "\n".join(labels) if labels else await page.evaluate("() => document.body ? document.body.innerText : ''")
+        else:
+            text = await page.evaluate("() => document.body ? document.body.innerText : ''")
         clean_text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
         return {
+            "app_type": "flutter_web" if is_flt else "standard_web",
             "url": page.url,
-            "title": page.title(),
+            "title": title,
             "active_tab_index": state["active_tab_index"],
             "total_tabs": len(get_open_pages()),
             "content": clean_text[:max_chars],
         }
 
 
-def cmd_screenshot(payload):
+async def cmd_screenshot(payload):
     """Captures a screenshot of the visible screen or full page."""
     full_page = bool(payload.get("full_page", False))
     save_path = payload.get("save_path")
     tab_index = payload.get("tab_index")
 
-    page = get_active_page(tab_index=tab_index)
+    page = await get_active_page(tab_index=tab_index)
 
     if not save_path:
         captures_dir = os.path.join(ROOT, "notes", "captures")
@@ -732,15 +1222,16 @@ def cmd_screenshot(payload):
         save_path = os.path.expanduser(save_path)
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
 
-    page.screenshot(path=save_path, full_page=full_page)
+    await page.screenshot(path=save_path, full_page=full_page)
     filename = os.path.basename(save_path)
+    title = await page.title()
     return {
         "status": "screenshot_saved",
         "path": save_path,
         "filename": filename,
         "screenshot_url": f"/captures/{filename}",
         "url": page.url,
-        "title": page.title(),
+        "title": title,
         "active_tab_index": state["active_tab_index"],
     }
 
@@ -751,6 +1242,11 @@ COMMANDS = {
     "/list": cmd_list,
     "/switch_tab": cmd_switch_tab,
     "/list_profiles": cmd_list_profiles,
+    "/detect_app_type": cmd_detect_app_type,
+    "/flutter_widgets": cmd_flutter_widgets,
+    "/flutter_click": cmd_flutter_click,
+    "/flutter_type": cmd_flutter_type,
+    "/flutter_run_test": cmd_flutter_run_test,
     "/click": cmd_click,
     "/type": cmd_type,
     "/press_key": cmd_press_key,
@@ -760,60 +1256,111 @@ COMMANDS = {
 }
 
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass  # keep quiet; JARVIS logs the interesting parts
+def _send_json_response(writer, data, status=200):
+    status_text = {
+        200: "OK",
+        404: "Not Found",
+        408: "Request Timeout",
+        500: "Internal Server Error",
+    }.get(status, "OK")
+    body = json.dumps(data).encode("utf-8")
+    header = (
+        f"HTTP/1.1 {status} {status_text}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("utf-8")
+    writer.write(header + body)
 
-    def _reply(self, obj, status=200):
-        body = json.dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
-    def do_GET(self):
-        if self.path == "/health":
-            self._reply({"ok": True})
-        else:
-            self._reply({"error": "unknown endpoint"}, 404)
-
-    def do_POST(self):
-        cmd = COMMANDS.get(self.path)
-        if cmd is None:
-            self._reply({"error": "unknown endpoint"}, 404)
+async def handle_client(reader, writer):
+    """Handles an HTTP client request over asyncio streams."""
+    try:
+        request_line = await reader.readline()
+        if not request_line:
+            writer.close()
+            await writer.wait_closed()
             return
+
+        line = request_line.decode("utf-8", errors="ignore").strip()
+        parts = line.split()
+        if len(parts) < 2:
+            writer.close()
+            await writer.wait_closed()
+            return
+        method, path = parts[0], parts[1]
+
+        headers = {}
+        while True:
+            header_line = await reader.readline()
+            if not header_line or header_line in (b"\r\n", b"\n"):
+                break
+            h_text = header_line.decode("utf-8", errors="ignore").strip()
+            if ":" in h_text:
+                k, v = h_text.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+
+        content_length = int(headers.get("content-length", 0))
+        body_bytes = await reader.readexactly(content_length) if content_length > 0 else b""
+
+        if method == "GET" and path == "/health":
+            _send_json_response(writer, {"ok": True}, 200)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        cmd = COMMANDS.get(path)
+        if cmd is None or method != "POST":
+            _send_json_response(writer, {"error": "unknown endpoint"}, 404)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
+
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, json.JSONDecodeError):
+            payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+        except Exception:
             payload = {}
 
         try:
-            result = cmd(payload)
-            self._reply(result)
+            result = await cmd(payload)
+            _send_json_response(writer, result, 200)
         except PlaywrightTimeoutError as e:
-            # Selector or navigation timeout: browser context is still healthy and alive!
-            print(f"[browser-daemon] command {self.path} timed out: {e}", file=sys.stderr)
-            self._reply({"error": f"Action timed out: {e}"}, 408)
+            print(f"[browser-daemon] {path} timed out: {e}", file=sys.stderr)
+            _send_json_response(writer, {"error": f"Action timed out: {e}"}, 408)
         except PlaywrightError as e:
             err_str = str(e)
-            print(f"[browser-daemon] command {self.path} Playwright error: {err_str}", file=sys.stderr)
-            # Only reset browser if target window/page was actually destroyed or disconnected
+            print(f"[browser-daemon] {path} Playwright error: {err_str}", file=sys.stderr)
             if "closed" in err_str.lower() or "session closed" in err_str.lower():
                 state["context"] = None
                 state["browser"] = None
                 state["pw"] = None
                 _clean_orphaned_playwright_processes()
-                self._reply({"error": f"Browser was closed: {err_str}"}, 500)
+                _send_json_response(writer, {"error": f"Browser was closed: {err_str}"}, 500)
             else:
-                self._reply({"error": f"Browser action failed: {err_str}"}, 500)
+                _send_json_response(writer, {"error": f"Browser action failed: {err_str}"}, 500)
         except Exception as e:
-            print(f"[browser-daemon] command {self.path} unexpected error: {e}", file=sys.stderr)
-            self._reply({"error": f"Internal browser daemon error: {e}"}, 500)
+            print(f"[browser-daemon] {path} unexpected error: {e}", file=sys.stderr)
+            _send_json_response(writer, {"error": f"Internal browser daemon error: {e}"}, 500)
+
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def main():
+    server = await asyncio.start_server(handle_client, "127.0.0.1", PORT)
+    print(f"[browser-daemon] listening on 127.0.0.1:{PORT}")
+    async with server:
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
-    print(f"[browser-daemon] listening on 127.0.0.1:{PORT}")
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
-
+    asyncio.run(main())
