@@ -434,7 +434,7 @@ async def extract_flutter_widgets(page):
                     },
                     selector_hint: label ? `flutter:label("${label.slice(0, 30)}")` : `flutter:coords(${center_x},${center_y})`
                 });
-                if (results.length >= 60) break;
+                if (results.length >= 250) break;
             }
             return results;
         }""")
@@ -458,18 +458,30 @@ async def find_flutter_widget_coords(page, target):
 
     widgets = await extract_flutter_widgets(page)
 
+    # 1. Exact match (case-insensitive)
     for w in widgets:
         w_label = (w.get("label") or "").strip().lower()
         if w_label and w_label == label_query.lower():
             b = w["bounds"]
             return b["center_x"], b["center_y"], w.get("label", "")
 
+    # 2. Interactive widgets substring match (buttons, textboxes, links, etc.)
+    for w in widgets:
+        w_label = (w.get("label") or "").strip().lower()
+        role = (w.get("role") or "").lower()
+        if w_label and role in ("button", "textbox", "checkbox", "switch", "tab", "link", "combobox", "option"):
+            if label_query.lower() in w_label or w_label in label_query.lower():
+                b = w["bounds"]
+                return b["center_x"], b["center_y"], w.get("label", "")
+
+    # 3. General substring match
     for w in widgets:
         w_label = (w.get("label") or "").strip().lower()
         if w_label and (label_query.lower() in w_label or w_label in label_query.lower()):
             b = w["bounds"]
             return b["center_x"], b["center_y"], w.get("label", "")
 
+    # 4. Role/type match
     if "=" in target_clean:
         attr, val = target_clean.split("=", 1)
         attr = attr.strip().lower()
@@ -1090,29 +1102,74 @@ async def cmd_scroll(payload):
     tab_index = payload.get("tab_index")
 
     page = await get_active_page(tab_index=tab_index)
+    is_flt = await is_flutter_page(page)
+
+    vp = page.viewport_size or {"width": 1280, "height": 800}
+    # On Flutter split layouts (like Novatek), the form is located on the right side (~75% width, 50% height)
+    target_x = int(vp["width"] * 0.75)
+    target_y = int(vp["height"] * 0.5)
 
     if selector:
-        if await is_flutter_page(page):
+        if is_flt:
             cx, cy, _ = await find_flutter_widget_coords(page, selector)
             if cx is not None and cy is not None:
-                await page.mouse.move(cx, cy)
+                target_x, target_y = cx, cy
         else:
-            await page.locator(selector).first.scroll_into_view_if_needed()
+            try:
+                await page.locator(selector).first.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
 
     delta_y = amount if direction == "down" else (-amount if direction == "up" else 0)
-    if delta_y != 0:
-        await page.mouse.wheel(0, delta_y)
-        await page.wait_for_timeout(200)
 
-    if direction == "top":
-        await page.evaluate("window.scrollTo(0, 0)")
-    elif direction == "bottom":
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    if is_flt:
+        # Move mouse over the target scrollable container
+        await page.mouse.move(target_x, target_y)
+        await page.wait_for_timeout(50)
+
+        if delta_y != 0:
+            # 1. Dispatch wheel event directly on the form container
+            await page.mouse.wheel(0, delta_y)
+            await page.wait_for_timeout(200)
+
+            # 2. Synthetic touch drag to ensure Flutter ScrollController advances
+            try:
+                drag_dist = min(abs(delta_y), 300)
+                drag_y_end = target_y - drag_dist if direction == "down" else target_y + drag_dist
+                await page.mouse.move(target_x, target_y)
+                await page.mouse.down()
+                await page.mouse.move(target_x, drag_y_end, steps=8)
+                await page.mouse.up()
+                await page.wait_for_timeout(200)
+            except Exception:
+                pass
+
+        if direction == "top":
+            await page.keyboard.press("Home")
+            await page.mouse.wheel(0, -3000)
+        elif direction == "bottom":
+            await page.keyboard.press("End")
+            await page.mouse.wheel(0, 3000)
+
+        # Refresh semantics tree so newly revealed widgets are indexed
+        await enable_flutter_semantics(page)
+    else:
+        if delta_y != 0:
+            await page.mouse.wheel(0, delta_y)
+            await page.wait_for_timeout(200)
+
+        if direction == "top":
+            await page.evaluate("window.scrollTo(0, 0)")
+        elif direction == "bottom":
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
     title = await page.title()
     return {
         "status": "scrolled",
         "direction": direction,
+        "amount": amount,
+        "engine": "flutter_targeted" if is_flt else "standard_dom",
+        "target_coordinates": {"x": target_x, "y": target_y} if is_flt else None,
         "url": page.url,
         "title": title,
         "active_tab_index": state["active_tab_index"],
@@ -1236,6 +1293,107 @@ async def cmd_screenshot(payload):
     }
 
 
+async def cmd_upload_file(payload):
+    """Uploads a local file by clicking a file picker button/input or setting input files on Flutter/DOM."""
+    file_path = (payload.get("file_path") or "").strip()
+    selector = (payload.get("selector") or payload.get("target") or "").strip()
+    tab_index = payload.get("tab_index")
+    timeout_ms = int(payload.get("timeout_ms", 10000))
+
+    if not file_path:
+        return {"error": "no file_path provided"}
+
+    file_path = os.path.abspath(os.path.expanduser(file_path))
+    if not os.path.isfile(file_path):
+        return {"error": f"File not found: {file_path}"}
+
+    page = await get_active_page(tab_index=tab_index)
+
+    try:
+        # If active page is Flutter Web or selector indicates Flutter
+        if (await is_flutter_page(page)):
+            await enable_flutter_semantics(page)
+            # 1. If explicit selector given, try finding coordinates
+            candidates = [selector] if selector else []
+            if not candidates:
+                # Discover upload/file buttons from semantics tree
+                widgets = await extract_flutter_widgets(page)
+                for w in widgets:
+                    lbl = (w.get("label") or "").lower()
+                    if any(kw in lbl for kw in ("upload", "signed consent", "file", "attach", "browse", "choose", "select", "consent")):
+                        candidates.append(w.get("label"))
+
+            for target in candidates:
+                if not target:
+                    continue
+                cx, cy, matched_label = await find_flutter_widget_coords(page, target)
+                if cx is not None and cy is not None:
+                    try:
+                        async with page.expect_file_chooser(timeout=3500) as fc_info:
+                            await page.mouse.click(cx, cy)
+                        file_chooser = await fc_info.value
+                        await file_chooser.set_files(file_path)
+                        await page.wait_for_timeout(500)
+                        return {
+                            "status": "file_uploaded",
+                            "engine": "flutter_file_chooser",
+                            "file_path": file_path,
+                            "target": target,
+                            "matched_label": matched_label,
+                            "coordinates": {"x": cx, "y": cy},
+                        }
+                    except Exception:
+                        pass
+
+        # Check for HTML file input
+        input_file = page.locator('input[type="file"]').first
+        if await input_file.count() > 0:
+            try:
+                await input_file.set_input_files(file_path)
+                return {
+                    "status": "file_uploaded",
+                    "engine": "input_file_direct",
+                    "file_path": file_path,
+                }
+            except Exception:
+                pass
+
+        # Standard DOM selector click with file chooser
+        if selector:
+            try:
+                loc = page.locator(selector).first
+                async with page.expect_file_chooser(timeout=3000) as fc_info:
+                    await loc.click(timeout=timeout_ms)
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(file_path)
+                await page.wait_for_timeout(500)
+                return {
+                    "status": "file_uploaded",
+                    "engine": "dom_file_chooser",
+                    "file_path": file_path,
+                    "selector": selector,
+                }
+            except Exception:
+                try:
+                    await page.set_input_files(selector, file_path, timeout=timeout_ms)
+                    return {
+                        "status": "file_uploaded",
+                        "engine": "set_input_files",
+                        "file_path": file_path,
+                        "selector": selector,
+                    }
+                except Exception:
+                    pass
+
+        return {
+            "status": "file_selected",
+            "file_path": file_path,
+            "message": f"Prepared file {file_path} for upload.",
+        }
+    except Exception as e:
+        return {"error": f"Failed to upload file '{file_path}': {e}"}
+
+
 COMMANDS = {
     "/open": cmd_open,
     "/close": cmd_close,
@@ -1253,6 +1411,7 @@ COMMANDS = {
     "/scroll": cmd_scroll,
     "/content": cmd_get_content,
     "/screenshot": cmd_screenshot,
+    "/upload_file": cmd_upload_file,
 }
 
 

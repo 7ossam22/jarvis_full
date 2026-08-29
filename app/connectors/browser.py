@@ -400,6 +400,31 @@ def get_browser_tools():
             },
         },
         {
+            "name": "browser_upload_file",
+            "description": (
+                "Upload a local file into a file upload field/picker on the active browser page. "
+                "Works with Flutter Web file pickers, file chooser dialogs, and HTML file inputs."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the local file to upload (e.g. '/path/to/Informed_Consent Template.pdf').",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "Optional selector or Flutter label of the upload button/field to click.",
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to upload on.",
+                    },
+                },
+                "required": ["file_path"],
+            },
+        },
+        {
             "name": "system_open",
             "description": (
                 "Open a local file, folder, or application on the user's machine via "
@@ -568,6 +593,12 @@ def execute_browser_tool(cfg, tool_name, tool_input):
             return _daemon_request("/screenshot", {
                 "full_page": bool(tool_input.get("full_page", False)),
                 "save_path": tool_input.get("save_path", ""),
+                "tab_index": tool_input.get("tab_index"),
+            })
+        elif tool_name == "browser_upload_file":
+            return _daemon_request("/upload_file", {
+                "file_path": tool_input.get("file_path", ""),
+                "selector": tool_input.get("selector", ""),
                 "tab_index": tool_input.get("tab_index"),
             })
         else:
