@@ -108,19 +108,27 @@ def call_anthropic(cfg, system_prompt, messages):
 CONNECTOR_HINTS = (
     "discord", "email", "gmail", "mail", "inbox", "send", "post",
     "share", "message", "dm", "channel",
-    "open", "close", "browser", "tab", "website", "launch",
+    "open", "close", "browser", "tab", "tabs", "website", "launch", "chrome",
+    "profile", "profiles", "switch", "click", "type", "scroll", "screenshot",
+    "jira", "ticket", "issue", "volume", "sound", "stats", "app",
 )
 
 
 def _decide_connector_action(cfg, messages):
     """One small `claude -p` call that decides whether the latest user turn
-    needs a connector tool (Gmail/Discord) and with what arguments, given the
+    needs a connector tool (Gmail/Discord/Browser/System/Jira) and with what arguments, given the
     whole recent conversation — replaces brittle keyword parsing of just the
     last sentence. Returns {"tool": name, "input": {...}} or None."""
     transcript = "\n\n".join(
         f"{m['role'].upper()}: {m['content']}" for m in messages[-6:]
     )
-    tool_specs = get_gmail_tools() + get_discord_tools() + get_browser_tools()
+    tool_specs = (
+        get_gmail_tools()
+        + get_discord_tools()
+        + get_browser_tools()
+        + get_system_tools()
+        + get_jira_tools()
+    )
     tools_desc = json.dumps(
         [{"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]}
          for t in tool_specs]
@@ -140,10 +148,8 @@ def _decide_connector_action(cfg, messages):
         "conversation, append the most relevant link to the message/body being sent.\n"
         "- For discord_send_message, channel_id may be a channel NAME like 'general' — it is "
         "resolved automatically. Default to 'general' when the user names no channel.\n"
-        "- browser_open_url / browser_close are for a real on-screen browser window: use them "
-        "when the user says to OPEN a website/video/page as a window, or to close what was "
-        "opened. Do NOT use them when the user says 'show me X' — showing happens inside the "
-        "assistant's own interface, so that is {\"tool\": \"none\"}.\n"
+        "- browser_open_url, browser_list_tabs, browser_switch_tab, browser_close are for a real on-screen browser window: "
+        "use them when the user asks to open a website, check open tabs, switch tabs, or close tabs/browser.\n"
     )
     try:
         res = subprocess.run(
@@ -175,6 +181,10 @@ def call_claude_cli(cfg, system_prompt, messages):
                 result = execute_discord_tool(cfg, tool_name, tool_input)
             elif tool_name.startswith("browser_") or tool_name == "system_open":
                 result = execute_browser_tool(cfg, tool_name, tool_input)
+            elif tool_name.startswith("system_"):
+                result = execute_system_tool(cfg, tool_name, tool_input)
+            elif tool_name.startswith("jira_"):
+                result = execute_jira_tool(cfg, tool_name, tool_input)
             else:
                 result = None
             if result is not None:

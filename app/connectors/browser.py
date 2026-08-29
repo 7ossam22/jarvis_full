@@ -1,15 +1,17 @@
 """app/connectors/browser.py — system UI and browser control tools (Connector layer).
 
 Lets JARVIS control and interact with the user's on-screen browser:
-- browser_open_url: Opens a visible Chromium window/tab on the user's screen.
+- browser_open_url: Opens or navigates a visible Chromium/Chrome window/tab on the user's screen.
+- browser_list_profiles: Lists discovered Chrome profiles on the host machine.
+- browser_list_tabs: Lists open browser tabs with their indices, titles, URLs, and active status.
+- browser_switch_tab: Switches active view to a specific open tab.
+- browser_close: Closes the active tab, a specific tab index, or the entire browser.
 - browser_click: Clicks any button, link, or element using CSS, text, or ARIA selectors.
 - browser_type: Types or fills text into search boxes, forms, and textareas.
 - browser_press_key: Presses keyboard keys like Enter, Escape, Tab, Arrow keys.
 - browser_scroll: Scrolls the active page up, down, or to a specific element.
 - browser_get_content: Reads page text or discovers clickable elements & selectors.
 - browser_screenshot: Captures a PNG screenshot of the visible screen/page.
-- browser_close: Closes current tab or whole browser.
-- browser_list_tabs: Lists open browser tabs.
 - system_open: Opens files, folders, or desktop app URLs with xdg-open.
 
 The JARVIS server itself stays standard-library only: Playwright lives in
@@ -36,21 +38,79 @@ def get_browser_tools():
         {
             "name": "browser_open_url",
             "description": (
-                "Open a URL in a real, visible browser window on the user's screen "
-                "(not an embedded viewer). Use when the user asks to open a website, "
-                "video, or page as an actual window they can interact with. Navigates "
-                "the current tab by default; set new_tab to true to keep the current page."
+                "Open a URL or search page in a real, visible browser window on the user's screen. "
+                "By default, navigates inside the active tab/window (reusing it). "
+                "Set new_tab to true ONLY when the user explicitly requests opening in a separate/new tab. "
+                "Can specify a persistent user Chrome profile (e.g. 'Hossam', 'Doxx', 'Habiba', 'Elkenany')."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "The URL to open (e.g. 'https://google.com')."},
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to open (e.g. 'https://google.com', 'https://youtube.com'). Defaults to Google.",
+                    },
                     "new_tab": {
                         "type": "boolean",
-                        "description": "Open in a fresh tab instead of reusing the current one (default false).",
+                        "description": "Open in a fresh tab instead of navigating the current active one (default false).",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": "Optional Chrome profile name or ID (e.g. 'Hossam', 'Doxx', 'Habiba', 'Elkenany', 'default').",
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional specific tab index to navigate in.",
                     },
                 },
-                "required": ["url"],
+            },
+        },
+        {
+            "name": "browser_list_profiles",
+            "description": "List all discovered Google Chrome profiles on this machine (e.g. Hossam, Doxx, Habiba, Elkenany) with their login emails.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "browser_list_tabs",
+            "description": "List all tabs currently open in JARVIS's on-screen browser window, showing their index, title, URL, and which one is active.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "browser_switch_tab",
+            "description": "Switch the active browser tab to a specific tab index or by matching a title/URL query.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "0-based index of the tab to switch to (from browser_list_tabs).",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Title or URL substring to search for and activate (e.g. 'youtube', 'github').",
+                    },
+                },
+            },
+        },
+        {
+            "name": "browser_close",
+            "description": (
+                "Close what JARVIS opened on screen: the active browser tab, a specific tab index, "
+                "or all tabs and the entire browser window."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["tab", "all", "others"],
+                        "description": "'tab' closes the active tab; 'all' closes all tabs and the whole browser window; 'others' closes all tabs except the active one.",
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional specific 0-based tab index to close.",
+                    },
+                },
             },
         },
         {
@@ -70,6 +130,10 @@ def get_browser_tools():
                     "double_click": {
                         "type": "boolean",
                         "description": "Whether to perform a double-click (default false).",
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to click on (defaults to active tab).",
                     },
                 },
                 "required": ["selector"],
@@ -100,6 +164,10 @@ def get_browser_tools():
                         "type": "boolean",
                         "description": "Whether to clear existing text before typing (default true).",
                     },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to type on (defaults to active tab).",
+                    },
                 },
                 "required": ["selector", "text"],
             },
@@ -119,6 +187,10 @@ def get_browser_tools():
                     "selector": {
                         "type": "string",
                         "description": "Optional element selector to focus before pressing the key.",
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to press key on.",
                     },
                 },
                 "required": ["key"],
@@ -145,6 +217,10 @@ def get_browser_tools():
                         "type": "string",
                         "description": "Optional selector of a specific element to scroll into view.",
                     },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to scroll on.",
+                    },
                 },
             },
         },
@@ -166,6 +242,10 @@ def get_browser_tools():
                         "type": "integer",
                         "description": "Maximum characters of content to return (default 4000).",
                     },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to read content from.",
+                    },
                 },
             },
         },
@@ -183,30 +263,12 @@ def get_browser_tools():
                         "type": "string",
                         "description": "Optional custom file path to save the PNG screenshot.",
                     },
-                },
-            },
-        },
-        {
-            "name": "browser_close",
-            "description": (
-                "Close what JARVIS opened on screen: the most recent browser tab, "
-                "or the whole browser window."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "scope": {
-                        "type": "string",
-                        "enum": ["tab", "all"],
-                        "description": "'tab' closes the latest tab (default); 'all' closes the whole browser.",
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to screenshot.",
                     },
                 },
             },
-        },
-        {
-            "name": "browser_list_tabs",
-            "description": "List the tabs currently open in JARVIS's on-screen browser window.",
-            "input_schema": {"type": "object", "properties": {}},
         },
         {
             "name": "system_open",
@@ -292,16 +354,29 @@ def execute_browser_tool(cfg, tool_name, tool_input):
         if tool_name == "browser_open_url":
             return _daemon_request("/open", {
                 "url": tool_input.get("url", ""),
-                "new_tab": bool(tool_input.get("new_tab")),
+                "new_tab": bool(tool_input.get("new_tab", False)),
+                "profile": tool_input.get("profile"),
+                "tab_index": tool_input.get("tab_index"),
             })
-        elif tool_name == "browser_close":
-            return _daemon_request("/close", {"scope": tool_input.get("scope", "tab")})
+        elif tool_name == "browser_list_profiles":
+            return _daemon_request("/list_profiles")
         elif tool_name == "browser_list_tabs":
             return _daemon_request("/list")
+        elif tool_name == "browser_switch_tab":
+            return _daemon_request("/switch_tab", {
+                "tab_index": tool_input.get("tab_index"),
+                "query": tool_input.get("query", ""),
+            })
+        elif tool_name == "browser_close":
+            return _daemon_request("/close", {
+                "scope": tool_input.get("scope", "tab"),
+                "tab_index": tool_input.get("tab_index"),
+            })
         elif tool_name == "browser_click":
             return _daemon_request("/click", {
                 "selector": tool_input.get("selector", ""),
                 "double_click": bool(tool_input.get("double_click", False)),
+                "tab_index": tool_input.get("tab_index"),
             })
         elif tool_name == "browser_type":
             return _daemon_request("/type", {
@@ -309,27 +384,32 @@ def execute_browser_tool(cfg, tool_name, tool_input):
                 "text": tool_input.get("text", ""),
                 "press_enter": bool(tool_input.get("press_enter", False)),
                 "clear": bool(tool_input.get("clear", True)),
+                "tab_index": tool_input.get("tab_index"),
             })
         elif tool_name == "browser_press_key":
             return _daemon_request("/press_key", {
                 "key": tool_input.get("key", "Enter"),
                 "selector": tool_input.get("selector", ""),
+                "tab_index": tool_input.get("tab_index"),
             })
         elif tool_name == "browser_scroll":
             return _daemon_request("/scroll", {
                 "direction": tool_input.get("direction", "down"),
                 "amount": tool_input.get("amount", 500),
                 "selector": tool_input.get("selector", ""),
+                "tab_index": tool_input.get("tab_index"),
             })
         elif tool_name == "browser_get_content":
             return _daemon_request("/content", {
                 "mode": tool_input.get("mode", "text"),
                 "max_chars": tool_input.get("max_chars", 4000),
+                "tab_index": tool_input.get("tab_index"),
             })
         elif tool_name == "browser_screenshot":
             return _daemon_request("/screenshot", {
                 "full_page": bool(tool_input.get("full_page", False)),
                 "save_path": tool_input.get("save_path", ""),
+                "tab_index": tool_input.get("tab_index"),
             })
         else:
             return {"error": f"Unknown browser tool: {tool_name}"}
@@ -344,4 +424,5 @@ def execute_browser_tool(cfg, tool_name, tool_input):
     except (urllib.error.URLError, TimeoutError, OSError, FileNotFoundError) as e:
         print(f"[jarvis] browser tool {tool_name} failed: {e}", file=sys.stderr)
         return {"error": f"browser control failed: {e}"}
+
 
