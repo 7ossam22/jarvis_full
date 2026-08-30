@@ -7,7 +7,10 @@
 // as a background job and we poll for the answer instead of holding one
 // request open the whole time.
 const CHAT_POLL_INTERVAL_MS = 1500;
-const CHAT_POLL_DEADLINE_MS = 30 * 60 * 1000;
+// Matches the server's _CHAT_JOB_MAX_AGE — a full "complete visit" run over
+// many long forms can legitimately take this long, and giving up client-side
+// before the server does left the workflow finishing invisibly.
+const CHAT_POLL_DEADLINE_MS = 60 * 60 * 1000;
 
 export async function chatRequest(message, sessionId) {
   const res = await fetch("/chat", {

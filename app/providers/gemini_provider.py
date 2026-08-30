@@ -11,6 +11,9 @@ fallback: unlike Anthropic (which can fall back to a locally logged-in
 Gemini in this app, so this provider is simply skipped when unconfigured.
 """
 import json
+import sys
+import time
+import urllib.error
 import urllib.request
 
 from .llm import LLMProvider
@@ -84,14 +87,35 @@ def call_gemini(cfg, system_prompt, messages):
 
     url = f"{API_BASE}/{model}:generateContent?key={api_key}"
 
-    for turn in range(80):
+    # Long automation workflows (fill form / complete visit) chain hundreds of
+    # tool rounds; a stall here used to freeze the whole workflow until the
+    # user prodded it again. Two past causes, both fixed at this layer:
+    # a single slow/rate-limited Gemini response killed the run (now retried
+    # with backoff below), and the old 80-round cap silently returned ""
+    # mid-visit (now a generous cap that reports instead of going quiet).
+    for turn in range(500):
         payload = json.dumps(payload_dict).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=payload, method="POST",
-            headers={"content-type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        body = None
+        for attempt, backoff in enumerate((2, 5, 10, 20), start=1):
+            req = urllib.request.Request(
+                url, data=payload, method="POST",
+                headers={"content-type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                # Only transient statuses are worth retrying; a 400/403 will
+                # fail identically every time, so surface it immediately.
+                if e.code not in (429, 500, 502, 503, 504):
+                    raise
+                print(f"[jarvis] Gemini HTTP {e.code} (attempt {attempt}); retrying in {backoff}s…", file=sys.stderr)
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                print(f"[jarvis] Gemini request failed ({e}) (attempt {attempt}); retrying in {backoff}s…", file=sys.stderr)
+            time.sleep(backoff)
+        if body is None:
+            raise TimeoutError("Gemini API unreachable after 4 retry attempts — giving up on this turn.")
 
         candidates = body.get("candidates") or []
         if not candidates:
@@ -128,7 +152,10 @@ def call_gemini(cfg, system_prompt, messages):
 
         return "".join(p.get("text", "") for p in parts)
 
-    return ""
+    # Round budget exhausted mid-workflow — say so instead of returning ""
+    # (an empty reply looks to the user like the assistant simply froze).
+    return ("I had to pause, sir — this task used up my action budget of 500 tool "
+            "rounds in one turn. Say \"continue\" and I will pick up exactly where I left off.")
 
 
 class GeminiProvider(LLMProvider):

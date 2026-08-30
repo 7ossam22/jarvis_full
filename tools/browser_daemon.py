@@ -1215,41 +1215,42 @@ async def cmd_scroll(payload):
 
     delta_y = amount if direction == "down" else (-amount if direction == "up" else 0)
 
+    async def smooth_wheel(total_delta):
+        # One big wheel delta makes the page jump/teleport (and on Flutter the
+        # old synthetic touch drag added fling momentum on top, overshooting
+        # past questions). Feed the same distance as a stream of small wheel
+        # ticks instead — the scroll animates smoothly and lands exactly on
+        # `total_delta`, so nothing gets skipped past.
+        step = 60 if total_delta > 0 else -60
+        remaining = total_delta
+        while abs(remaining) > 0:
+            tick = step if abs(remaining) >= abs(step) else remaining
+            await page.mouse.wheel(0, tick)
+            remaining -= tick
+            await page.wait_for_timeout(30)
+        # Let any scroll animation settle before the caller re-reads widgets.
+        await page.wait_for_timeout(250)
+
     if is_flt:
         # Move mouse over the target scrollable container
         await page.mouse.move(target_x, target_y)
         await page.wait_for_timeout(50)
 
         if delta_y != 0:
-            # 1. Dispatch wheel event directly on the form container
-            await page.mouse.wheel(0, delta_y)
-            await page.wait_for_timeout(200)
-
-            # 2. Synthetic touch drag to ensure Flutter ScrollController advances
-            try:
-                drag_dist = min(abs(delta_y), 300)
-                drag_y_end = target_y - drag_dist if direction == "down" else target_y + drag_dist
-                await page.mouse.move(target_x, target_y)
-                await page.mouse.down()
-                await page.mouse.move(target_x, drag_y_end, steps=8)
-                await page.mouse.up()
-                await page.wait_for_timeout(200)
-            except Exception:
-                pass
+            await smooth_wheel(delta_y)
 
         if direction == "top":
             await page.keyboard.press("Home")
-            await page.mouse.wheel(0, -3000)
+            await smooth_wheel(-3000)
         elif direction == "bottom":
             await page.keyboard.press("End")
-            await page.mouse.wheel(0, 3000)
+            await smooth_wheel(3000)
 
         # Refresh semantics tree so newly revealed widgets are indexed
         await enable_flutter_semantics(page)
     else:
         if delta_y != 0:
-            await page.mouse.wheel(0, delta_y)
-            await page.wait_for_timeout(200)
+            await smooth_wheel(delta_y)
 
         if direction == "top":
             await page.evaluate("window.scrollTo(0, 0)")
