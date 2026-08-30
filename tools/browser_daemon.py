@@ -1509,6 +1509,335 @@ async def cmd_upload_file(payload):
         state["expecting_file_chooser"] = False
 
 
+# ============================================================================
+# Novatek Visit-Mode Form Autopilot
+# ============================================================================
+# Fills and submits forms with zero LLM involvement — the whole
+# answer/scroll/submit loop runs in-process at machine speed. Scope is
+# deliberately hard-limited to the VISIT MODE screen (the one titled
+# "Visit Mode" with the sidebar Forms list and the N/M progress counter):
+# both commands refuse to act anywhere else.
+
+# Question markers: "1.", "4-1." (sub-questions).
+_AUTOPILOT_MARKER_RE = re.compile(r"^\d+(-\d+)?\.$")
+_AUTOPILOT_SIDEBAR_RESERVED = (
+    "visit note", "discard", "early termination", "hold visit", "end visit",
+)
+_AUTOPILOT_NUMBER_HINTS = (
+    "ranges", "number", "score", "count", "level", "dose", "age", "weight",
+    "height", "temperature", "pulse", "systolic", "diastolic", "rate", "bpm",
+    "mmhg", "(0-", "scale", "duration", "result", "quantity", "spo",
+    "pressure", "how many", "how much",
+)
+
+
+def _autopilot_visit_ok(widgets):
+    """True only on the visit-mode screen — the autopilot's hard scope guard."""
+    return any((w.get("label") or "").strip() == "Visit Mode" for w in widgets)
+
+
+def _autopilot_progress(widgets):
+    """The top-bar N/M forms-progress counter, e.g. '0/4'."""
+    for w in widgets:
+        if re.fullmatch(r"\d+\s*/\s*\d+", (w.get("label") or "").strip()):
+            return w["label"].replace(" ", "")
+    return None
+
+
+def _autopilot_panel(widgets, min_x):
+    """Widgets belonging to the question panel (right of the sidebar)."""
+    out = []
+    for w in widgets:
+        b = w.get("bounds") or {}
+        if (b.get("center_x") or 0) >= min_x and (b.get("center_y") or 0) > 100:
+            out.append(w)
+    return sorted(out, key=lambda w: (w["bounds"]["center_y"], w["bounds"]["center_x"]))
+
+
+def _autopilot_blocks(panel):
+    """Splits panel widgets into per-question blocks using the markers."""
+    markers = [w for w in panel if _AUTOPILOT_MARKER_RE.match((w.get("label") or "").strip())]
+    blocks = []
+    for i, m in enumerate(markers):
+        top = m["bounds"]["center_y"] - 25
+        bottom = markers[i + 1]["bounds"]["center_y"] - 25 if i + 1 < len(markers) else 10 ** 9
+        members = [w for w in panel if top <= w["bounds"]["center_y"] < bottom]
+        title = ""
+        for w in members:
+            if w is m:
+                continue
+            if abs(w["bounds"]["center_y"] - m["bounds"]["center_y"]) <= 12 and w.get("label"):
+                title = w["label"]
+                break
+        extras = " ".join(
+            w.get("label") or "" for w in members
+            if w.get("role") == "widget" and w.get("label") and w["label"] != title
+            and 12 < w["bounds"]["center_y"] - m["bounds"]["center_y"] <= 70)
+        blocks.append({
+            "key": f"{m['label']} {title}".strip(),
+            "marker_y": m["bounds"]["center_y"],
+            "title": title,
+            "hint": f"{title} {extras}".lower(),
+            "members": members,
+        })
+    return blocks
+
+
+async def _autopilot_click(page, w, settle=180):
+    b = w["bounds"]
+    await page.mouse.click(b["center_x"], b["center_y"])
+    await page.wait_for_timeout(settle)
+
+
+async def _autopilot_type(page, w, text):
+    await _autopilot_click(page, w, settle=120)
+    await page.keyboard.press("Control+A")
+    await page.keyboard.press("Backspace")
+    await page.keyboard.type(str(text), delay=8)
+    await page.wait_for_timeout(80)
+
+
+async def _autopilot_sign(page, w, username, password, report):
+    """Clicks a Sign button and completes the credentials dialog."""
+    await _autopilot_click(page, w, settle=700)
+    widgets = await extract_flutter_widgets(page)
+    dialog_present = any(x.get("role") == "dialog" for x in widgets)
+    boxes = [x for x in widgets if x.get("role") == "textbox"
+             and (x.get("label") or "").strip().lower() != "search..."]
+    boxes.sort(key=lambda x: x["bounds"]["center_y"])
+    if not dialog_present or not boxes:
+        report["unresolved"].append("signature dialog did not appear as expected")
+        return
+    await _autopilot_type(page, boxes[0], username)
+    if len(boxes) > 1:
+        await _autopilot_type(page, boxes[1], password)
+    widgets = await extract_flutter_widgets(page)
+    for x in widgets:
+        low = (x.get("label") or "").strip().lower()
+        if x.get("role") == "button" and low in ("confirm", "sign", "ok", "submit", "verify", "login"):
+            await _autopilot_click(page, x, settle=700)
+            return
+    report["unresolved"].append("signature dialog: no confirm button found")
+
+
+async def cmd_autofill_form(payload):
+    """Deterministically fills and submits the form currently open on the
+    Novatek VISIT MODE screen. Answers every question top-to-bottom with the
+    standard defaults (first option, 'test', 55, today's date, current time,
+    consent PDF, Admin signature), smooth-scrolls to reveal the rest, clicks
+    Submit, and reports what happened — including the before/after N/M
+    progress counter and anything it could not answer."""
+    text_value = payload.get("text_value") or "test"
+    number_value = str(payload.get("number_value") or "55")
+    file_path = payload.get("file_path") or "/home/proslayer/AndroidStudioProjects/jarvis_full/Informed_Consent Template.pdf"
+    username = payload.get("username") or "Admin"
+    password = payload.get("password") or "nursenurse123"
+    min_x = int(payload.get("panel_min_x", 330))
+    max_rounds = int(payload.get("max_rounds", 80))
+    tab_index = payload.get("tab_index")
+
+    page = await get_active_page(tab_index=tab_index)
+    if not await is_flutter_page(page):
+        return {"error": "autofill only works on the Novatek Flutter app"}
+
+    today = time.strftime("%-m/%-d/%Y")
+    now_hhmm = time.strftime("%H:%M")
+
+    report = {"answered": [], "unresolved": [], "rounds": 0,
+              "submitted": False, "progress_before": None, "progress_after": None}
+    done = set()
+    typed_retry = set()
+
+    widgets = await extract_flutter_widgets(page)
+    if not _autopilot_visit_ok(widgets):
+        return {"error": "Not on the Visit Mode screen — the autopilot is restricted to visit mode. "
+                         "Start the visit first."}
+    report["progress_before"] = _autopilot_progress(widgets)
+
+    stagnant = 0
+    for round_no in range(1, max_rounds + 1):
+        report["rounds"] = round_no
+        inner_h = await page.evaluate("() => window.innerHeight")
+        panel = _autopilot_panel(widgets, min_x)
+        blocks = _autopilot_blocks(panel)
+        acted = False
+
+        for blk in blocks:
+            if blk["key"] in done:
+                continue
+            # Widget rects are viewport-relative — anything below the fold
+            # can't be clicked yet; the post-round scroll will bring it up.
+            if blk["marker_y"] >= inner_h - 40:
+                continue
+            hint = blk["hint"]
+            below_title = [w for w in blk["members"]
+                           if w["bounds"]["center_y"] > blk["marker_y"] + 12
+                           and w["bounds"]["center_y"] < inner_h - 10]
+            actions_here = []
+
+            sign_btn = next((w for w in below_title if w.get("role") == "button"
+                             and (w.get("label") or "").strip().lower() == "sign"), None)
+            upload_hit = ("upload" in hint or "attach" in hint) or any(
+                any(k in (w.get("label") or "").lower() for k in ("upload", "attach", "browse", "choose file"))
+                for w in below_title if w.get("role") == "button")
+            boxes = [w for w in below_title if w.get("role") == "textbox" and not w.get("value")]
+            checkboxes = [w for w in below_title if w.get("role") in ("checkbox", "switch")
+                          and w.get("value") != "checked"]
+            # Buttons count as answer options ONLY in a block with no textbox —
+            # next to a textbox a button is a unit dropdown or calendar icon,
+            # and clicking it would open an overlay instead of answering.
+            options = [] if boxes else [
+                w for w in below_title if w.get("role") == "button" and w.get("label")
+                and (w.get("label") or "").strip().lower() not in ("sign", "submit")]
+
+            if sign_btn:
+                await _autopilot_sign(page, sign_btn, username, password, report)
+                actions_here.append("signature")
+            elif upload_hit:
+                res = await cmd_upload_file({"file_path": file_path, "tab_index": tab_index})
+                if res.get("status") == "file_uploaded":
+                    actions_here.append("upload")
+                else:
+                    report["unresolved"].append(f"{blk['key']}: upload failed ({res.get('error') or res.get('status')})")
+            elif boxes:
+                for box in boxes:
+                    if "date" in hint:
+                        value = today
+                    elif "time" in hint:
+                        value = now_hhmm
+                    elif any(h in hint for h in _AUTOPILOT_NUMBER_HINTS):
+                        value = number_value
+                    else:
+                        value = text_value
+                    await _autopilot_type(page, box, value)
+                    actions_here.append(f"typed '{value}'")
+            elif checkboxes:
+                await _autopilot_click(page, checkboxes[0])
+                actions_here.append("checked first box")
+            elif options:
+                if any(w.get("value") == "checked" for w in below_title):
+                    actions_here.append("already answered")
+                else:
+                    await _autopilot_click(page, options[0])
+                    actions_here.append(f"clicked '{(options[0].get('label') or '')[:40]}'")
+            else:
+                continue  # nothing actionable visible yet — likely revealed after scroll
+
+            if actions_here:
+                done.add(blk["key"])
+                report["answered"].append({"question": blk["key"][:80], "action": "; ".join(actions_here)})
+                acted = True
+
+        # Digit-only fields silently swallow 'test' — re-read once per acted
+        # round and retype stragglers with the number default.
+        if acted:
+            widgets = await extract_flutter_widgets(page)
+            for blk in _autopilot_blocks(_autopilot_panel(widgets, min_x)):
+                if blk["key"] not in done or blk["key"] in typed_retry:
+                    continue
+                for w in blk["members"]:
+                    if w.get("role") == "textbox" and not w.get("value") \
+                            and w["bounds"]["center_y"] > blk["marker_y"] + 12 \
+                            and w["bounds"]["center_y"] < inner_h - 10:
+                        typed_retry.add(blk["key"])
+                        await _autopilot_type(page, w, number_value)
+
+        panel = _autopilot_panel(widgets, min_x)
+        submit = next((w for w in panel if w.get("role") == "button"
+                       and (w.get("label") or "").strip().lower() == "submit"), None)
+        all_keys = {b["key"] for b in _autopilot_blocks(panel)}
+        if submit and all_keys.issubset(done):
+            if submit["bounds"]["center_y"] >= inner_h - 20:
+                await cmd_scroll({"direction": "down", "amount": 500, "tab_index": tab_index})
+                widgets = await extract_flutter_widgets(page)
+                continue
+            await _autopilot_click(page, submit, settle=1400)
+            report["submitted"] = True
+            widgets = await extract_flutter_widgets(page)
+            report["progress_after"] = _autopilot_progress(widgets)
+            break
+
+        if not acted:
+            stagnant += 1
+            if stagnant >= 3:
+                report["unresolved"].append("no progress after 3 scroll rounds — stopped before Submit")
+                break
+        else:
+            stagnant = 0
+
+        await cmd_scroll({"direction": "down", "amount": 500, "tab_index": tab_index})
+        widgets = await extract_flutter_widgets(page)
+
+    report["status"] = "autofill_done" if report["submitted"] else "autofill_incomplete"
+    report["widgets"] = _slim_widgets(widgets)
+    return report
+
+
+async def cmd_autofill_visit(payload):
+    """Fills and submits EVERY form of the visit-mode screen: walks the
+    sidebar Forms list top-to-bottom, runs the form autopilot on each, and
+    stops when the N/M progress counter is full (or no form advances it).
+    Never touches End Visit — reporting the final progress is the caller's
+    cue to end the visit."""
+    tab_index = payload.get("tab_index")
+    page = await get_active_page(tab_index=tab_index)
+    if not await is_flutter_page(page):
+        return {"error": "autofill only works on the Novatek Flutter app"}
+
+    widgets = await extract_flutter_widgets(page)
+    if not _autopilot_visit_ok(widgets):
+        return {"error": "Not on the Visit Mode screen — the autopilot is restricted to visit mode. "
+                         "Start the visit first."}
+
+    report = {"forms": [], "progress": _autopilot_progress(widgets)}
+
+    for _pass in range(int(payload.get("max_forms", 30))):
+        progress = _autopilot_progress(widgets)
+        if progress:
+            done_n, total_n = progress.split("/")
+            if done_n == total_n:
+                break
+
+        # Sidebar form buttons: left of the panel, between "Forms" and the
+        # reserved visit actions (visit note / discard / hold / end visit).
+        sidebar = [w for w in widgets if w.get("role") == "button"
+                   and (w["bounds"]["center_x"]) < 330
+                   and w.get("label")
+                   and not any(r in w["label"].lower() for r in _AUTOPILOT_SIDEBAR_RESERVED)
+                   and w["bounds"]["center_y"] > 250]
+        sidebar.sort(key=lambda w: w["bounds"]["center_y"])
+        if not sidebar:
+            report["forms"].append({"error": "no form buttons found in the sidebar"})
+            break
+
+        target = sidebar[min(len(report["forms"]), len(sidebar) - 1)] \
+            if len(report["forms"]) < len(sidebar) else sidebar[0]
+        await _autopilot_click(page, target, settle=900)
+
+        form_res = await cmd_autofill_form(dict(payload))
+        report["forms"].append({
+            "form": target.get("label"),
+            "status": form_res.get("status", form_res.get("error")),
+            "answered": len(form_res.get("answered", [])),
+            "unresolved": form_res.get("unresolved", []),
+            "progress_after": form_res.get("progress_after"),
+        })
+
+        widgets = await extract_flutter_widgets(page)
+        new_progress = _autopilot_progress(widgets)
+        if new_progress == progress and not form_res.get("submitted"):
+            report["forms"].append({"note": f"'{target.get('label')}' did not advance progress — stopping for review"})
+            break
+
+    widgets = await extract_flutter_widgets(page)
+    report["progress"] = _autopilot_progress(widgets)
+    report["all_forms_submitted"] = bool(
+        report["progress"] and len(set(report["progress"].split("/"))) == 1)
+    report["status"] = "visit_filled" if report["all_forms_submitted"] else "visit_incomplete"
+    report["widgets"] = _slim_widgets(widgets)
+    return report
+
+
 async def cmd_batch(payload):
     """Executes a sequence of actions in one HTTP request — the speed path for
     form filling. Each LLM round-trip costs 10-25s; before this command a
@@ -1567,6 +1896,8 @@ async def cmd_batch(payload):
 COMMANDS = {
     "/open": cmd_open,
     "/batch": cmd_batch,
+    "/autofill_form": cmd_autofill_form,
+    "/autofill_visit": cmd_autofill_visit,
     "/close": cmd_close,
     "/list": cmd_list,
     "/switch_tab": cmd_switch_tab,
