@@ -325,6 +325,41 @@ def get_browser_tools():
             },
         },
         {
+            "name": "browser_autofill_form",
+            "description": (
+                "AUTOPILOT (fastest path, VISIT MODE ONLY): deterministically fill AND submit the form "
+                "currently open on the Novatek Visit Mode screen in one call, with the standard defaults "
+                "(first option, text 'test', number 55, today's date, current time, consent PDF, Admin "
+                "signature). Handles the whole answer/scroll/submit loop internally at machine speed and "
+                "returns a report: questions answered, anything unresolved (finish those yourself with "
+                "browser_batch_actions), whether Submit was clicked, and the N/M forms-progress counter "
+                "before/after. Refuses to run on any screen other than Visit Mode."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tab_index": {"type": "integer", "description": "Optional tab index to act on."},
+                },
+            },
+        },
+        {
+            "name": "browser_autofill_visit",
+            "description": (
+                "AUTOPILOT (VISIT MODE ONLY): fill and submit EVERY form of the current Novatek Visit Mode "
+                "session in one call — walks the sidebar Forms list top-to-bottom, runs the form autopilot "
+                "on each, and stops when the N/M progress counter is full or a form fails to advance it. "
+                "Returns per-form results and the final progress (e.g. '4/4'). It NEVER clicks End Visit — "
+                "when the report shows all_forms_submitted true, ending the visit is your step. Refuses to "
+                "run on any screen other than Visit Mode."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tab_index": {"type": "integer", "description": "Optional tab index to act on."},
+                },
+            },
+        },
+        {
             "name": "browser_batch_actions",
             "description": (
                 "FAST PATH for form filling: execute MANY browser/Flutter actions sequentially in ONE call — "
@@ -627,6 +662,15 @@ def execute_browser_tool(cfg, tool_name, tool_input):
                 "selector": tool_input.get("selector", ""),
                 "tab_index": tool_input.get("tab_index"),
             })
+        elif tool_name == "browser_autofill_form":
+            # The autopilot loops the whole form internally — allow it minutes.
+            return _daemon_request("/autofill_form", {
+                "tab_index": tool_input.get("tab_index"),
+            }, timeout=420)
+        elif tool_name == "browser_autofill_visit":
+            return _daemon_request("/autofill_visit", {
+                "tab_index": tool_input.get("tab_index"),
+            }, timeout=580)
         elif tool_name == "browser_batch_actions":
             # A batch runs many sequential page actions — give it far longer
             # than the single-action timeout before declaring it dead.
