@@ -30,7 +30,7 @@ import time
 import urllib.error
 import urllib.request
 
-DAEMON_URL = "http://127.0.0.1:4701"
+DAEMON_URL = f"http://127.0.0.1:{os.environ.get('BROWSER_DAEMON_PORT', '4701')}"
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DAEMON_SCRIPT = os.path.join(ROOT, "tools", "browser_daemon.py")
 VENV_PYTHON = os.path.join(ROOT, ".venv-browser", "bin", "python")

@@ -11,7 +11,7 @@ import sys
 import urllib.error
 import uuid
 
-from . import history, persona, retrieval
+from . import formflow, history, persona, retrieval
 from .graph import build_graph, regenerate_graph
 from .images import extract_media_references, extract_image_references
 from .providers.llm import call_model
@@ -38,6 +38,27 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
     session_id = body.get("session_id") or str(uuid.uuid4())
     if not question:
         return {"error": "empty message"}, 400
+
+    # Novatek form submission is deterministic and NEVER goes through an AI
+    # provider: form/visit/takeover commands are dispatched straight to the
+    # local rule-engine autopilot and answered from its report.
+    routed = formflow.try_formflow(cfg, question)
+    if routed is not None:
+        max_turns = cfg.get("retrieval.max_history_turns", 6)
+        history.append_history(session_id, "user", question, max_turns)
+        history.append_history(session_id, "assistant", routed["answer"], max_turns)
+        return {
+            "answer": routed["answer"],
+            "nodes": [],
+            "session_id": session_id,
+            "image_urls": [],
+            "video_urls": [],
+            "show_url": None,
+            "jira_data": None,
+            "screenshot_url": None,
+            "formflow": routed["intent"],
+            "formflow_report": routed["report"],
+        }, 200
 
     graph = regenerate_graph(notes_dir, viewer_dir)
     nodes = graph["nodes"]

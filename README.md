@@ -188,7 +188,34 @@ viewer/                      frontend (View + Controller)
 
 notes/                        sample markdown notes (25 notes, Nova Roasters coffee co.)
 notes/captures/                notes JARVIS writes for you via "remember that…" (gitignored)
+
+app/formflow.py               deterministic pre-LLM router: Novatek form/visit/takeover
+                              commands never reach an AI provider — they dispatch straight
+                              to the local rule-engine autopilot
+tools/browser_daemon.py       Playwright daemon (port 4701) incl. the zero-AI form autopilot
+tools/novatek_autopilot.py    standalone CLI for the autopilot: status|open|form|visit|takeover
+tools/tests/                  offline test suite: rule-engine unit tests, router unit tests,
+                              and a headless end-to-end run against mock_novatek.html
+                              (run everything with tools/tests/run_all.sh)
 ```
+
+## Deterministic Novatek form submission (zero AI)
+
+Form submission is pure rule engine — first option / `test` / `55` / today's
+date / current time / consent PDF / `Admin` signature — executed locally by
+the browser daemon. Saying "fill the form", "complete the visit", or "take
+over the participant" to Akira is intercepted *before* any model call. The
+same engine runs standalone:
+
+```bash
+python3 tools/novatek_autopilot.py open              # navigate + login
+python3 tools/novatek_autopilot.py form              # fill+submit the open form
+python3 tools/novatek_autopilot.py visit             # every form of the visit
+python3 tools/novatek_autopilot.py takeover --visits 9
+tools/tests/run_all.sh                               # full offline test suite
+```
+
+Exit code 0 = verified complete; the `--json` flag prints the full report.
 
 ## Troubleshooting
 

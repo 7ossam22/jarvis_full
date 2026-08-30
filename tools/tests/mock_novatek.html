@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mock Novatek Visit Mode</title>
+<!-- Offline stand-in for the Novatek Flutter Web app, used by the
+     deterministic autopilot test suite. It reproduces exactly what the
+     browser daemon's widget extractor sees on the real app: role/aria-label
+     elements for the semantics tree, a fixed "Visit Mode" top bar with the
+     N/M progress counter, a fixed sidebar (x < 330) with reserved actions
+     and the Forms list, and a scrolling question panel (x >= 330) whose
+     blocks cover every question type the rule engine handles.
+     Query params: ?view=visit|profile  &forms=N (per visit)  &visits=N -->
+<style>
+  * { box-sizing: border-box; font-family: sans-serif; }
+  body { margin: 0; background: #f4f6f8; }
+  #topbar { position: fixed; top: 0; left: 0; right: 0; height: 64px;
+            background: #1e2a3a; color: #fff; z-index: 5;
+            display: flex; align-items: center; gap: 24px; padding: 0 16px; }
+  #topbar span { font-size: 18px; }
+  #sidebar { position: fixed; top: 64px; left: 0; bottom: 0; width: 300px;
+             background: #263445; color: #eee; z-index: 4; padding: 12px; }
+  #sidebar button { display: block; width: 240px; margin: 10px 0; padding: 10px;
+                    text-align: left; position: relative; }
+  #sidebar .check { position: absolute; right: 6px; top: 6px; width: 22px; height: 22px;
+                    background: #21c55d; color: #fff; border-radius: 50%;
+                    text-align: center; line-height: 22px; }
+  #formsList { margin-top: 60px; }
+  #panel { margin-left: 340px; padding: 120px 40px 60px 20px; max-width: 760px; }
+  .q { background: #fff; border: 1px solid #ddd; border-radius: 8px;
+       padding: 16px; margin-bottom: 28px; }
+  .qhead { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; }
+  .qhead .marker { font-weight: bold; }
+  .answers { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .answers input[type=text] { padding: 8px; width: 260px; }
+  .err { color: #c0392b; display: block; margin-top: 8px; }
+  .opt[aria-checked="true"] { background: #2e7dd1; color: #fff; }
+  #dialog { position: fixed; z-index: 20; top: 30%; left: 40%; width: 340px;
+            background: #fff; border: 2px solid #444; border-radius: 8px; padding: 20px; }
+  #unitmenu { position: absolute; background: #fff; border: 1px solid #999; z-index: 15; }
+  #unitmenu div { padding: 6px 16px; cursor: pointer; }
+  .hidden { display: none; }
+  #profile { margin-left: 340px; padding: 130px 40px; }
+</style>
+</head>
+<body>
+<script>window._flutter = {};</script>
+
+<div id="topbar">
+  <span aria-label="Visit Mode">Visit Mode</span>
+  <span id="progress" aria-label="0/0">0/0</span>
+</div>
+
+<div id="sidebar">
+  <button aria-label="Visit Note">Visit Note</button>
+  <button aria-label="Hold Visit">Hold Visit</button>
+  <button aria-label="Discard">Discard</button>
+  <button id="endVisitBtn" aria-label="End Visit">End Visit</button>
+  <div id="formsList"></div>
+</div>
+
+<div id="panel"></div>
+<div id="profile" class="hidden"></div>
+
+<div id="dialog" class="hidden" role="dialog" aria-label="Signature required">
+  <span aria-label="Sign with your credentials">Sign with your credentials</span><br><br>
+  <input type="text" id="sigUser" aria-label="Signature Username"><br><br>
+  <input type="text" id="sigPass" aria-label="Signature Password"><br><br>
+  <button id="sigConfirm" aria-label="Confirm">Confirm</button>
+</div>
+
+<input type="file" id="fileInput" style="display:none">
+
+<script>
+const params = new URLSearchParams(location.search);
+const NUM_VISITS = parseInt(params.get('visits') || '1', 10);
+const FORMS_PER_VISIT = parseInt(params.get('forms') || '2', 10);
+const START_VIEW = params.get('view') || 'visit';
+
+const VISIT_NAMES = ['Screening Visit', 'Week 1 Visit', 'Week 2 Visit', 'Week 3 Visit'];
+
+const state = {
+  visitsDone: 0,
+  formsDone: 0,
+  currentForm: 0,       // index of the open form, or -1 when none open
+  answers: {},          // per-open-form answer state
+  actualDate: '',
+};
+
+const isNum = v => /^\d+(\.\d+)?$/.test((v || '').trim());
+const isDate = v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test((v || '').trim());
+const isTime = v => /^\d{1,2}:\d{2}$/.test((v || '').trim());
+
+// ---- question definitions -------------------------------------------------
+// Long form (form 0) exercises every rule-engine branch; later forms are short.
+function questionsFor(formIdx) {
+  if (formIdx === 0) return [
+    { id: 'q1', kind: 'radio',    title: 'Choose the participant status',
+      options: ['Option Alpha', 'Option Beta', 'Option Gamma'] },
+    { id: 'q2', kind: 'text',     title: 'Enter participant name' },
+    { id: 'q3', kind: 'number',   title: 'Pain score (0-10)' },
+    { id: 'q4', kind: 'strictnum',title: 'Enter the code' },
+    { id: 'q5', kind: 'date',     title: 'Visit date' },
+    { id: 'q6', kind: 'time',     title: 'Visit time' },
+    { id: 'q7', kind: 'checks',   title: 'Select all symptoms that apply',
+      options: ['Headache', 'Nausea', 'Fatigue'] },
+    { id: 'q8', kind: 'unit',     title: 'Weight' },
+    { id: 'q9', kind: 'upload',   title: 'Upload signed consent document' },
+    { id: 'q10', kind: 'sign',    title: 'Investigator signature' },
+  ];
+  return [
+    { id: 'q1', kind: 'radio', title: 'Attendance status', options: ['Present', 'Absent'] },
+    { id: 'q2', kind: 'text',  title: 'Visit summary comment' },
+  ];
+}
+
+function setProgress() {
+  const el = document.getElementById('progress');
+  const text = state.formsDone + '/' + FORMS_PER_VISIT;
+  el.textContent = text;
+  el.setAttribute('aria-label', text);
+}
+
+function renderSidebarForms() {
+  const list = document.getElementById('formsList');
+  list.innerHTML = '';
+  for (let i = 0; i < FORMS_PER_VISIT; i++) {
+    const b = document.createElement('button');
+    const name = 'Form ' + String.fromCharCode(65 + i);
+    b.setAttribute('aria-label', name);
+    b.textContent = name;
+    if (i < state.formsDone) {
+      const c = document.createElement('span');
+      c.className = 'check';
+      c.textContent = '✓';
+      b.appendChild(c);
+    }
+    list.appendChild(b);
+  }
+}
+
+// ---- question rendering ---------------------------------------------------
+function renderQuestion(q, idx) {
+  const wrap = document.createElement('div');
+  wrap.className = 'q';
+  wrap.id = 'blk_' + q.id;
+  const head = document.createElement('div');
+  head.className = 'qhead';
+  head.innerHTML = '<span class="marker" aria-label="' + (idx + 1) + '.">' + (idx + 1) +
+    '.</span><span aria-label="' + q.title + '">' + q.title + '</span>';
+  wrap.appendChild(head);
+  const box = document.createElement('div');
+  box.className = 'answers';
+  wrap.appendChild(box);
+  const a = state.answers;
+
+  const addInput = (label, onchange) => {
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.setAttribute('aria-label', label);
+    inp.addEventListener('input', () => onchange(inp));
+    box.appendChild(inp);
+    return inp;
+  };
+
+  if (q.kind === 'radio') {
+    q.options.forEach(opt => {
+      const b = document.createElement('button');
+      b.className = 'opt';
+      b.setAttribute('aria-label', opt);
+      b.setAttribute('aria-checked', 'false');
+      b.textContent = opt;
+      b.onclick = () => {
+        box.querySelectorAll('.opt').forEach(o => o.setAttribute('aria-checked', 'false'));
+        b.setAttribute('aria-checked', 'true');
+        a[q.id] = opt;
+      };
+      box.appendChild(b);
+    });
+  } else if (q.kind === 'checks') {
+    q.options.forEach(opt => {
+      const b = document.createElement('button');
+      b.setAttribute('role', 'checkbox');
+      b.setAttribute('aria-label', opt);
+      b.setAttribute('aria-checked', 'false');
+      b.textContent = opt;
+      b.onclick = () => {
+        const on = b.getAttribute('aria-checked') === 'true';
+        b.setAttribute('aria-checked', on ? 'false' : 'true');
+        a[q.id] = !on;
+      };
+      box.appendChild(b);
+    });
+  } else if (q.kind === 'text') {
+    addInput(q.title, inp => { a[q.id] = inp.value.trim(); });
+  } else if (q.kind === 'number') {
+    addInput(q.title, inp => { a[q.id] = isNum(inp.value) ? inp.value.trim() : ''; });
+  } else if (q.kind === 'strictnum') {
+    // Live numeric validation: a non-numeric value shows the same inline
+    // rejection message Novatek renders, exercising the retype path.
+    const err = document.createElement('span');
+    err.className = 'err hidden';
+    err.setAttribute('aria-label', 'Please enter a valid number');
+    err.textContent = 'Please enter a valid number';
+    addInput(q.title, inp => {
+      const v = inp.value.trim();
+      const bad = v !== '' && !isNum(v);
+      err.classList.toggle('hidden', !bad);
+      if (bad) err.removeAttribute('aria-hidden');
+      a[q.id] = (v !== '' && isNum(v)) ? v : '';
+    });
+    wrap.appendChild(err);
+  } else if (q.kind === 'date') {
+    addInput(q.title, inp => { a[q.id] = isDate(inp.value) ? inp.value.trim() : ''; });
+  } else if (q.kind === 'time') {
+    addInput(q.title, inp => { a[q.id] = isTime(inp.value) ? inp.value.trim() : ''; });
+  } else if (q.kind === 'unit') {
+    const inp = addInput(q.title, i2 => {
+      a[q.id] = (isNum(i2.value) && a[q.id + '_unit']) ? i2.value.trim() : '';
+      a[q.id + '_val'] = i2.value.trim();
+    });
+    const ub = document.createElement('button');
+    ub.setAttribute('aria-label', 'Unit');
+    ub.textContent = 'Unit';
+    ub.onclick = () => {
+      let menu = document.getElementById('unitmenu');
+      if (menu) { menu.remove(); return; }
+      menu = document.createElement('div');
+      menu.id = 'unitmenu';
+      ['kg', 'lb'].forEach(u => {
+        const o = document.createElement('div');
+        o.setAttribute('role', 'option');
+        o.setAttribute('aria-label', u);
+        o.textContent = u;
+        o.onclick = (ev) => {
+          ev.stopPropagation();
+          a[q.id + '_unit'] = u;
+          ub.textContent = u;
+          ub.setAttribute('aria-label', u);
+          a[q.id] = isNum(a[q.id + '_val']) ? a[q.id + '_val'] : '';
+          menu.remove();
+        };
+        menu.appendChild(o);
+      });
+      ub.parentElement.appendChild(menu);
+    };
+    box.appendChild(ub);
+  } else if (q.kind === 'upload') {
+    const b = document.createElement('button');
+    b.setAttribute('aria-label', 'Upload File');
+    b.textContent = 'Upload File';
+    b.onclick = () => document.getElementById('fileInput').click();
+    box.appendChild(b);
+    const nameSpan = document.createElement('span');
+    nameSpan.id = 'uploadedName';
+    box.appendChild(nameSpan);
+    // A fresh visit gets a fresh picker (as Flutter does) — otherwise a
+    // second set_files with the same file never fires 'change'.
+    document.getElementById('fileInput').value = '';
+    document.getElementById('fileInput').onchange = (ev) => {
+      const f = ev.target.files[0];
+      if (!f) return;
+      a[q.id] = f.name;
+      nameSpan.textContent = f.name;
+      nameSpan.setAttribute('aria-label', f.name);
+    };
+  } else if (q.kind === 'sign') {
+    const b = document.createElement('button');
+    b.setAttribute('aria-label', 'Sign');
+    b.textContent = 'Sign';
+    b.onclick = () => {
+      // Emulates Flutter's modal barrier: the semantics of everything
+      // behind the dialog disappear while it is open.
+      document.getElementById('panel').style.visibility = 'hidden';
+      document.getElementById('dialog').classList.remove('hidden');
+      document.getElementById('sigUser').value = '';
+      document.getElementById('sigPass').value = '';
+      document.getElementById('sigConfirm').onclick = () => {
+        const u = document.getElementById('sigUser').value.trim();
+        const p = document.getElementById('sigPass').value.trim();
+        document.getElementById('dialog').classList.add('hidden');
+        document.getElementById('panel').style.visibility = 'visible';
+        if (u === 'Admin' && p === 'nursenurse123') {
+          a[q.id] = u;
+          const s = document.createElement('span');
+          s.setAttribute('aria-label', 'Signed by ' + u);
+          s.textContent = 'Signed by ' + u;
+          box.appendChild(s);
+          b.remove();
+        }
+      };
+    };
+    box.appendChild(b);
+  }
+  return wrap;
+}
+
+function answeredOk(q) {
+  const v = state.answers[q.id];
+  if (q.kind === 'checks' || q.kind === 'radio' || q.kind === 'sign') return !!v;
+  return typeof v === 'string' && v !== '';
+}
+
+function renderForm() {
+  const panel = document.getElementById('panel');
+  panel.innerHTML = '';
+  state.answers = {};
+  const qs = questionsFor(state.currentForm);
+  const title = document.createElement('h2');
+  const fname = 'Form ' + String.fromCharCode(65 + state.currentForm);
+  title.setAttribute('aria-label', fname + ' Questions');
+  title.textContent = fname + ' Questions';
+  panel.appendChild(title);
+  qs.forEach((q, i) => panel.appendChild(renderQuestion(q, i)));
+
+  const submit = document.createElement('button');
+  submit.setAttribute('aria-label', 'Submit');
+  submit.textContent = 'Submit';
+  submit.style.padding = '12px 40px';
+  submit.onclick = () => {
+    panel.querySelectorAll('.reqerr').forEach(e => e.remove());
+    let allOk = true;
+    qs.forEach(q => {
+      if (!answeredOk(q)) {
+        allOk = false;
+        const e = document.createElement('span');
+        e.className = 'err reqerr';
+        e.setAttribute('aria-label', q.title + ' is required');
+        e.textContent = q.title + ' is required';
+        document.getElementById('blk_' + q.id).appendChild(e);
+      }
+    });
+    if (!allOk) return;
+    state.formsDone++;
+    setProgress();
+    renderSidebarForms();
+    if (state.formsDone < FORMS_PER_VISIT) {
+      // Novatek auto-selects the next unsubmitted form after a submission.
+      state.currentForm = state.formsDone;
+      window.scrollTo(0, 0);
+      renderForm();
+    } else {
+      renderVisitComplete();
+    }
+  };
+  panel.appendChild(submit);
+}
+
+function renderVisitComplete() {
+  const panel = document.getElementById('panel');
+  panel.innerHTML = '';
+  window.scrollTo(0, 0);
+  const done = document.createElement('h2');
+  done.setAttribute('aria-label', 'All forms submitted');
+  done.textContent = 'All forms submitted';
+  panel.appendChild(done);
+  const lbl = document.createElement('span');
+  lbl.setAttribute('aria-label', 'Actual Visit Date entry below');
+  lbl.textContent = 'Actual Visit Date entry below';
+  panel.appendChild(lbl);
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.setAttribute('aria-label', 'Actual Visit Date');
+  inp.addEventListener('input', () => { state.actualDate = inp.value.trim(); });
+  panel.appendChild(document.createElement('br'));
+  panel.appendChild(inp);
+}
+
+function renderVisit() {
+  state.formsDone = 0;
+  state.currentForm = 0;
+  state.actualDate = '';
+  document.getElementById('profile').classList.add('hidden');
+  document.getElementById('panel').classList.remove('hidden');
+  document.getElementById('sidebar').style.visibility = 'visible';
+  document.getElementById('topbar').style.visibility = 'visible';
+  window.scrollTo(0, 0);
+  setProgress();
+  renderSidebarForms();
+  renderForm();
+}
+
+function renderProfile() {
+  document.getElementById('panel').classList.add('hidden');
+  document.getElementById('sidebar').style.visibility = 'hidden';
+  document.getElementById('topbar').style.visibility = 'hidden';
+  const prof = document.getElementById('profile');
+  prof.classList.remove('hidden');
+  window.scrollTo(0, 0);
+  let html = '<h1 aria-label="Participant profile">Participant profile</h1>' +
+             '<h3 aria-label="Visit Progress">Visit Progress</h3>' +
+             '<span aria-label="Completed visits: ' + state.visitsDone + '">Completed visits: ' +
+             state.visitsDone + '</span><br><br>';
+  if (state.visitsDone < NUM_VISITS) {
+    const name = VISIT_NAMES[state.visitsDone % VISIT_NAMES.length];
+    html += '<span aria-label="Next: ' + name + '">Next: ' + name + '</span><br><br>' +
+            '<button id="startVisit" aria-label="Start Visit">Start Visit</button>';
+  } else {
+    html += '<span aria-label="No more visits scheduled">No more visits scheduled</span>';
+  }
+  prof.innerHTML = html;
+  const btn = document.getElementById('startVisit');
+  if (btn) btn.onclick = renderVisit;
+}
+
+document.getElementById('endVisitBtn').onclick = () => {
+  if (state.formsDone >= FORMS_PER_VISIT && state.actualDate) {
+    state.visitsDone++;
+    renderProfile();
+  }
+};
+
+if (START_VIEW === 'profile') { renderProfile(); } else { renderVisit(); }
+</script>
+</body>
+</html>

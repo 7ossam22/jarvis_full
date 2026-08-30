@@ -36,8 +36,13 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
-PORT = 4701
+PORT = int(os.environ.get("BROWSER_DAEMON_PORT", "4701"))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Test-suite isolation knobs (production runs with none of these set):
+# BROWSER_DAEMON_HEADLESS=1     run Chromium headless (no window on screen)
+# BROWSER_DAEMON_PROFILE_BASE   keep browser profiles out of ~/.config/jarvis-chrome
+HEADLESS = os.environ.get("BROWSER_DAEMON_HEADLESS", "") == "1"
+PROFILE_BASE = os.environ.get("BROWSER_DAEMON_PROFILE_BASE", "")
 
 
 class _TimestampedStream:
@@ -213,7 +218,7 @@ def get_chrome_profiles():
 
 def _resolve_profile_dir(profile_query):
     """Maps a profile name/query to a safe persistent directory in ~/.config/jarvis-chrome/."""
-    jarvis_base = os.path.expanduser("~/.config/jarvis-chrome")
+    jarvis_base = PROFILE_BASE or os.path.expanduser("~/.config/jarvis-chrome")
     os.makedirs(jarvis_base, exist_ok=True)
 
     if not profile_query or profile_query.strip().lower() in ("default", "none", ""):
@@ -310,6 +315,9 @@ async def ensure_browser(profile=None):
         "--no-default-browser-check",
         "--disable-infobars",
     ]
+    if HEADLESS:
+        # A fixed window size keeps headless test-suite runs deterministic.
+        launch_args.append("--window-size=1280,900")
 
     # The profile dir remembers which engine last worked with it. A profile
     # created by Playwright's Chromium makes the real-Chrome channel launch
@@ -332,7 +340,9 @@ async def ensure_browser(profile=None):
             pass
 
     context = None
-    if preferred != "chromium" and not state.get("force_chromium"):
+    # Headless runs (the test suite) always use bundled Chromium — the real
+    # Chrome channel is a windowed-desktop concern only.
+    if preferred != "chromium" and not state.get("force_chromium") and not HEADLESS:
         try:
             context = await state["pw"].chromium.launch_persistent_context(
                 user_data_dir=req_dir,
@@ -351,7 +361,7 @@ async def ensure_browser(profile=None):
         try:
             context = await state["pw"].chromium.launch_persistent_context(
                 user_data_dir=req_dir,
-                headless=False,
+                headless=HEADLESS,
                 args=launch_args,
                 no_viewport=True,
                 ignore_https_errors=True,
@@ -360,7 +370,7 @@ async def ensure_browser(profile=None):
         except Exception as e2:
             print(f"[browser-daemon] Persistent launch failed ({e2}); falling back to ephemeral launch…", file=sys.stderr)
             state["browser"] = await state["pw"].chromium.launch(
-                headless=False,
+                headless=HEADLESS,
                 args=launch_args,
             )
             context = await state["browser"].new_context(no_viewport=True, ignore_https_errors=True)
@@ -1578,6 +1588,23 @@ _AUTOPILOT_DIALOG_ACCEPT = ("ok", "confirm", "done", "set", "save", "select", "a
 _AUTOPILOT_ERROR_HINTS = ("valid number", "invalid", "must be", "is required")
 
 
+def _autopilot_answer_value(hint, numeric_error, attempt,
+                            text_value, number_value, today, now_hhmm):
+    """Which default answer a text field gets. Priority: an explicit "valid
+    number" rejection wins outright; date/time hints beat everything else
+    (a generic "is required" on a date field must still get a date, never
+    the number default); then number hints / retry rounds; then plain text."""
+    if numeric_error:
+        return number_value
+    if "date" in hint:
+        return today
+    if "time" in hint:
+        return now_hhmm
+    if attempt > 1 or any(h in hint for h in _AUTOPILOT_NUMBER_HINTS):
+        return number_value
+    return text_value
+
+
 def _block_has_error(blk):
     """True when the block shows an inline validation error — its field holds
     a WRONG value (not merely an empty one) and must be retyped."""
@@ -1598,10 +1625,14 @@ def _autopilot_profile_ok(widgets):
 
 
 def _autopilot_progress(widgets):
-    """The top-bar N/M forms-progress counter, e.g. '0/4'."""
-    for w in widgets:
-        if re.fullmatch(r"\d+\s*/\s*\d+", (w.get("label") or "").strip()):
-            return w["label"].replace(" ", "")
+    """The top-bar N/M forms-progress counter, e.g. '0/4'. The top bar is
+    checked first so a question answer that happens to read '3/4' can never
+    shadow the real counter."""
+    top_bar = [w for w in widgets if ((w.get("bounds") or {}).get("center_y") or 999) < 100]
+    for pool in (top_bar, widgets):
+        for w in pool:
+            if re.fullmatch(r"\d+\s*/\s*\d+", (w.get("label") or "").strip()):
+                return w["label"].replace(" ", "")
     return None
 
 
@@ -1815,7 +1846,9 @@ async def cmd_autofill_form(payload):
                 continue
             attempts[key] = attempts.get(key, 0) + 1
             if attempts[key] == 3:
-                report["unresolved"].append(f"{key}: still unanswered after 3 attempts")
+                miss = f"{key}: still unanswered after 3 attempts"
+                if miss not in report["unresolved"]:
+                    report["unresolved"].append(miss)
             actions_here = []
 
             sign_btn = next((w for w in below_title if w.get("role") == "button"
@@ -1853,20 +1886,17 @@ async def cmd_autofill_form(payload):
                     report["unresolved"].append(f"{key}: upload failed ({res.get('error') or res.get('status')})")
             elif boxes_empty:
                 # On a retry round, a swallowed 'test' means a digit-only
-                # field — go straight to the number default.
+                # field — go straight to the number default. Order matters:
+                # an explicit "valid number" rejection wins outright, but a
+                # generic error (e.g. "is required") on a date/time field must
+                # still get a date/time — never the number default.
+                numeric_error = any(
+                    "valid number" in (w.get("label") or "").lower()
+                    for w in blk["members"])
                 for box in boxes_empty:
-                    if error_here and "please enter a valid number" not in hint:
-                        # The field rejected what it holds — the number default
-                        # satisfies every numeric validator we have seen.
-                        value = number_value
-                    elif "date" in hint:
-                        value = today
-                    elif "time" in hint:
-                        value = now_hhmm
-                    elif attempts[key] > 1 or any(h in hint for h in _AUTOPILOT_NUMBER_HINTS):
-                        value = number_value
-                    else:
-                        value = text_value
+                    value = _autopilot_answer_value(
+                        hint, numeric_error, attempts[key],
+                        text_value, number_value, today, now_hhmm)
                     await _autopilot_type(page, box, value)
                     actions_here.append(f"typed '{value}'")
                 if unit_btns and key not in units_done:
@@ -1891,6 +1921,22 @@ async def cmd_autofill_form(payload):
             if actions_here:
                 report["answered"].append({"question": key[:80], "action": "; ".join(actions_here)})
                 acted = True
+                # ANY action can reshape the panel — an inline validation
+                # error appearing or clearing, selection styling, a
+                # conditional question unfolding — which shifts every block
+                # below and makes the rest of this round's coordinates stale.
+                # When a later pending block moved, restart the round on fresh
+                # widgets instead of clicking blind.
+                later = [b2 for b2 in blocks
+                         if b2["marker_y"] > blk["marker_y"] and b2["key"] not in done]
+                if later:
+                    fresh_now = await extract_flutter_widgets(page)
+                    fresh_pos = {b2["key"]: b2["marker_y"]
+                                 for b2 in _autopilot_blocks(_autopilot_panel(fresh_now, min_x))}
+                    if any(abs(fresh_pos.get(b2["key"], -(10 ** 9)) - b2["marker_y"]) > 10
+                           for b2 in later):
+                        widgets = fresh_now
+                        break
 
         # Verification pass: only blocks whose visible inputs now hold a value
         # are marked done; the rest stay eligible for an immediate retry.
@@ -1901,10 +1947,22 @@ async def cmd_autofill_form(payload):
             empty = [w for w in blk["members"] if w.get("role") == "textbox" and not w.get("value")
                      and w["bounds"]["center_y"] > blk["marker_y"] + 12
                      and w["bounds"]["center_y"] < inner_h - 10]
-            if empty or _block_has_error(blk):
+            # Checkbox/switch questions must show positive evidence: a click
+            # that silently missed leaves every box unchecked, which absence-
+            # of-empty-textboxes alone would wrongly "verify".
+            checkables = [w for w in blk["members"]
+                          if w.get("role") in ("checkbox", "switch")]
+            unchecked = checkables and not any(
+                w.get("value") == "checked" for w in checkables)
+            if empty or unchecked or _block_has_error(blk):
                 done.discard(blk["key"])
             else:
                 done.add(blk["key"])
+                # A block that eventually registered its answer is not
+                # unresolved, even if an earlier round hit the attempt cap.
+                stale = f"{blk['key']}: still unanswered after 3 attempts"
+                if stale in report["unresolved"]:
+                    report["unresolved"].remove(stale)
 
         panel = _autopilot_panel(widgets, min_x)
         submit = next((w for w in panel if w.get("role") == "button"
@@ -1923,13 +1981,16 @@ async def cmd_autofill_form(payload):
                 swept = True
                 widgets = await _autopilot_scroll_to_form_top(page, tab_index, min_x)
                 continue
-            while submit and submit["bounds"]["center_y"] >= inner_h - 20:
+            scroll_tries = 0
+            while (submit and submit["bounds"]["center_y"] >= inner_h - 20
+                   and scroll_tries < 10):
+                scroll_tries += 1
                 await cmd_scroll({"direction": "down", "amount": 400, "tab_index": tab_index})
                 widgets = await extract_flutter_widgets(page)
                 submit = next((w for w in _autopilot_panel(widgets, min_x)
                                if w.get("role") == "button"
                                and (w.get("label") or "").strip().lower() == "submit"), None)
-            if not submit:
+            if not submit or submit["bounds"]["center_y"] >= inner_h - 20:
                 continue
             await _autopilot_click(page, submit, settle=1500)
             report["submitted"] = True
@@ -1994,7 +2055,9 @@ async def cmd_autofill_form(payload):
         else:
             stagnant = 0
 
-    report["status"] = "autofill_done" if report["submitted"] else "autofill_incomplete"
+    report["status"] = ("autofill_done"
+                        if report["submitted"] and report["submit_verified"]
+                        else "autofill_incomplete")
     report["widgets"] = _slim_widgets(widgets)
     return report
 
