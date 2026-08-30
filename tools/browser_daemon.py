@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zlib
 
 from playwright.async_api import (
     async_playwright,
@@ -310,19 +311,43 @@ async def ensure_browser(profile=None):
         "--disable-infobars",
     ]
 
-    context = None
+    # The profile dir remembers which engine last worked with it. A profile
+    # created by Playwright's Chromium makes the real-Chrome channel launch
+    # crash (SIGTRAP) — the window comes up on about:blank, the command dies,
+    # and the user stares at a blank browser. Once Chromium is known to be
+    # the working engine, skip the doomed Chrome attempt entirely.
+    engine_marker = os.path.join(req_dir, ".jarvis_engine")
+    preferred = None
     try:
-        context = await state["pw"].chromium.launch_persistent_context(
-            user_data_dir=req_dir,
-            channel="chrome",
-            headless=False,
-            args=launch_args,
-            no_viewport=True,
-            ignore_https_errors=True,
-        )
-    except Exception as e:
-        print(f"[browser-daemon] Chrome channel launch failed ({e}); cleaning locks and trying Chromium…", file=sys.stderr)
-        _clean_profile_locks(req_dir)
+        with open(engine_marker) as f:
+            preferred = f.read().strip()
+    except Exception:
+        pass
+
+    def _remember_engine(name):
+        try:
+            with open(engine_marker, "w") as f:
+                f.write(name)
+        except Exception:
+            pass
+
+    context = None
+    if preferred != "chromium" and not state.get("force_chromium"):
+        try:
+            context = await state["pw"].chromium.launch_persistent_context(
+                user_data_dir=req_dir,
+                channel="chrome",
+                headless=False,
+                args=launch_args,
+                no_viewport=True,
+                ignore_https_errors=True,
+            )
+            _remember_engine("chrome")
+        except Exception as e:
+            print(f"[browser-daemon] Chrome channel launch failed ({e}); cleaning locks and trying Chromium…", file=sys.stderr)
+            _remember_engine("chromium")
+            _clean_profile_locks(req_dir)
+    if context is None:
         try:
             context = await state["pw"].chromium.launch_persistent_context(
                 user_data_dir=req_dir,
@@ -331,6 +356,7 @@ async def ensure_browser(profile=None):
                 no_viewport=True,
                 ignore_https_errors=True,
             )
+            _remember_engine("chromium")
         except Exception as e2:
             print(f"[browser-daemon] Persistent launch failed ({e2}); falling back to ephemeral launch…", file=sys.stderr)
             state["browser"] = await state["pw"].chromium.launch(
@@ -801,6 +827,24 @@ async def cmd_list_profiles(_payload):
 
 
 async def cmd_open(payload):
+    """Opens a URL, self-healing once if the browser died mid-command (a
+    crashed first launch used to leave the user staring at a blank window
+    until they asked again — now the relaunch and navigation happen here)."""
+    try:
+        return await _cmd_open_inner(payload)
+    except Exception as e:
+        low = str(e).lower()
+        if payload.get("_retried") or ("closed" not in low and "crash" not in low):
+            raise
+        print(f"[browser-daemon] /open hit a dead browser ({e}); relaunching and retrying…", file=sys.stderr)
+        state["context"] = None
+        state["force_chromium"] = True  # the crashed engine doesn't get a second try this session
+        payload = dict(payload)
+        payload["_retried"] = True
+        return await cmd_open(payload)
+
+
+async def _cmd_open_inner(payload):
     """Opens a URL, navigating in the active tab or opening a new tab."""
     url = (payload.get("url") or "").strip()
     profile = payload.get("profile")
@@ -1515,8 +1559,8 @@ async def cmd_upload_file(payload):
 # Fills and submits forms with zero LLM involvement — the whole
 # answer/scroll/submit loop runs in-process at machine speed. Scope is
 # deliberately hard-limited to the VISIT MODE screen (the one titled
-# "Visit Mode" with the sidebar Forms list and the N/M progress counter):
-# both commands refuse to act anywhere else.
+# "Visit Mode" with the sidebar Forms list and the N/M progress counter).
+# cmd_takeover_participant chains whole visits from the participant profile.
 
 # Question markers: "1.", "4-1." (sub-questions).
 _AUTOPILOT_MARKER_RE = re.compile(r"^\d+(-\d+)?\.$")
@@ -1529,11 +1573,28 @@ _AUTOPILOT_NUMBER_HINTS = (
     "mmhg", "(0-", "scale", "duration", "result", "quantity", "spo",
     "pressure", "how many", "how much",
 )
+_AUTOPILOT_DIALOG_ACCEPT = ("ok", "confirm", "done", "set", "save", "select", "apply", "yes")
+# Inline validation messages Novatek renders under a rejected field.
+_AUTOPILOT_ERROR_HINTS = ("valid number", "invalid", "must be", "is required")
+
+
+def _block_has_error(blk):
+    """True when the block shows an inline validation error — its field holds
+    a WRONG value (not merely an empty one) and must be retyped."""
+    return any(
+        any(h in (w.get("label") or "").lower() for h in _AUTOPILOT_ERROR_HINTS)
+        for w in blk["members"])
 
 
 def _autopilot_visit_ok(widgets):
     """True only on the visit-mode screen — the autopilot's hard scope guard."""
     return any((w.get("label") or "").strip() == "Visit Mode" for w in widgets)
+
+
+def _autopilot_profile_ok(widgets):
+    """True on the participant profile screen (where visits are started)."""
+    labels = [(w.get("label") or "") for w in widgets]
+    return any("Visit Progress" in l or "Participant profile" in l for l in labels)
 
 
 def _autopilot_progress(widgets):
@@ -1583,6 +1644,12 @@ def _autopilot_blocks(panel):
     return blocks
 
 
+def _widget_sig(w):
+    b = w.get("bounds") or {}
+    return (w.get("role"), w.get("label"),
+            round((b.get("center_x") or 0) / 25), round((b.get("center_y") or 0) / 25))
+
+
 async def _autopilot_click(page, w, settle=180):
     b = w["bounds"]
     await page.mouse.click(b["center_x"], b["center_y"])
@@ -1595,6 +1662,38 @@ async def _autopilot_type(page, w, text):
     await page.keyboard.press("Backspace")
     await page.keyboard.type(str(text), delay=8)
     await page.wait_for_timeout(80)
+
+
+async def _autopilot_accept_dialog(page, extra_labels=()):
+    """Accepts an open picker/confirmation dialog by clicking its OK-style
+    button (calendar and time pickers default to now/today, so accepting is
+    exactly the 'current date / current time' rule). Returns the label it
+    clicked, or None when no dialog button was found."""
+    widgets = await extract_flutter_widgets(page)
+    accept = tuple(extra_labels) + _AUTOPILOT_DIALOG_ACCEPT
+    for want in accept:
+        for x in widgets:
+            if x.get("role") == "button" and (x.get("label") or "").strip().lower() == want:
+                await _autopilot_click(page, x, settle=450)
+                return want
+    return None
+
+
+async def _autopilot_first_dropdown_option(page, before_widgets):
+    """After a dropdown/unit button was clicked, picks the FIRST option the
+    click revealed (widgets present now but not before)."""
+    await page.wait_for_timeout(300)
+    before = {_widget_sig(w) for w in before_widgets}
+    widgets = await extract_flutter_widgets(page)
+    fresh = [w for w in widgets if _widget_sig(w) not in before and w.get("label")]
+    fresh = [w for w in fresh if w.get("role") in ("option", "button", "menuitem", "widget")]
+    fresh.sort(key=lambda w: (0 if w.get("role") == "option" else 1,
+                              w["bounds"]["center_y"], w["bounds"]["center_x"]))
+    if fresh:
+        await _autopilot_click(page, fresh[0], settle=250)
+        return fresh[0].get("label")
+    await page.keyboard.press("Escape")
+    return None
 
 
 async def _autopilot_sign(page, w, username, password, report):
@@ -1620,20 +1719,31 @@ async def _autopilot_sign(page, w, username, password, report):
     report["unresolved"].append("signature dialog: no confirm button found")
 
 
+async def _autopilot_scroll_to_form_top(page, tab_index, min_x):
+    """Scrolls the question panel back to question 1 for the pre-submit sweep."""
+    for _ in range(20):
+        widgets = await extract_flutter_widgets(page)
+        blocks = _autopilot_blocks(_autopilot_panel(widgets, min_x))
+        if any(b["key"].startswith("1.") and b["marker_y"] > 110 for b in blocks):
+            return widgets
+        await cmd_scroll({"direction": "up", "amount": 900, "tab_index": tab_index})
+    return await extract_flutter_widgets(page)
+
+
 async def cmd_autofill_form(payload):
     """Deterministically fills and submits the form currently open on the
     Novatek VISIT MODE screen. Answers every question top-to-bottom with the
-    standard defaults (first option, 'test', 55, today's date, current time,
-    consent PDF, Admin signature), smooth-scrolls to reveal the rest, clicks
-    Submit, and reports what happened — including the before/after N/M
-    progress counter and anything it could not answer."""
+    standard defaults, VERIFIES each answer actually registered (a question
+    that is visible but unanswered is retried immediately, never left for a
+    lucky later round), runs a full top-to-bottom sweep before Submit, and
+    reports the before/after N/M progress counter plus anything unresolved."""
     text_value = payload.get("text_value") or "test"
     number_value = str(payload.get("number_value") or "55")
     file_path = payload.get("file_path") or "/home/proslayer/AndroidStudioProjects/jarvis_full/Informed_Consent Template.pdf"
     username = payload.get("username") or "Admin"
     password = payload.get("password") or "nursenurse123"
     min_x = int(payload.get("panel_min_x", 330))
-    max_rounds = int(payload.get("max_rounds", 80))
+    max_rounds = int(payload.get("max_rounds", 100))
     tab_index = payload.get("tab_index")
 
     page = await get_active_page(tab_index=tab_index)
@@ -1644,9 +1754,14 @@ async def cmd_autofill_form(payload):
     now_hhmm = time.strftime("%H:%M")
 
     report = {"answered": [], "unresolved": [], "rounds": 0,
-              "submitted": False, "progress_before": None, "progress_after": None}
-    done = set()
-    typed_retry = set()
+              "submitted": False, "submit_verified": False,
+              "progress_before": None, "progress_after": None}
+    done = set()          # blocks whose answers were VERIFIED in place
+    attempts = {}         # per-block answer attempts (cap 3, then unresolved)
+    units_done = set()    # blocks whose unit dropdown was already picked
+    swept = False         # pre-submit top-to-bottom sweep completed
+    resubmits = 0
+    render_waits = 0      # rounds spent waiting for a visible block's inputs to render
 
     widgets = await extract_flutter_widgets(page)
     if not _autopilot_visit_ok(widgets):
@@ -1663,16 +1778,44 @@ async def cmd_autofill_form(payload):
         acted = False
 
         for blk in blocks:
-            if blk["key"] in done:
-                continue
-            # Widget rects are viewport-relative — anything below the fold
-            # can't be clicked yet; the post-round scroll will bring it up.
+            key = blk["key"]
+            # A "done" block is still re-checked every time it is on screen:
+            # if its textbox shows no value, the answer didn't register and
+            # it is retried NOW — this is the fix for visible-but-skipped
+            # questions that previously waited for a lucky later round.
             if blk["marker_y"] >= inner_h - 40:
                 continue
             hint = blk["hint"]
             below_title = [w for w in blk["members"]
                            if w["bounds"]["center_y"] > blk["marker_y"] + 12
                            and w["bounds"]["center_y"] < inner_h - 10]
+            boxes_empty = [w for w in below_title if w.get("role") == "textbox" and not w.get("value")]
+            error_here = _block_has_error(blk)
+            if error_here:
+                # A rejected value (e.g. a date that landed in a number field)
+                # is worse than an empty one — retype every field in the block.
+                boxes_empty = [w for w in below_title if w.get("role") == "textbox"]
+            if key in done and not boxes_empty and not error_here:
+                continue
+            # NEVER re-touch a question that already holds a valid answer —
+            # a filled, error-free field (pre-existing or from a previous
+            # round), a checked option, or an already-attached file counts as
+            # answered on sight, with zero interaction.
+            if not error_here:
+                has_filled_box = any(w.get("role") == "textbox" and w.get("value")
+                                     for w in below_title)
+                any_empty_box = bool(boxes_empty)
+                already_checked = any(w.get("value") == "checked" for w in below_title)
+                already_uploaded = ("upload" in hint or "attach" in hint or "file" in hint) and any(
+                    ".pdf" in (w.get("label") or "").lower() for w in blk["members"])
+                if (has_filled_box and not any_empty_box) or already_checked or already_uploaded:
+                    done.add(key)
+                    continue
+            if attempts.get(key, 0) >= 3:
+                continue
+            attempts[key] = attempts.get(key, 0) + 1
+            if attempts[key] == 3:
+                report["unresolved"].append(f"{key}: still unanswered after 3 attempts")
             actions_here = []
 
             sign_btn = next((w for w in below_title if w.get("role") == "button"
@@ -1680,15 +1823,17 @@ async def cmd_autofill_form(payload):
             upload_hit = ("upload" in hint or "attach" in hint) or any(
                 any(k in (w.get("label") or "").lower() for k in ("upload", "attach", "browse", "choose file"))
                 for w in below_title if w.get("role") == "button")
-            boxes = [w for w in below_title if w.get("role") == "textbox" and not w.get("value")]
             checkboxes = [w for w in below_title if w.get("role") in ("checkbox", "switch")
                           and w.get("value") != "checked"]
+            has_box = any(w.get("role") == "textbox" for w in below_title)
             # Buttons count as answer options ONLY in a block with no textbox —
-            # next to a textbox a button is a unit dropdown or calendar icon,
-            # and clicking it would open an overlay instead of answering.
-            options = [] if boxes else [
+            # next to a textbox a button is a unit dropdown or calendar icon.
+            options = [] if has_box else [
                 w for w in below_title if w.get("role") == "button" and w.get("label")
                 and (w.get("label") or "").strip().lower() not in ("sign", "submit")]
+            unit_btns = [w for w in below_title if has_box and w.get("role") == "button"
+                         and len((w.get("label") or "").strip()) <= 14
+                         and (w.get("label") or "").strip().lower() not in ("sign", "submit")]
 
             if sign_btn:
                 await _autopilot_sign(page, sign_btn, username, password, report)
@@ -1697,20 +1842,39 @@ async def cmd_autofill_form(payload):
                 res = await cmd_upload_file({"file_path": file_path, "tab_index": tab_index})
                 if res.get("status") == "file_uploaded":
                     actions_here.append("upload")
+                    # Consent uploads chain calendar + time pickers; both
+                    # default to now, so accepting them IS the current
+                    # date/time rule. Two dialogs at most.
+                    for _ in range(2):
+                        if not await _autopilot_accept_dialog(page):
+                            break
+                        actions_here.append("accepted picker dialog")
                 else:
-                    report["unresolved"].append(f"{blk['key']}: upload failed ({res.get('error') or res.get('status')})")
-            elif boxes:
-                for box in boxes:
-                    if "date" in hint:
+                    report["unresolved"].append(f"{key}: upload failed ({res.get('error') or res.get('status')})")
+            elif boxes_empty:
+                # On a retry round, a swallowed 'test' means a digit-only
+                # field — go straight to the number default.
+                for box in boxes_empty:
+                    if error_here and "please enter a valid number" not in hint:
+                        # The field rejected what it holds — the number default
+                        # satisfies every numeric validator we have seen.
+                        value = number_value
+                    elif "date" in hint:
                         value = today
                     elif "time" in hint:
                         value = now_hhmm
-                    elif any(h in hint for h in _AUTOPILOT_NUMBER_HINTS):
+                    elif attempts[key] > 1 or any(h in hint for h in _AUTOPILOT_NUMBER_HINTS):
                         value = number_value
                     else:
                         value = text_value
                     await _autopilot_type(page, box, value)
                     actions_here.append(f"typed '{value}'")
+                if unit_btns and key not in units_done:
+                    units_done.add(key)
+                    snapshot = await extract_flutter_widgets(page)
+                    await _autopilot_click(page, unit_btns[0], settle=250)
+                    picked = await _autopilot_first_dropdown_option(page, snapshot)
+                    actions_here.append(f"unit '{picked}'" if picked else "unit dropdown: nothing to pick")
             elif checkboxes:
                 await _autopilot_click(page, checkboxes[0])
                 actions_here.append("checked first box")
@@ -1721,64 +1885,218 @@ async def cmd_autofill_form(payload):
                     await _autopilot_click(page, options[0])
                     actions_here.append(f"clicked '{(options[0].get('label') or '')[:40]}'")
             else:
-                continue  # nothing actionable visible yet — likely revealed after scroll
+                attempts[key] -= 1  # nothing actionable visible yet — not a real attempt
+                continue
 
             if actions_here:
-                done.add(blk["key"])
-                report["answered"].append({"question": blk["key"][:80], "action": "; ".join(actions_here)})
+                report["answered"].append({"question": key[:80], "action": "; ".join(actions_here)})
                 acted = True
 
-        # Digit-only fields silently swallow 'test' — re-read once per acted
-        # round and retype stragglers with the number default.
-        if acted:
-            widgets = await extract_flutter_widgets(page)
-            for blk in _autopilot_blocks(_autopilot_panel(widgets, min_x)):
-                if blk["key"] not in done or blk["key"] in typed_retry:
-                    continue
-                for w in blk["members"]:
-                    if w.get("role") == "textbox" and not w.get("value") \
-                            and w["bounds"]["center_y"] > blk["marker_y"] + 12 \
-                            and w["bounds"]["center_y"] < inner_h - 10:
-                        typed_retry.add(blk["key"])
-                        await _autopilot_type(page, w, number_value)
+        # Verification pass: only blocks whose visible inputs now hold a value
+        # are marked done; the rest stay eligible for an immediate retry.
+        widgets = await extract_flutter_widgets(page)
+        for blk in _autopilot_blocks(_autopilot_panel(widgets, min_x)):
+            if blk["marker_y"] >= inner_h - 40 or attempts.get(blk["key"], 0) == 0:
+                continue
+            empty = [w for w in blk["members"] if w.get("role") == "textbox" and not w.get("value")
+                     and w["bounds"]["center_y"] > blk["marker_y"] + 12
+                     and w["bounds"]["center_y"] < inner_h - 10]
+            if empty or _block_has_error(blk):
+                done.discard(blk["key"])
+            else:
+                done.add(blk["key"])
 
         panel = _autopilot_panel(widgets, min_x)
         submit = next((w for w in panel if w.get("role") == "button"
                        and (w.get("label") or "").strip().lower() == "submit"), None)
-        all_keys = {b["key"] for b in _autopilot_blocks(panel)}
-        if submit and all_keys.issubset(done):
-            if submit["bounds"]["center_y"] >= inner_h - 20:
-                await cmd_scroll({"direction": "down", "amount": 500, "tab_index": tab_index})
-                widgets = await extract_flutter_widgets(page)
+        blocks_now = _autopilot_blocks(panel)
+        all_keys = {b["key"] for b in blocks_now}
+        pending = all_keys - done - {k for k, n in attempts.items() if n >= 3}
+        visible_pending = [b for b in blocks_now
+                           if b["key"] in pending and b["marker_y"] < inner_h - 40]
+
+        if submit and not pending:
+            if not swept:
+                # Full sweep before Submit: back to question 1, then walk down
+                # re-verifying every screenful, so nothing scrolled past
+                # unanswered can slip through.
+                swept = True
+                widgets = await _autopilot_scroll_to_form_top(page, tab_index, min_x)
                 continue
-            await _autopilot_click(page, submit, settle=1400)
+            while submit and submit["bounds"]["center_y"] >= inner_h - 20:
+                await cmd_scroll({"direction": "down", "amount": 400, "tab_index": tab_index})
+                widgets = await extract_flutter_widgets(page)
+                submit = next((w for w in _autopilot_panel(widgets, min_x)
+                               if w.get("role") == "button"
+                               and (w.get("label") or "").strip().lower() == "submit"), None)
+            if not submit:
+                continue
+            await _autopilot_click(page, submit, settle=1500)
             report["submitted"] = True
             widgets = await extract_flutter_widgets(page)
             report["progress_after"] = _autopilot_progress(widgets)
+            advanced = (report["progress_after"] or "") != (report["progress_before"] or "")
+            still_open = any((w.get("label") or "").strip().lower() == "submit"
+                             for w in _autopilot_panel(widgets, min_x))
+            report["submit_verified"] = advanced or not still_open
+            if not report["submit_verified"] and resubmits < 1:
+                # Validation rejected it — something is still unanswered.
+                # Sweep once more from the top and try again.
+                resubmits += 1
+                swept = False
+                report["submitted"] = False
+                widgets = await _autopilot_scroll_to_form_top(page, tab_index, min_x)
+                continue
             break
 
-        if not acted:
+        # SCROLLING IS EARNED, NEVER TIMED: while any visible question is
+        # still unanswered, the loop stays on this screenful and retries —
+        # it never scrolls away from pending work (the "skips questions and
+        # scrolls too fast" failure on long forms).
+        if visible_pending:
+            if acted:
+                continue
+            # A question is visible but its inputs aren't in the semantics
+            # tree yet (Flutter renders lazily) — wait for the render
+            # instead of scrolling past it.
+            render_waits += 1
+            if render_waits <= 4:
+                await page.wait_for_timeout(400)
+                widgets = await extract_flutter_widgets(page)
+                continue
+            for b in visible_pending:
+                attempts[b["key"]] = 3
+                report["unresolved"].append(f"{b['key']}: inputs never became actionable")
+        render_waits = 0
+
+        # Scroll at most ~45% of the viewport so revealed content always
+        # overlaps the previous screenful, then WAIT until the scroll
+        # actually surfaces new questions (or Submit) before moving on.
+        await cmd_scroll({"direction": "down",
+                          "amount": max(300, min(500, int(inner_h * 0.45))),
+                          "tab_index": tab_index})
+        widgets = await extract_flutter_widgets(page)
+        for _ in range(6):
+            fresh_panel = _autopilot_panel(widgets, min_x)
+            fresh_keys = {b["key"] for b in _autopilot_blocks(fresh_panel)}
+            submit_visible = any((w.get("label") or "").strip().lower() == "submit"
+                                 for w in fresh_panel if w.get("role") == "button")
+            if (fresh_keys - all_keys) or submit_visible:
+                break
+            await page.wait_for_timeout(350)
+            widgets = await extract_flutter_widgets(page)
+        fresh_keys = {b["key"] for b in _autopilot_blocks(_autopilot_panel(widgets, min_x))}
+        if not (fresh_keys - all_keys):
             stagnant += 1
             if stagnant >= 3:
-                report["unresolved"].append("no progress after 3 scroll rounds — stopped before Submit")
+                report["unresolved"].append("reached the bottom without finding Submit — stopped")
                 break
         else:
             stagnant = 0
-
-        await cmd_scroll({"direction": "down", "amount": 500, "tab_index": tab_index})
-        widgets = await extract_flutter_widgets(page)
 
     report["status"] = "autofill_done" if report["submitted"] else "autofill_incomplete"
     report["widgets"] = _slim_widgets(widgets)
     return report
 
 
+def _png_pixels(data):
+    """Minimal stdlib PNG decoder (8-bit RGB/RGBA) — returns (w, h, channels,
+    flat bytearray). Used to read the sidebar checkmarks, which exist only as
+    drawn pixels: the semantics tree shows identical buttons either way."""
+    import struct
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+    pos, w, h, colort, idat = 8, 0, 0, 6, b""
+    while pos < len(data):
+        ln, typ = struct.unpack(">I4s", data[pos:pos + 8])
+        pos += 8
+        chunk = data[pos:pos + ln]
+        pos += ln + 4
+        if typ == b"IHDR":
+            w, h, _bitd, colort = struct.unpack(">IIBB", chunk[:10])
+        elif typ == b"IDAT":
+            idat += chunk
+        elif typ == b"IEND":
+            break
+    raw = zlib.decompress(idat)
+    ch = {0: 1, 2: 3, 4: 2, 6: 4}[colort]
+    stride = w * ch
+    out = bytearray(h * stride)
+    prev = bytearray(stride)
+    pos = 0
+    for y in range(h):
+        f = raw[pos]
+        pos += 1
+        line = bytearray(raw[pos:pos + stride])
+        pos += stride
+        if f == 1:
+            for i in range(ch, stride):
+                line[i] = (line[i] + line[i - ch]) & 255
+        elif f == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 255
+        elif f == 3:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                line[i] = (line[i] + ((a + prev[i]) >> 1)) & 255
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                b = prev[i]
+                c = prev[i - ch] if i >= ch else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                line[i] = (line[i] + pr) & 255
+        out[y * stride:(y + 1) * stride] = line
+        prev = line
+    return w, h, ch, out
+
+
+async def _sidebar_checkmarks(page, buttons):
+    """Which sidebar form buttons carry the green completion checkmark.
+    Takes ONE screenshot of the sidebar strip and samples the pixels at each
+    button's right edge. Returns a list of bools aligned with `buttons`."""
+    if not buttons:
+        return []
+    tops = [b["bounds"]["y"] for b in buttons]
+    bottoms = [b["bounds"]["y"] + b["bounds"]["height"] for b in buttons]
+    clip_y = max(0, min(tops) - 4)
+    clip_h = max(bottoms) - clip_y + 4
+    clip_w = max(b["bounds"]["x"] + b["bounds"]["width"] for b in buttons) + 8
+    shot = await page.screenshot(clip={"x": 0, "y": clip_y, "width": clip_w, "height": clip_h})
+    try:
+        w, h, ch, px = _png_pixels(shot)
+    except Exception as e:
+        print(f"[browser-daemon] checkmark pixel scan failed: {e}", file=sys.stderr)
+        return [False] * len(buttons)
+    scale = w / clip_w  # device pixel ratio applied by the screenshot
+    results = []
+    for b in buttons:
+        bb = b["bounds"]
+        x0 = int((bb["x"] + bb["width"] - 42) * scale)
+        x1 = int((bb["x"] + bb["width"] - 4) * scale)
+        y0 = int((bb["center_y"] - clip_y - 10) * scale)
+        y1 = int((bb["center_y"] - clip_y + 10) * scale)
+        green = 0
+        for yy in range(max(0, y0), min(h, y1)):
+            row = yy * w * ch
+            for xx in range(max(0, x0), min(w, x1)):
+                i = row + xx * ch
+                r, g, bl = px[i], px[i + 1], px[i + 2]
+                if g > 110 and g > r + 35 and g > bl + 35:
+                    green += 1
+        results.append(green >= 6)
+    return results
+
+
 async def cmd_autofill_visit(payload):
-    """Fills and submits EVERY form of the visit-mode screen: walks the
-    sidebar Forms list top-to-bottom, runs the form autopilot on each, and
-    stops when the N/M progress counter is full (or no form advances it).
-    Never touches End Visit — reporting the final progress is the caller's
-    cue to end the visit."""
+    """Fills and submits EVERY form of the visit-mode screen. Rides Novatek's
+    own flow: each verified submission auto-selects the next unsubmitted form,
+    so the loop just fills whatever is open; the sidebar is only consulted
+    (via the pixel checkmark scan) when nothing is auto-selected. Stops when
+    the N/M progress counter is full or a form fails to advance it. Never
+    touches End Visit — cmd_takeover_participant (or the model) owns the
+    actual-date + End Visit step."""
     tab_index = payload.get("tab_index")
     page = await get_active_page(tab_index=tab_index)
     if not await is_flutter_page(page):
@@ -1790,30 +2108,87 @@ async def cmd_autofill_visit(payload):
                          "Start the visit first."}
 
     report = {"forms": [], "progress": _autopilot_progress(widgets)}
+    attempted = set()  # form labels already worked on this run — never re-target
 
-    for _pass in range(int(payload.get("max_forms", 30))):
+    for _ in range(int(payload.get("max_forms", 40))):
         progress = _autopilot_progress(widgets)
         if progress:
-            done_n, total_n = progress.split("/")
-            if done_n == total_n:
+            done_n, total_n = (int(x) for x in progress.split("/"))
+            if done_n >= total_n:
                 break
 
-        # Sidebar form buttons: left of the panel, between "Forms" and the
-        # reserved visit actions (visit note / discard / hold / end visit).
-        sidebar = [w for w in widgets if w.get("role") == "button"
-                   and (w["bounds"]["center_x"]) < 330
-                   and w.get("label")
-                   and not any(r in w["label"].lower() for r in _AUTOPILOT_SIDEBAR_RESERVED)
-                   and w["bounds"]["center_y"] > 250]
-        sidebar.sort(key=lambda w: w["bounds"]["center_y"])
-        if not sidebar:
-            report["forms"].append({"error": "no form buttons found in the sidebar"})
+        # After a verified submission Novatek AUTO-SELECTS the next
+        # unsubmitted form. When question blocks are already on screen, fill
+        # exactly the form that is open and DO NOT click the sidebar — a
+        # manual sidebar click is what used to re-open an already-submitted
+        # form and rewrite its answers.
+        blocks_open = bool(_autopilot_blocks(_autopilot_panel(widgets, 330)))
+        if not blocks_open:
+            for _ in range(8):
+                await page.wait_for_timeout(400)
+                widgets = await extract_flutter_widgets(page)
+                if _autopilot_blocks(_autopilot_panel(widgets, 330)):
+                    blocks_open = True
+                    break
+        if blocks_open:
+            target_label = "(auto-selected form)"
+            form_res = await cmd_autofill_form(dict(payload))
+            report["forms"].append({
+                "form": target_label,
+                "status": form_res.get("status", form_res.get("error")),
+                "answered": len(form_res.get("answered", [])),
+                "unresolved": form_res.get("unresolved", []),
+                "progress_after": form_res.get("progress_after"),
+            })
+            # Let the auto-selection of the next form settle before re-reading.
+            await page.wait_for_timeout(1000)
+            widgets = await extract_flutter_widgets(page)
+            new_progress = _autopilot_progress(widgets)
+            if new_progress == progress and not form_res.get("submit_verified"):
+                report["forms"].append({"note": "open form did not advance progress — stopping for review"})
+                break
+            continue
+
+        # FALLBACK ONLY (no form auto-selected): screenshot the sidebar strip
+        # and target the first form WITHOUT the green checkmark. Forms do NOT
+        # complete in list order, and the semantics tree shows checked and
+        # unchecked buttons identically — the checkmark exists only as
+        # pixels, so this scan is what keeps an already-submitted form from
+        # ever being re-selected.
+        target = None
+        inner_h = await page.evaluate("() => window.innerHeight")
+        for _scroll_try in range(6):
+            sidebar = [w for w in widgets if w.get("role") == "button"
+                       and w["bounds"]["center_x"] < 330 and w.get("label")
+                       and not any(r in w["label"].lower() for r in _AUTOPILOT_SIDEBAR_RESERVED)
+                       and w["bounds"]["center_y"] > 250
+                       and w["bounds"]["center_y"] < inner_h - 20]
+            sidebar.sort(key=lambda w: w["bounds"]["center_y"])
+            if sidebar:
+                checks = await _sidebar_checkmarks(page, sidebar)
+                open_forms = [b for b, c in zip(sidebar, checks)
+                              if not c and (b.get("label") or "") not in attempted]
+                if open_forms:
+                    target = open_forms[0]
+                    break
+            # Every on-screen form is checked (or already attempted) but the
+            # counter says more remain — scroll the sidebar list for the rest.
+            await page.mouse.move(160, inner_h // 2)
+            await page.mouse.wheel(0, 400)
+            await page.wait_for_timeout(350)
+            widgets = await extract_flutter_widgets(page)
+        if target is None:
+            report["forms"].append({"error": "no unchecked form found in the sidebar despite incomplete progress"})
             break
+        await _autopilot_click(page, target, settle=1000)
+        # Give the form time to render its first questions.
+        for _ in range(10):
+            widgets = await extract_flutter_widgets(page)
+            if _autopilot_blocks(_autopilot_panel(widgets, 330)):
+                break
+            await page.wait_for_timeout(400)
 
-        target = sidebar[min(len(report["forms"]), len(sidebar) - 1)] \
-            if len(report["forms"]) < len(sidebar) else sidebar[0]
-        await _autopilot_click(page, target, settle=900)
-
+        attempted.add(target.get("label") or "")
         form_res = await cmd_autofill_form(dict(payload))
         report["forms"].append({
             "form": target.get("label"),
@@ -1825,16 +2200,113 @@ async def cmd_autofill_visit(payload):
 
         widgets = await extract_flutter_widgets(page)
         new_progress = _autopilot_progress(widgets)
-        if new_progress == progress and not form_res.get("submitted"):
+        if new_progress == progress and not form_res.get("submit_verified"):
             report["forms"].append({"note": f"'{target.get('label')}' did not advance progress — stopping for review"})
             break
 
     widgets = await extract_flutter_widgets(page)
     report["progress"] = _autopilot_progress(widgets)
-    report["all_forms_submitted"] = bool(
-        report["progress"] and len(set(report["progress"].split("/"))) == 1)
+    parts = (report["progress"] or "0/1").split("/")
+    report["all_forms_submitted"] = len(parts) == 2 and parts[0] == parts[1]
     report["status"] = "visit_filled" if report["all_forms_submitted"] else "visit_incomplete"
     report["widgets"] = _slim_widgets(widgets)
+    return report
+
+
+async def cmd_takeover_participant(payload):
+    """TAKE OVER a participant: from the participant profile screen, starts
+    the next available visit (named in the Visit Progress card), completes
+    every form via the visit autopilot, enters the Actual visit date, executes
+    End Visit, returns to the profile, and repeats for the following visit —
+    until no next visit remains, max_visits is reached, or a visit cannot be
+    completed. Reports per-visit results."""
+    tab_index = payload.get("tab_index")
+    max_visits = int(payload.get("max_visits", 5))
+    today = time.strftime("%-m/%-d/%Y")
+
+    page = await get_active_page(tab_index=tab_index)
+    if not await is_flutter_page(page):
+        return {"error": "takeover only works on the Novatek Flutter app"}
+
+    report = {"visits": [], "status": "takeover_incomplete"}
+    profile_url = page.url
+
+    for _visit_no in range(max_visits):
+        widgets = await extract_flutter_widgets(page)
+
+        if not _autopilot_visit_ok(widgets):
+            if not _autopilot_profile_ok(widgets):
+                report["visits"].append({"error": "not on a participant profile or visit-mode screen"})
+                break
+            profile_url = page.url
+            nxt = next((w for w in widgets
+                        if (w.get("label") or "").strip().startswith("Next:")), None)
+            if not nxt:
+                report["status"] = "no_next_visit"
+                break
+            visit_name = nxt["label"].split("Next:", 1)[1].strip()
+            start_btn = next(
+                (w for w in widgets if w.get("role") == "button" and w.get("label")
+                 and (visit_name.lower() in w["label"].lower()
+                      or "start" in w["label"].lower() and "visit" in w["label"].lower())), None)
+            if start_btn is None:
+                # The start affordance is often the "Next: …" row itself.
+                start_btn = nxt
+            await _autopilot_click(page, start_btn, settle=1200)
+            await _autopilot_accept_dialog(page, extra_labels=("start", "start visit"))
+            await page.wait_for_timeout(1200)
+            widgets = await extract_flutter_widgets(page)
+            if not _autopilot_visit_ok(widgets):
+                report["visits"].append({"visit": visit_name,
+                                         "error": "could not enter visit mode from the profile"})
+                break
+        else:
+            visit_name = "(visit already in progress)"
+
+        visit_res = await cmd_autofill_visit(dict(payload))
+        entry = {"visit": visit_name,
+                 "progress": visit_res.get("progress"),
+                 "forms": visit_res.get("forms", []),
+                 "ended": False}
+
+        if not visit_res.get("all_forms_submitted"):
+            entry["error"] = "visit forms incomplete — stopping for review"
+            report["visits"].append(entry)
+            break
+
+        # Actual visit date, then End Visit.
+        widgets = await extract_flutter_widgets(page)
+        date_box = next((w for w in widgets if w.get("role") == "textbox"
+                         and "actual" in (w.get("label") or "").lower()), None)
+        if date_box is not None and not date_box.get("value"):
+            await _autopilot_type(page, date_box, today)
+            await _autopilot_accept_dialog(page)  # in case a picker opened
+            entry["actual_date"] = today
+        widgets = await extract_flutter_widgets(page)
+        end_btn = next((w for w in widgets
+                        if "end visit" in (w.get("label") or "").lower()
+                        and w.get("role") in ("button", "widget")), None)
+        if end_btn is None:
+            entry["error"] = "End Visit button not found"
+            report["visits"].append(entry)
+            break
+        await _autopilot_click(page, end_btn, settle=1000)
+        await _autopilot_accept_dialog(page, extra_labels=("end visit", "end"))
+        await page.wait_for_timeout(2000)
+        entry["ended"] = True
+        report["visits"].append(entry)
+
+        # Back to the profile for the next visit.
+        widgets = await extract_flutter_widgets(page)
+        if not _autopilot_profile_ok(widgets):
+            await cmd_open({"url": profile_url, "tab_index": tab_index})
+            await page.wait_for_timeout(2500)
+
+    ended = sum(1 for v in report["visits"] if v.get("ended"))
+    if report["status"] != "no_next_visit":
+        report["status"] = "takeover_done" if ended and all(
+            v.get("ended") for v in report["visits"]) else "takeover_incomplete"
+    report["visits_completed"] = ended
     return report
 
 
@@ -1898,6 +2370,7 @@ COMMANDS = {
     "/batch": cmd_batch,
     "/autofill_form": cmd_autofill_form,
     "/autofill_visit": cmd_autofill_visit,
+    "/takeover_participant": cmd_takeover_participant,
     "/close": cmd_close,
     "/list": cmd_list,
     "/switch_tab": cmd_switch_tab,

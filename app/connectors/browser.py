@@ -360,6 +360,24 @@ def get_browser_tools():
             },
         },
         {
+            "name": "browser_takeover_participant",
+            "description": (
+                "TAKE OVER a participant end-to-end: from the participant profile screen, starts the next "
+                "available visit (named in the Visit Progress card), completes every form via the visit "
+                "autopilot, enters the Actual visit date, executes End Visit, returns to the profile, and "
+                "repeats for the following visit — looping until no next visit remains or max_visits is hit. "
+                "One call, zero interruptions. Returns per-visit results (forms filled, progress, ended). "
+                "Requires being on the participant's profile screen (or already inside visit mode)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "max_visits": {"type": "integer", "description": "Maximum visits to complete in this call (default 5)."},
+                    "tab_index": {"type": "integer", "description": "Optional tab index to act on."},
+                },
+            },
+        },
+        {
             "name": "browser_batch_actions",
             "description": (
                 "FAST PATH for form filling: execute MANY browser/Flutter actions sequentially in ONE call — "
@@ -662,6 +680,12 @@ def execute_browser_tool(cfg, tool_name, tool_input):
                 "selector": tool_input.get("selector", ""),
                 "tab_index": tool_input.get("tab_index"),
             })
+        elif tool_name == "browser_takeover_participant":
+            # Chains whole visits — the longest-running tool in the app.
+            return _daemon_request("/takeover_participant", {
+                "max_visits": tool_input.get("max_visits"),
+                "tab_index": tool_input.get("tab_index"),
+            }, timeout=3300)
         elif tool_name == "browser_autofill_form":
             # The autopilot loops the whole form internally — allow it minutes.
             return _daemon_request("/autofill_form", {
