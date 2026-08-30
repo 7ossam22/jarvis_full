@@ -533,6 +533,23 @@ async def extract_flutter_widgets(page):
         return []
 
 
+def _slim_widgets(widgets):
+    """Compact per-widget shape sent back to the model: role/label/value plus
+    center coordinates only. The full bounds + selector_hint form roughly
+    doubled the JSON the LLM has to read every round — on a 250-widget Novatek
+    form that alone made each model turn several seconds slower."""
+    slim = []
+    for w in widgets:
+        b = w.get("bounds") or {}
+        item = {"role": w.get("role"), "x": b.get("center_x"), "y": b.get("center_y")}
+        if w.get("label"):
+            item["label"] = w["label"]
+        if w.get("value"):
+            item["value"] = w["value"]
+        slim.append(item)
+    return slim
+
+
 async def find_flutter_widget_coords(page, target):
     """Finds exact viewport (center_x, center_y) coordinates for a Flutter widget target.
 
@@ -640,7 +657,8 @@ async def cmd_flutter_widgets(payload):
         "title": title,
         "total_widgets": len(widgets),
         "active_tab_index": state["active_tab_index"],
-        "widgets": widgets,
+        "coordinate_usage": "click/type with target 'flutter:coords(x,y)'",
+        "widgets": widgets if payload.get("verbose") else _slim_widgets(widgets),
     }
 
 
@@ -1288,7 +1306,7 @@ async def cmd_get_content(payload):
             "title": title,
             "active_tab_index": state["active_tab_index"],
             "total_tabs": len(get_open_pages()),
-            "elements": flutter_widgets,
+            "elements": _slim_widgets(flutter_widgets),
             "flutter_widgets_count": len(flutter_widgets),
         }
     elif mode == "elements":
@@ -1491,8 +1509,64 @@ async def cmd_upload_file(payload):
         state["expecting_file_chooser"] = False
 
 
+async def cmd_batch(payload):
+    """Executes a sequence of actions in one HTTP request — the speed path for
+    form filling. Each LLM round-trip costs 10-25s; before this command a
+    one-question form burned 6+ of them (read, click, type, submit, verify…).
+    Now the model plans a whole screenful once and the daemon executes every
+    step back-to-back at machine speed, returning a fresh widget list in the
+    same response so no separate re-read round is needed either."""
+    actions = payload.get("actions") or []
+    return_widgets = payload.get("return_widgets", True)
+    tab_index = payload.get("tab_index")
+
+    results = []
+    for i, act in enumerate(actions):
+        cmd = str(act.get("cmd") or "").strip().lstrip("/")
+        path = f"/{cmd}"
+        handler = COMMANDS.get(path)
+        if handler is None or path == "/batch":
+            results.append({"index": i, "cmd": cmd, "ok": False, "error": "unknown batch action"})
+            continue
+        sub = {k: v for k, v in act.items() if k != "cmd"}
+        if tab_index is not None and "tab_index" not in sub:
+            sub["tab_index"] = tab_index
+        try:
+            res = await handler(sub)
+        except Exception as e:
+            res = {"error": str(e)}
+        entry = {"index": i, "cmd": cmd, "ok": "error" not in res}
+        if not entry["ok"]:
+            entry["error"] = str(res.get("error"))
+        results.append(entry)
+        # A failed click/type usually means stale coordinates; later actions in
+        # the plan would then hit the wrong targets, so stop and let the model
+        # re-plan from the fresh widget list below.
+        if not entry["ok"] and cmd in ("flutter_click", "flutter_type", "click", "type"):
+            results.append({"note": f"stopped after failed action {i}; re-plan remaining actions from the returned widgets"})
+            break
+
+    out = {
+        "status": "batch_done",
+        "requested": len(actions),
+        "executed": sum(1 for r in results if "cmd" in r),
+        "results": results,
+    }
+    if return_widgets:
+        try:
+            page = await get_active_page(tab_index=tab_index)
+            if await is_flutter_page(page):
+                out["widgets"] = _slim_widgets(await extract_flutter_widgets(page))
+                out["coordinate_usage"] = "click/type with target 'flutter:coords(x,y)'"
+            out["url"] = page.url
+        except Exception as e:
+            out["widgets_error"] = str(e)
+    return out
+
+
 COMMANDS = {
     "/open": cmd_open,
+    "/batch": cmd_batch,
     "/close": cmd_close,
     "/list": cmd_list,
     "/switch_tab": cmd_switch_tab,

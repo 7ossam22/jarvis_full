@@ -325,6 +325,57 @@ def get_browser_tools():
             },
         },
         {
+            "name": "browser_batch_actions",
+            "description": (
+                "FAST PATH for form filling: execute MANY browser/Flutter actions sequentially in ONE call — "
+                "clicks, typing, key presses, scrolls, file uploads — then get back a fresh Flutter widget list "
+                "in the same response. Use this instead of separate browser_flutter_click / browser_flutter_type / "
+                "browser_scroll calls whenever you already know every step (e.g. answering all visible form "
+                "questions top-to-bottom and scrolling). Each action is an object with 'cmd' plus that command's "
+                "normal parameters. Available cmds: 'flutter_click' (target), 'flutter_type' (target, text), "
+                "'click' (selector), 'type' (selector, text), 'press_key' (key), 'scroll' (direction, amount), "
+                "'upload_file' (file_path). Actions run strictly in order; on a failed click/type the batch stops "
+                "and returns fresh widgets so you can re-plan. The response's 'widgets' list reflects the page "
+                "AFTER all actions ran — use it directly instead of calling browser_flutter_get_widgets again."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "description": "Ordered list of actions to execute.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "cmd": {
+                                    "type": "string",
+                                    "enum": ["flutter_click", "flutter_type", "click", "type", "press_key", "scroll", "upload_file"],
+                                    "description": "Which action to run.",
+                                },
+                                "target": {"type": "string", "description": "Flutter widget target for flutter_click/flutter_type, e.g. 'flutter:coords(850,420)' or a label."},
+                                "selector": {"type": "string", "description": "CSS selector for click/type on standard DOM pages."},
+                                "text": {"type": "string", "description": "Text to type for flutter_type/type."},
+                                "key": {"type": "string", "description": "Key for press_key, e.g. 'Enter', 'Tab'."},
+                                "direction": {"type": "string", "description": "Scroll direction: down, up, top, bottom."},
+                                "amount": {"type": "integer", "description": "Scroll amount in pixels (default 500)."},
+                                "file_path": {"type": "string", "description": "Absolute file path for upload_file."},
+                            },
+                            "required": ["cmd"],
+                        },
+                    },
+                    "return_widgets": {
+                        "type": "boolean",
+                        "description": "Include a fresh Flutter widget list in the response (default true).",
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Optional tab index to act on.",
+                    },
+                },
+                "required": ["actions"],
+            },
+        },
+        {
             "name": "browser_scroll",
             "description": (
                 "Scroll the active browser page up, down, to the top, or to the bottom, or scroll a specific element / Flutter widget into view."
@@ -576,6 +627,14 @@ def execute_browser_tool(cfg, tool_name, tool_input):
                 "selector": tool_input.get("selector", ""),
                 "tab_index": tool_input.get("tab_index"),
             })
+        elif tool_name == "browser_batch_actions":
+            # A batch runs many sequential page actions — give it far longer
+            # than the single-action timeout before declaring it dead.
+            return _daemon_request("/batch", {
+                "actions": tool_input.get("actions") or [],
+                "return_widgets": tool_input.get("return_widgets", True),
+                "tab_index": tool_input.get("tab_index"),
+            }, timeout=240)
         elif tool_name == "browser_scroll":
             return _daemon_request("/scroll", {
                 "direction": tool_input.get("direction", "down"),
