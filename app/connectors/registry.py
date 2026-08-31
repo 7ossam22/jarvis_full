@@ -438,19 +438,24 @@ def _register_builtin_connectors(reg: ToolRegistry) -> None:
 
     Access policy, per bundle:
 
-      browser, system   only_llm=True — these drive the user's real desktop:
-                        a visible browser, shell commands, volume, screenshots,
-                        app launching. Restricted to locally hosted models.
+      browser, system   only_llm=True, with Anthropic and Gemini named
+                        explicitly in LOCAL_ONLY_ALLOWED_PROVIDERS. These drive
+                        the user's real desktop — a visible browser, shell
+                        commands, volume, screenshots, app launching — so they
+                        stay gated rather than open, but the two cloud backends
+                        in use here are trusted with them: the Novatek
+                        automation flows in app/persona.py have to run on
+                        whichever provider answers, and Gemini's 500-round tool
+                        loop exists specifically to drive them.
       gmail, discord,   only_llm=False — these reach an external API the user
       jira              has already granted a scoped token for, and the hosted
                         models are the ones with the reasoning to use them well.
 
-    NOTE — the browser/system restriction hides every ``browser_*``,
-    ``flutter_*`` and ``system_*`` tool from the Anthropic and Gemini backends,
-    which disables the Novatek automation flows on those providers (see the
-    Novatek rules in app/persona.py). To restore them while keeping the gate,
-    set LOCAL_ONLY_ALLOWED_PROVIDERS below to the providers you trust, e.g.
-    ``[ANTHROPIC, GEMINI]``.
+    Keeping only_llm=True with an explicit allowlist, rather than flipping to
+    only_llm=False, is deliberate: a provider added later is denied desktop
+    control by default and has to be named here on purpose. To lock these tools
+    back down to locally hosted models, set LOCAL_ONLY_ALLOWED_PROVIDERS to
+    None — nothing else needs to change.
     """
     from .browser import get_browser_tools, execute_browser_tool
     from .discord import get_discord_tools, execute_discord_tool
@@ -458,9 +463,11 @@ def _register_builtin_connectors(reg: ToolRegistry) -> None:
     from .jira import get_jira_tools, execute_jira_tool
     from .system import get_system_tools, execute_system_tool
 
-    LOCAL_ONLY_ALLOWED_PROVIDERS: list[str] | None = None
+    # Set the list of allowed providers for the desktop control tools,
+    # If LOCAL_ONLY_ALLOWED_PROVIDERS: list[str] | None = None that means no restriction
+    LOCAL_ONLY_ALLOWED_PROVIDERS: list[str] | None = [ANTHROPIC, GEMINI]
 
-    # Desktop control — local models only.
+    # Desktop control — gated, with the trusted cloud providers named above.
     # No prefix filter on the browser bundle: it also owns `system_open` and
     # `flutter_run_test`, both of which were unreachable under the old
     # prefix-matching routing.
