@@ -19,13 +19,14 @@ def call_anthropic(cfg, system_prompt, messages):
     api_key = cfg.get("model.provider_api_key")
     model = cfg.get("model.model_id") or "claude-sonnet-5"
 
-    # web_search is Anthropic's own server-side tool, so it is declared here
-    # rather than in the registry; everything else is registry-owned and
-    # already filtered to what this provider is permitted to see.
-    tools: list[dict] = [
-        {"type": "web_search_20260209", "name": "web_search", "max_uses": 3}
-    ]
-    tools.extend(registry.get_tools_for_provider(ANTHROPIC))
+    # Every tool comes from the registry, already filtered to what this
+    # provider may see and in Anthropic's wire shape. Anthropic's server-side
+    # `web_search` used to be declared here as well; it was removed when
+    # app/connectors/web_search.py registered a `web_search` of its own —
+    # two tools sharing a name in one request is an API validation error, and
+    # a single locally-executed search keeps behaviour identical across all
+    # three backends instead of varying by whoever answered.
+    tools: list[dict] = registry.get_tools_for_provider(ANTHROPIC)
 
     curr_messages = list(messages)
     payload_dict = {

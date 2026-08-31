@@ -39,11 +39,13 @@ def call_gemini(cfg, system_prompt, messages):
     api_key = cfg.get("model.gemini_api_key")
     model = cfg.get("model.gemini_model_id") or DEFAULT_MODEL
 
-    # google_search is Gemini's own server-side tool; the declarations come from
-    # the registry already converted to Gemini's shape and filtered to what this
-    # provider is permitted to see.
+    # Every tool comes from the registry, already converted to Gemini's shape
+    # and filtered to what this provider may see. Gemini's own server-side
+    # `google_search` used to sit alongside these; it was removed when
+    # app/connectors/web_search.py made search a locally-executed registry tool,
+    # so all three backends now search identically rather than each using
+    # whatever their vendor happened to provide.
     tools = [
-        {"google_search": {}},
         {"function_declarations": registry.get_tools_for_provider(GEMINI)},
     ]
 
@@ -52,10 +54,12 @@ def call_gemini(cfg, system_prompt, messages):
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
         "tools": tools,
-        # Required as of the current API whenever a built-in tool (google_search)
-        # is combined with custom function_declarations in one request — without
-        # it Gemini rejects the call with a 400 INVALID_ARGUMENT.
-        "tool_config": {"include_server_side_tool_invocations": True},
+        # NOTE: "tool_config": {"include_server_side_tool_invocations": True}
+        # used to be required here, but only because a built-in tool
+        # (google_search) was combined with custom function_declarations in one
+        # request. With no built-in tool left in the payload that condition no
+        # longer holds, so it is gone; restore it if a server-side tool is ever
+        # added back alongside the declarations.
     }
 
     url = f"{API_BASE}/{model}:generateContent?key={api_key}"

@@ -41,6 +41,8 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
+from .web_search import WEB_SEARCH_SCHEMA, execute_web_search
+
 # ---------------------------------------------------------------------------
 # Types & provider identifiers
 # ---------------------------------------------------------------------------
@@ -490,3 +492,24 @@ def _register_builtin_connectors(reg: ToolRegistry) -> None:
 
 
 _register_builtin_connectors(registry)
+
+
+# ---------------------------------------------------------------------------
+# Standalone tools
+# ---------------------------------------------------------------------------
+
+# Web search is read-only, touches nothing on the machine, and is the one
+# capability every backend needs — so it is open to all of them. It replaces
+# the provider-native search tools (Anthropic's server-side `web_search`,
+# Gemini's `google_search`), which gave three different behaviours and left a
+# local LM Studio model with none at all. Registering it under the name
+# `web_search` is also why the Anthropic provider no longer declares its own:
+# two tools of that name in one request is an API error.
+registry.register(
+    WEB_SEARCH_SCHEMA["name"],
+    WEB_SEARCH_SCHEMA["description"],
+    WEB_SEARCH_SCHEMA["input_schema"],
+    execute_web_search,
+    only_llm=False,
+    allowed_providers=[ANTHROPIC, GEMINI, LMSTUDIO],
+)
