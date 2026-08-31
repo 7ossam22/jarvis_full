@@ -113,6 +113,110 @@ won't cut it), and optionally an
    Open **http://127.0.0.1:4700** in Chrome, click **Wake JARVIS** (browsers
    block audio until you interact with the page once), and fly around.
 
+## Running this on another machine
+
+Everything secret comes from `config.json` (gitignored) or environment
+variables — nothing is baked into the source. But a few **absolute paths and
+host-specific values are still hardcoded**, so a fresh clone needs the steps
+below before the browser/Novatek automation will work.
+
+### 1. Prerequisites
+
+- **Python 3.12+** — standard library only for the server itself, no pip install.
+- **Google Chrome** — required for the mic and voice; Safari/Firefox won't work.
+- **Playwright + Chromium**, only if you want the browser/Flutter automation:
+
+  ```bash
+  ./tools/setup_browser.sh
+  ```
+
+  This creates `.venv-browser/` and downloads Chromium into `~/.cache/ms-playwright`.
+  No sudo. The server starts `tools/browser_daemon.py` from that venv on demand
+  (localhost:4701) — you never launch it yourself.
+
+### 2. Create `config.json`
+
+```bash
+cp config.example.json config.json
+```
+
+`config.json` is deep-merged over `config.example.json`, so include only what
+you actually override. Any value still reading `YOUR-…` or `PUT-YOUR-…` is
+treated as *unset*, never as a real credential.
+
+```json
+{
+  "model":   { "provider": "anthropic", "provider_api_key": "sk-ant-..." },
+  "voice":   { "tts_provider": "elevenlabs", "elevenlabs_api_keys": ["sk_..."] },
+  "gmail":   { "access_token": "ya29...." },
+  "discord": { "bot_token": "..." },
+  "jira":    { "domain": "https://you.atlassian.net", "email": "you@example.com", "api_token": "ATATT..." },
+  "novatek": { "username": "...", "password": "..." }
+}
+```
+
+Every connector is optional and degrades gracefully — an unconfigured one
+reports that it needs setting up rather than failing the whole turn.
+
+### 3. Or supply secrets as environment variables
+
+Useful for CI, containers, or keeping credentials out of files entirely.
+**`config.json` wins where both are set.** These are read by the connectors
+and by `Config.novatek_credentials()`:
+
+| Variable | Replaces |
+|---|---|
+| `GMAIL_ACCESS_TOKEN` | `gmail.access_token` |
+| `DISCORD_BOT_TOKEN` | `discord.bot_token` |
+| `JIRA_DOMAIN`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | the `jira` section |
+| `NOVATEK_USERNAME`, `NOVATEK_PASSWORD` | the `novatek` section |
+
+The Anthropic / Gemini / ElevenLabs keys have **no** environment-variable
+path — those must go in `config.json`.
+
+The browser daemon inherits the server's environment, so exporting
+`NOVATEK_*` before `python3 server.py` reaches the form autopilot too.
+
+### 4. Fix the hardcoded host paths
+
+These are the only values that genuinely will not work on another machine.
+Skip any whose feature you don't use.
+
+| File and line | Change it to |
+|---|---|
+| `app/persona.py:59` and `:66` | The absolute path of the PDF used to answer File Upload questions |
+| `tools/browser_daemon.py:1749` | Same PDF path — the autopilot's fallback default |
+| `tools/browser_daemon.py:84-87` | Your Flutter SDK paths, or delete the list if you never run `flutter_run_test` |
+| `app/persona.py:40` | The example Chrome profile names (`Hossam`, `Doxx`, …) — replace with yours, or run `browser_list_profiles` to discover them |
+| `app/http_server.py` `NOTES_DIR` | Point the live server at your own notes vault instead of `notes/` |
+
+The Novatek portal URL (`https://nec-dev.autotrial.app`, `app/persona.py:41-42`)
+is deployment-specific too — change it if you target a different instance, and
+delete the whole Novatek rules block from `RULES_TEMPLATE` if you don't use it
+at all.
+
+### 5. Launch and verify
+
+```bash
+python3 server.py
+```
+
+Open **http://127.0.0.1:4700** in Chrome and click **Wake JARVIS**.
+
+To confirm what the machine actually resolved:
+
+```bash
+python3 -c "import sys; sys.path.insert(0,'.'); from app.config import Config; \
+c=Config.load(); print('LLM key:', c.has_real_api_key()); \
+print('Novatek:', c.novatek_credentials()[0] or 'not configured')"
+```
+
+> **Before exposing it:** `server.bind` defaults to `0.0.0.0`, which reaches
+> your whole LAN, and the server has **no authentication on any endpoint**.
+> `POST /chat` can reach your configured Gmail, Discord, Jira and Novatek
+> credentials, plus `system_run_command`. On any shared or untrusted network,
+> set `"server": { "bind": "127.0.0.1" }` in `config.json`.
+
 ## Configuring JARVIS
 
 Almost every behavior tunable lives in `config.json` — see

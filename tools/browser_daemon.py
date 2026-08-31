@@ -1698,6 +1698,13 @@ async def _autopilot_first_dropdown_option(page, before_widgets):
 
 async def _autopilot_sign(page, w, username, password, report):
     """Clicks a Sign button and completes the credentials dialog."""
+    if not username or not password:
+        # Signing with blank fields would confirm an empty dialog and look like
+        # a success — leave the question unresolved so the caller reports it.
+        report["unresolved"].append(
+            "signature question: no Novatek login configured (set novatek.username / "
+            "novatek.password in config.json, or NOVATEK_USERNAME / NOVATEK_PASSWORD)")
+        return
     await _autopilot_click(page, w, settle=700)
     widgets = await extract_flutter_widgets(page)
     dialog_present = any(x.get("role") == "dialog" for x in widgets)
@@ -1740,8 +1747,12 @@ async def cmd_autofill_form(payload):
     text_value = payload.get("text_value") or "test"
     number_value = str(payload.get("number_value") or "55")
     file_path = payload.get("file_path") or "/home/proslayer/AndroidStudioProjects/jarvis_full/Informed_Consent Template.pdf"
-    username = payload.get("username") or "Admin"
-    password = payload.get("password") or "nursenurse123"
+    # No credential lives in this file. The JARVIS connector resolves the login
+    # from config/env and sends it in the payload; the env vars are the fallback
+    # for driving this daemon directly. Empty means the signature step will
+    # report an unresolved question rather than signing as a guessed user.
+    username = payload.get("username") or os.environ.get("NOVATEK_USERNAME") or ""
+    password = payload.get("password") or os.environ.get("NOVATEK_PASSWORD") or ""
     min_x = int(payload.get("panel_min_x", 330))
     max_rounds = int(payload.get("max_rounds", 100))
     tab_index = payload.get("tab_index")

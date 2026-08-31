@@ -6,6 +6,11 @@ RULES text stays in code — it's mechanically tied to server-side parsing
 (app/images.py's IMAGE-line contract) and must stay in sync with it, so
 it isn't a safe thing to expose as freeform config. persona.system_prompt_extra
 is the escape hatch for tone tweaks that don't need code changes.
+
+The one secret the RULES text needs — the Novatek portal login used by the
+form/visit automation flows — is injected at format time from
+novatek.username / novatek.password (or NOVATEK_USERNAME / NOVATEK_PASSWORD),
+never hardcoded here; see _novatek_credentials below.
 """
 
 RULES_TEMPLATE = """
@@ -37,7 +42,7 @@ Rules:
   - Navigate to `https://nec-dev.autotrial.app` using `browser_open_url`.
   - Inspect and state the app type using `browser_detect_app_type` (discovering it is built with Flutter Web).
   - Check that it opens on the login screen and verify if a loading indicator animation is active. If no loading animation is happening, it indicates it is ready for login credentials.
-  - Enter the admin credentials: username `Admin` and password `nursenurse123` using `browser_flutter_type` or `browser_type`.
+  - Enter the admin credentials: username `{novatek_username}` and password `{novatek_password}` using `browser_flutter_type` or `browser_type`.
   - Click the login button via `browser_flutter_click` or `browser_click`.
   - Confirm successful login and navigation to the dashboard screen.
 - When the user asks to fill a form or execute "Fill current form" in Novatek (e.g. "fill current form", "fill form in Novatek", "complete the form"):
@@ -52,13 +57,13 @@ Rules:
      - Number Question: Always enter 55.
      - Question with Unit: Enter 55 in the number field, and from the units dropdown on the right of the number field, select the first item from the dropdown.
      - File Upload Question: Prefer `browser_upload_file` with file_path '/home/proslayer/AndroidStudioProjects/jarvis_full/Informed_Consent Template.pdf'. If the upload card is instead clicked directly and a file chooser opens, the system intercepts it and auto-selects the first available PDF automatically — it never blocks, so just continue. After the file is attached, on the calendar picker select today's/now date, and on the time picker select the current time.
-     - Signature Question: Click the "Sign" button on the right side of the question card, enter credentials in the dialog (username: 'Admin', password: 'nursenurse123' from the Open Novatek flow), and confirm.
+     - Signature Question: Click the "Sign" button on the right side of the question card, enter credentials in the dialog (username: '{novatek_username}', password: '{novatek_password}' from the Open Novatek flow), and confirm.
   3. Scroll Loop Until Fully Complete: Forms are often LONG (20+ questions). Because every batch ends with its scroll action, each `browser_batch_actions` response hands you the next screenful's widgets directly — answer those with the next batch, and repeat this one-batch-per-screenful loop for as many rounds as it takes. NEVER stop early, never give up mid-form, and never skip a question. If a batch action fails, the batch stops and returns fresh widgets — retry that step once from the fresh coordinates, then continue. If a scroll reveals no new questions and no Submit button, scroll once more before concluding the bottom is reached.
   4. Submission & Verification: Only after the Submit button is visible AND no unanswered question remains above it, click Submit via a final `browser_batch_actions` call with the single submit click — its returned widgets show the top-right success banner ('Success') in the same response, no extra read needed. The banner alone is NOT final proof: after submitting, re-read the widgets and confirm the selected form now shows its completion checkmark — ONLY that checkmark proves the form was truly submitted. If the checkmark has not appeared, the form is NOT done: scroll back through it to find what is still unanswered, answer it, and submit again. Never declare a form complete, and never move on, without its checkmark.
 - When the user asks to complete a visit in Novatek (e.g. "complete the visit", "complete current visit", "complete the screening visit", "finish this visit"):
   0. AUTOPILOT FIRST (fastest, always try this before anything else): on the Visit Mode screen, invoke `browser_autofill_visit` — ONE call walks the sidebar Forms list, fills and submits every form, and returns per-form results plus the final N/M progress counter. If it reports all_forms_submitted true (progress full, e.g. '4/4'), fill the Actual visit date field if still empty (type today's date as 'M/D/YYYY' via one `browser_batch_actions` call), then perform the End Visit action and report the tally. If some forms came back unresolved or incomplete, finish only those with the manual flow below. Only fall back entirely if the autopilot errors out.
   1. Form Survey: With the visit open, read the visit's form list with `browser_flutter_get_widgets` (or `browser_get_content` mode 'flutter_widgets'). Each form row shows a completion checkmark on its right side when already done — ALWAYS check for that existing checkmark FIRST and skip any form that has one.
-  2. Fill Each Incomplete Form (STRICT top-to-bottom order over the form list): Select the first form without a checkmark, then execute the ENTIRE "Fill current form" procedure above on it — same rules exactly: batched sequential answering top-to-bottom, text "test", number 55, first choice/checkbox/dropdown option, current date/time, the Informed Consent PDF ('/home/proslayer/AndroidStudioProjects/jarvis_full/Informed_Consent Template.pdf') for file uploads, Signature via the Sign button with credentials Admin / nursenurse123, and the answer-then-scroll loop until fully filled. Click Submit only when every question is answered, and verify the top-right success notification.
+  2. Fill Each Incomplete Form (STRICT top-to-bottom order over the form list): Select the first form without a checkmark, then execute the ENTIRE "Fill current form" procedure above on it — same rules exactly: batched sequential answering top-to-bottom, text "test", number 55, first choice/checkbox/dropdown option, current date/time, the Informed Consent PDF ('/home/proslayer/AndroidStudioProjects/jarvis_full/Informed_Consent Template.pdf') for file uploads, Signature via the Sign button with credentials {novatek_username} / {novatek_password}, and the answer-then-scroll loop until fully filled. Click Submit only when every question is answered, and verify the top-right success notification.
   3. Next Form Loop (checkmark-gated, NON-NEGOTIABLE): You may NOT move to another form unless the form you are currently in shows its completion checkmark — the checkmark is the ONLY proof of successful submission. After submitting, navigate back to the visit's form list, re-read the widgets (never reuse pre-navigation coordinates), and confirm the checkmark on the form you just filled. If it is missing, re-open that same form, find and answer whatever is still unanswered, and re-submit — repeat until the checkmark appears. Only then repeat step 2 on the next form without a checkmark. Scroll the form list down if more forms may be below. NEVER stop early and never skip an incomplete form.
   4. Visit Completion & Verification (progress-gated): The visit's form-progress indicator (e.g. "17/20") is the completion authority. End the visit ONLY when that progress counter shows all forms submitted (e.g. "20/20") AND every form in the list shows its completion checkmark — if the counter reads anything less, forms remain: re-survey the list, complete them, and check again. Once the counter is full (e.g. "20/20"), perform the end-visit action, then report the final tally along with any form that could not be completed and why.
 - When the user asks to take over a participant in Novatek (e.g. "take over this participant", "take over participant 100-013-463", "complete all visits for this participant", "run the participant to the end"):
@@ -133,6 +138,18 @@ Rules:
 
 
 
+NOVATEK_UNSET = "NOT-CONFIGURED"
+
+
+def _novatek_credentials(cfg):
+    """Config.novatek_credentials, mapped onto the placeholder the RULES text
+    is formatted with when no login is configured."""
+    username, password = cfg.novatek_credentials()
+    if not username:
+        return NOVATEK_UNSET, NOVATEK_UNSET
+    return username, password
+
+
 def build_system_prompt(cfg):
     name = cfg.get("persona.name", "JARVIS")
     address_term = cfg.get("persona.address_term", "sir")
@@ -146,7 +163,22 @@ def build_system_prompt(cfg):
         f'assistant. Address the user as "{address_term}" occasionally — not every '
         "sentence, that gets tedious. One genuinely funny line beats three bland ones."
     )
-    prompt = intro + "\n" + RULES_TEMPLATE.format(address_term=address_term, max_gallery=max_gallery)
+    novatek_username, novatek_password = _novatek_credentials(cfg)
+
+    prompt = intro + "\n" + RULES_TEMPLATE.format(
+        address_term=address_term,
+        max_gallery=max_gallery,
+        novatek_username=novatek_username,
+        novatek_password=novatek_password,
+    )
+    if novatek_username == NOVATEK_UNSET:
+        prompt += (
+            "\n- The Novatek portal credentials are NOT configured on this machine. If a "
+            "Novatek flow above asks you to log in or sign, do not invent or guess a login: "
+            "stop and tell the user to set 'novatek.username' and 'novatek.password' in "
+            "config.json (or the NOVATEK_USERNAME / NOVATEK_PASSWORD environment "
+            "variables).\n"
+        )
     if extra:
         prompt += f"\n{extra}\n"
     return prompt

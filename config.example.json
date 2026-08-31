@@ -67,6 +67,10 @@
   "discord": {
     "bot_token": "YOUR-DISCORD-BOT-TOKEN"
   },
+  "novatek": {
+    "username": "YOUR-NOVATEK-USERNAME",
+    "password": "YOUR-NOVATEK-PASSWORD"
+  },
   "gmail": {
     "access_token": "YOUR-GMAIL-OAUTH-ACCESS-TOKEN"
   }

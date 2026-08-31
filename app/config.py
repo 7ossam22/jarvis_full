@@ -63,6 +63,25 @@ class Config:
         key = self.get("model.provider_api_key", "")
         return bool(key) and "PUT-YOUR-KEY-HERE" not in key and key.strip() != ""
 
+    def novatek_credentials(self):
+        """The Novatek portal login used by the browser automation flows, as
+        (username, password) — or (None, None) when unset. Config first, then
+        NOVATEK_USERNAME / NOVATEK_PASSWORD, mirroring how the Gmail/Jira/
+        Discord connectors resolve their own secrets. config.example.json is
+        the defaults layer this merges over, so its "YOUR-…" placeholder is
+        rejected here the same way has_real_api_key rejects its own."""
+        def pick(config_key, env_key):
+            value = (self.get(config_key) or "").strip()
+            if value.startswith("YOUR-") or value.startswith("PUT-YOUR"):
+                value = ""
+            return value or (os.environ.get(env_key) or "").strip()
+
+        username = pick("novatek.username", "NOVATEK_USERNAME")
+        password = pick("novatek.password", "NOVATEK_PASSWORD")
+        if not username or not password:
+            return None, None
+        return username, password
+
     def public_dict(self):
         """Only what the browser needs — never provider_api_key or
         elevenlabs_api_key. Curated explicitly (not filtered from the full

@@ -591,6 +591,18 @@ def _ensure_daemon():
     return f"The browser daemon failed to start — see {DAEMON_LOG}."
 
 
+def _novatek_payload(cfg, extra=None):
+    """The autopilot endpoints sign forms as the Novatek user, so they need the
+    login. It is resolved here from config/env and passed per call — the daemon
+    holds no credential of its own."""
+    username, password = cfg.novatek_credentials()
+    payload = dict(extra or {})
+    if username:
+        payload["username"] = username
+        payload["password"] = password
+    return payload
+
+
 def execute_browser_tool(cfg, tool_name, tool_input):
     """Executes a browser, Flutter automation, or system UI tool call."""
     try:
@@ -682,19 +694,19 @@ def execute_browser_tool(cfg, tool_name, tool_input):
             })
         elif tool_name == "browser_takeover_participant":
             # Chains whole visits — the longest-running tool in the app.
-            return _daemon_request("/takeover_participant", {
+            return _daemon_request("/takeover_participant", _novatek_payload(cfg, {
                 "max_visits": tool_input.get("max_visits"),
                 "tab_index": tool_input.get("tab_index"),
-            }, timeout=3300)
+            }), timeout=3300)
         elif tool_name == "browser_autofill_form":
             # The autopilot loops the whole form internally — allow it minutes.
-            return _daemon_request("/autofill_form", {
+            return _daemon_request("/autofill_form", _novatek_payload(cfg, {
                 "tab_index": tool_input.get("tab_index"),
-            }, timeout=420)
+            }), timeout=420)
         elif tool_name == "browser_autofill_visit":
-            return _daemon_request("/autofill_visit", {
+            return _daemon_request("/autofill_visit", _novatek_payload(cfg, {
                 "tab_index": tool_input.get("tab_index"),
-            }, timeout=580)
+            }), timeout=580)
         elif tool_name == "browser_batch_actions":
             # A batch runs many sequential page actions — give it far longer
             # than the single-action timeout before declaring it dead.

@@ -21,8 +21,8 @@ When instructed to open Novatek (e.g. "open Novatek", "launch Novatek portal", "
    - Check if a loading indicator animation (spinner/progress bar) is currently active.
    - If no loading animation is happening, it indicates that the system is ready and waiting for user credentials to be entered.
 4. **Credential Entry & Submission**:
-   - **Admin Username**: `Admin`
-   - **Admin Password**: `nursenurse123`
+   - **Admin Username**: from `novatek.username` in `config.json` (or `NOVATEK_USERNAME`)
+   - **Admin Password**: from `novatek.password` in `config.json` (or `NOVATEK_PASSWORD`)
    - Type the credentials into the corresponding Flutter input fields (`browser_flutter_type` or `browser_type` on `Username`/`Password`).
    - Click the **Login** button (`browser_flutter_click` or `browser_click`).
 5. **Dashboard Verification**:

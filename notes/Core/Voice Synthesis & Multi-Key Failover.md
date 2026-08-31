@@ -22,8 +22,8 @@ Configured in `config.json`:
   "voice": {
     "tts_provider": "elevenlabs",
     "elevenlabs_api_keys": [
-      "sk_ba0c2f8214d75333c082be11c23cb26219f7ac23e1d28a5a",
-      "sk_d09eb9c9d2c913c1b701f5b18fb68fb62617b3af7c565836"
+      "PUT-YOUR-ELEVENLABS-KEY-HERE",
+      "PUT-YOUR-BACKUP-ELEVENLABS-KEY-HERE"
     ],
     "elevenlabs_voice_id": "JBFqnCBsd6RMkjVDRZzb"
   }

@@ -54,8 +54,8 @@ When the user commands JARVIS to **"Fill current form"** (or "fill form in Novat
 - **Action**:
   1. Click the **Sign** button situated on the right side of the question card.
   2. In the signature verification dialog that opens, enter the credentials from [[Novatek Web Application]]:
-     - **Username**: `Admin`
-     - **Password**: `nursenurse123`
+     - **Username**: from `novatek.username` in `config.json` (or `NOVATEK_USERNAME`)
+     - **Password**: from `novatek.password` in `config.json` (or `NOVATEK_PASSWORD`)
   3. Submit / confirm the signature dialog.
 
 ### 10. Form Submission & Success Verification
