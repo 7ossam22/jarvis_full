@@ -17,39 +17,10 @@ import urllib.error
 import urllib.request
 
 from .llm import LLMProvider
-from ..connectors.gmail import get_gmail_tools, execute_gmail_tool
-from ..connectors.discord import get_discord_tools, execute_discord_tool
-from ..connectors.browser import get_browser_tools, execute_browser_tool
-from ..connectors.system import get_system_tools, execute_system_tool
-from ..connectors.jira import get_jira_tools, execute_jira_tool
+from ..connectors.registry import GEMINI, registry
 
 DEFAULT_MODEL = "gemini-flash-latest"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-
-
-def _to_gemini_schema(tools):
-    """Anthropic-style tool specs ({"name", "description", "input_schema"})
-    to Gemini's functionDeclarations ({"name", "description", "parameters"}).
-    Both use an OpenAPI-subset JSON Schema for the parameter object, so this
-    is a rename, not a translation."""
-    return [
-        {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}
-        for t in tools
-    ]
-
-
-def _execute_tool(cfg, tool_name, tool_input):
-    if tool_name.startswith("gmail_"):
-        return execute_gmail_tool(cfg, tool_name, tool_input)
-    elif tool_name.startswith("discord_"):
-        return execute_discord_tool(cfg, tool_name, tool_input)
-    elif tool_name.startswith("browser_") or tool_name == "system_open":
-        return execute_browser_tool(cfg, tool_name, tool_input)
-    elif tool_name.startswith("system_"):
-        return execute_system_tool(cfg, tool_name, tool_input)
-    elif tool_name.startswith("jira_"):
-        return execute_jira_tool(cfg, tool_name, tool_input)
-    return {"error": f"Tool {tool_name} not found"}
 
 
 def _to_gemini_contents(messages):
@@ -68,10 +39,12 @@ def call_gemini(cfg, system_prompt, messages):
     api_key = cfg.get("model.gemini_api_key")
     model = cfg.get("model.gemini_model_id") or DEFAULT_MODEL
 
-    tool_specs = get_gmail_tools() + get_discord_tools() + get_browser_tools() + get_system_tools() + get_jira_tools()
+    # google_search is Gemini's own server-side tool; the declarations come from
+    # the registry already converted to Gemini's shape and filtered to what this
+    # provider is permitted to see.
     tools = [
         {"google_search": {}},
-        {"function_declarations": _to_gemini_schema(tool_specs)},
+        {"function_declarations": registry.get_tools_for_provider(GEMINI)},
     ]
 
     contents = _to_gemini_contents(messages)
@@ -133,7 +106,7 @@ def call_gemini(cfg, system_prompt, messages):
             for call in function_calls:
                 tool_name = call.get("name", "")
                 tool_input = call.get("args") or {}
-                result_data = _execute_tool(cfg, tool_name, tool_input)
+                result_data = registry.dispatch(tool_name, tool_input, GEMINI, cfg)
                 response_parts.append({
                     "functionResponse": {
                         "name": tool_name,

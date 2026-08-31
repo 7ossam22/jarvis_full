@@ -12,25 +12,20 @@ import urllib.error
 import urllib.request
 
 from .llm import LLMProvider
-from ..connectors.gmail import get_gmail_tools, execute_gmail_tool
-from ..connectors.discord import get_discord_tools, execute_discord_tool
-from ..connectors.browser import get_browser_tools, execute_browser_tool
-from ..connectors.system import get_system_tools, execute_system_tool
-from ..connectors.jira import get_jira_tools, execute_jira_tool
+from ..connectors.registry import ANTHROPIC, registry
 
 
 def call_anthropic(cfg, system_prompt, messages):
     api_key = cfg.get("model.provider_api_key")
     model = cfg.get("model.model_id") or "claude-sonnet-5"
 
-    tools = [
+    # web_search is Anthropic's own server-side tool, so it is declared here
+    # rather than in the registry; everything else is registry-owned and
+    # already filtered to what this provider is permitted to see.
+    tools: list[dict] = [
         {"type": "web_search_20260209", "name": "web_search", "max_uses": 3}
     ]
-    tools.extend(get_gmail_tools())
-    tools.extend(get_discord_tools())
-    tools.extend(get_browser_tools())
-    tools.extend(get_system_tools())
-    tools.extend(get_jira_tools())
+    tools.extend(registry.get_tools_for_provider(ANTHROPIC))
 
     curr_messages = list(messages)
     payload_dict = {
@@ -73,18 +68,7 @@ def call_anthropic(cfg, system_prompt, messages):
                     tool_name = block.get("name")
                     tool_input = block.get("input", {})
 
-                    if tool_name.startswith("gmail_"):
-                        result_data = execute_gmail_tool(cfg, tool_name, tool_input)
-                    elif tool_name.startswith("discord_"):
-                        result_data = execute_discord_tool(cfg, tool_name, tool_input)
-                    elif tool_name.startswith("browser_") or tool_name == "system_open":
-                        result_data = execute_browser_tool(cfg, tool_name, tool_input)
-                    elif tool_name.startswith("system_"):
-                        result_data = execute_system_tool(cfg, tool_name, tool_input)
-                    elif tool_name.startswith("jira_"):
-                        result_data = execute_jira_tool(cfg, tool_name, tool_input)
-                    else:
-                        result_data = {"error": f"Tool {tool_name} not found"}
+                    result_data = registry.dispatch(tool_name, tool_input, ANTHROPIC, cfg)
 
                     tool_results.append({
                         "type": "tool_result",
@@ -123,17 +107,9 @@ def _decide_connector_action(cfg, messages):
     transcript = "\n\n".join(
         f"{m['role'].upper()}: {m['content']}" for m in messages[-6:]
     )
-    tool_specs = (
-        get_gmail_tools()
-        + get_discord_tools()
-        + get_browser_tools()
-        + get_system_tools()
-        + get_jira_tools()
-    )
-    tools_desc = json.dumps(
-        [{"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]}
-         for t in tool_specs]
-    )
+    # Exactly the tools this provider is allowed to invoke — offering any more
+    # would let the router pick one that dispatch would then refuse.
+    tools_desc = json.dumps(registry.get_tools_for_provider(ANTHROPIC))
     sys_p = (
         "You are the tool-routing brain for a voice assistant. Given a conversation, decide "
         "whether the LAST user turn requires calling one of these tools:\n" + tools_desc + "\n\n"
@@ -177,18 +153,7 @@ def call_claude_cli(cfg, system_prompt, messages):
         if action:
             tool_name = action.get("tool", "")
             tool_input = action.get("input") or {}
-            if tool_name.startswith("gmail_"):
-                result = execute_gmail_tool(cfg, tool_name, tool_input)
-            elif tool_name.startswith("discord_"):
-                result = execute_discord_tool(cfg, tool_name, tool_input)
-            elif tool_name.startswith("browser_") or tool_name.startswith("flutter_") or tool_name == "system_open":
-                result = execute_browser_tool(cfg, tool_name, tool_input)
-            elif tool_name.startswith("system_"):
-                result = execute_system_tool(cfg, tool_name, tool_input)
-            elif tool_name.startswith("jira_"):
-                result = execute_jira_tool(cfg, tool_name, tool_input)
-            else:
-                result = None
+            result = registry.dispatch(tool_name, tool_input, ANTHROPIC, cfg)
             if result is not None:
                 print(f"[jarvis] connector call {tool_name}({json.dumps(tool_input)[:200]}) -> "
                       f"{json.dumps(result)[:300]}", file=sys.stderr)

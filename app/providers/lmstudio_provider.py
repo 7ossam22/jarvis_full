@@ -27,39 +27,10 @@ import sys
 import urllib.request
 
 from .llm import LLMProvider
-from ..connectors.gmail import get_gmail_tools, execute_gmail_tool
-from ..connectors.discord import get_discord_tools, execute_discord_tool
-from ..connectors.browser import get_browser_tools, execute_browser_tool
-from ..connectors.system import get_system_tools, execute_system_tool
-from ..connectors.jira import get_jira_tools, execute_jira_tool
+from ..connectors.registry import LMSTUDIO, registry
 
 DEFAULT_MODEL = "local-model"
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-
-
-def _execute_tool(cfg, tool_name, tool_input):
-    if tool_name.startswith("gmail_"):
-        return execute_gmail_tool(cfg, tool_name, tool_input)
-    elif tool_name.startswith("discord_"):
-        return execute_discord_tool(cfg, tool_name, tool_input)
-    elif tool_name.startswith("browser_") or tool_name == "system_open":
-        return execute_browser_tool(cfg, tool_name, tool_input)
-    elif tool_name.startswith("system_"):
-        return execute_system_tool(cfg, tool_name, tool_input)
-    elif tool_name.startswith("jira_"):
-        return execute_jira_tool(cfg, tool_name, tool_input)
-    return {"error": f"Tool {tool_name} not found"}
-
-
-def _to_openai_tools(tool_specs):
-    """Anthropic-style specs -> OpenAI `tools` array. Both use an OpenAPI-subset
-    JSON Schema for parameters, so this is a rename."""
-    return [
-        {"type": "function", "function": {
-            "name": t["name"], "description": t["description"], "parameters": t["input_schema"],
-        }}
-        for t in tool_specs
-    ]
 
 
 def _to_openai_messages(system_prompt, messages):
@@ -99,10 +70,9 @@ def call_lmstudio(cfg, system_prompt, messages):
     convo = _to_openai_messages(system_prompt, messages)
     payload = {"model": model, "messages": convo, "temperature": 0.7, "stream": False}
     if use_tools:
-        payload["tools"] = _to_openai_tools(
-            get_gmail_tools() + get_discord_tools() + get_browser_tools()
-            + get_system_tools() + get_jira_tools()
-        )
+        # Already in OpenAI's {"type": "function", ...} shape and filtered to
+        # what this provider may see — a local model is trusted with all of it.
+        payload["tools"] = registry.get_tools_for_provider(LMSTUDIO)
         payload["tool_choice"] = "auto"
 
     url = f"{base}/chat/completions"
@@ -131,7 +101,7 @@ def call_lmstudio(cfg, system_prompt, messages):
             for tc in tool_calls:
                 fn = tc.get("function") or {}
                 name = fn.get("name", "")
-                result = _execute_tool(cfg, name, _parse_args(fn.get("arguments")))
+                result = registry.dispatch(name, _parse_args(fn.get("arguments")), LMSTUDIO, cfg)
                 convo.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id"),
