@@ -177,9 +177,15 @@ class TestAnswerValuePriority(unittest.TestCase):
     def test_plain_text(self):
         self.assertEqual(self.val("enter participant name"), "test")
 
-    def test_number_hints(self):
-        for hint in ("pain score (0-10)", "weight", "heart rate", "how many pills"):
+    def test_number_hints_without_a_stated_range_keep_the_flat_default(self):
+        for hint in ("weight", "heart rate", "how many pills"):
             self.assertEqual(self.val(hint), "55", hint)
+
+    def test_number_hint_with_a_stated_range_is_answer_correct_not_flat(self):
+        # "Pain score (0-10)" typed as the flat default '55' is WRONG data —
+        # this is exactly the bug the answer-correctness checker exists to
+        # fix: the default must actually satisfy the question's own range.
+        self.assertEqual(self.val("pain score (0-10)"), "5")
 
     def test_date_and_time(self):
         self.assertEqual(self.val("visit date"), "8/30/2026")
@@ -199,6 +205,147 @@ class TestAnswerValuePriority(unittest.TestCase):
                          "8/30/2026")
         self.assertEqual(self.val("visit time", numeric_error=False, attempt=3),
                          "14:05")
+
+    def test_birth_date_question_never_gets_todays_date(self):
+        self.assertEqual(
+            bd._autopilot_answer_value("date of birth", False, 1, **self.ARGS),
+            "1/1/1990")
+
+    def test_expiry_date_question_gets_a_future_date_not_today(self):
+        self.assertEqual(
+            bd._autopilot_answer_value("consent expiry date", False, 1,
+                                       **self.ARGS, expiry_date="1/1/2028"),
+            "1/1/2028")
+
+    def test_generic_visit_date_unaffected_by_smart_date_keywords(self):
+        self.assertEqual(self.val("actual visit date"), "8/30/2026")
+
+    def test_nearby_note_text_never_redirects_an_ordinary_date_field(self):
+        # The hint (title + nearby helper-widget text) contains "expired",
+        # but the question's own TITLE is just "assessment date" — the
+        # unrelated note must not redirect the answer away from today. A
+        # distinct expiry_date proves this: if the note text were (wrongly)
+        # matched, the answer would come back as "1/1/2028", not today.
+        hint = "assessment date note: expired consent version 2 on file"
+        value = bd._autopilot_answer_value(
+            hint, False, 1, title="assessment date", expiry_date="1/1/2028",
+            **self.ARGS)
+        self.assertEqual(value, "8/30/2026")
+
+    def test_composite_numeric_block_keeps_flat_default_for_every_box(self):
+        # A block with TWO empty number boxes sharing one hint (e.g. a
+        # Systolic/Diastolic vitals question) must never have a range
+        # stitched from one field's bound to the other's and typed into
+        # both — single_field=False disables range-aware numbers entirely,
+        # matching the old flat-default behavior for composite fields.
+        hint = "systolic (min 90) and diastolic (max 120) blood pressure"
+        value = bd._autopilot_answer_value(
+            hint, False, 1, single_field=False, **self.ARGS)
+        self.assertEqual(value, "55")
+
+    def test_single_field_block_still_gets_the_range_aware_value(self):
+        # Same range-bearing hint, but single_field=True (the default,
+        # exactly one empty box in the block) — the smart value still fires.
+        hint = "pain score (0-10)"
+        value = bd._autopilot_answer_value(
+            hint, False, 1, single_field=True, **self.ARGS)
+        self.assertEqual(value, "5")
+
+
+class TestRangeExtraction(unittest.TestCase):
+    def test_parenthesized_range(self):
+        self.assertEqual(bd._autopilot_extract_range("pain score (0-10)"), (0.0, 10.0))
+        self.assertEqual(bd._autopilot_extract_range("scale (1 to 5)"), (1.0, 5.0))
+        self.assertEqual(bd._autopilot_extract_range("intensity (0 – 4)"), (0.0, 4.0))
+
+    def test_between_phrasing(self):
+        self.assertEqual(bd._autopilot_extract_range("enter a value between 1 and 100"),
+                         (1.0, 100.0))
+
+    def test_min_max_either_order(self):
+        self.assertEqual(bd._autopilot_extract_range("min 2 max 8"), (2.0, 8.0))
+        self.assertEqual(bd._autopilot_extract_range("maximum: 8 minimum: 2"), (2.0, 8.0))
+
+    def test_upper_bound_only_assumes_zero_floor(self):
+        self.assertEqual(bd._autopilot_extract_range("up to 20 tablets"), (0.0, 20.0))
+        self.assertEqual(bd._autopilot_extract_range("no more than 50"), (0.0, 50.0))
+
+    def test_lower_bound_only_has_no_ceiling(self):
+        self.assertEqual(bd._autopilot_extract_range("at least 10 years old"), (10.0, None))
+
+    def test_no_range_stated_returns_none(self):
+        for hint in ("weight", "enter participant name", "visit date", "how many pills"):
+            self.assertIsNone(bd._autopilot_extract_range(hint), hint)
+
+    def test_reversed_bounds_are_normalized(self):
+        # a hostile/odd phrasing shouldn't produce lo > hi
+        rng = bd._autopilot_extract_range("min 8 max 2")
+        self.assertEqual(rng, (2.0, 8.0))
+
+
+class TestSmartNumber(unittest.TestCase):
+    def test_ranged_hint_picks_midpoint_not_flat_default(self):
+        self.assertEqual(bd._autopilot_smart_number("pain score (0-10)", "55"), "5")
+
+    def test_flat_default_already_in_range_is_kept(self):
+        # no pointless churn when '55' already satisfies the question.
+        self.assertEqual(bd._autopilot_smart_number("scale (0-100)", "55"), "55")
+
+    def test_no_range_leaves_flat_default_untouched(self):
+        self.assertEqual(bd._autopilot_smart_number("weight", "55"), "55")
+
+    def test_single_value_range_uses_that_value(self):
+        self.assertEqual(bd._autopilot_smart_number("fixed dose (5-5)", "55"), "5")
+
+    def test_lower_bound_only_bumps_default_up_when_below_it(self):
+        self.assertEqual(bd._autopilot_smart_number("at least 100 mg", "55"), "100")
+
+    def test_lower_bound_only_keeps_default_when_already_satisfied(self):
+        self.assertEqual(bd._autopilot_smart_number("at least 10 mg", "55"), "55")
+
+    def test_midpoint_is_a_whole_number_string(self):
+        v = bd._autopilot_smart_number("scale (0-10)", "55")
+        self.assertNotIn(".", v)
+
+
+class TestSmartDate(unittest.TestCase):
+    TODAY = "8/30/2026"
+
+    def test_birth_keywords(self):
+        for hint in ("date of birth", "birth date", "birthdate", "dob"):
+            self.assertEqual(bd._autopilot_smart_date(hint, self.TODAY), "1/1/1990", hint)
+
+    def test_expiry_keywords_use_expiry_date_not_today(self):
+        for hint in ("expiry date", "expiration date", "consent expires on"):
+            self.assertEqual(
+                bd._autopilot_smart_date(hint, self.TODAY, expiry_date="1/1/2028"),
+                "1/1/2028", hint)
+
+    def test_expiry_without_explicit_expiry_date_falls_back_to_today(self):
+        self.assertEqual(bd._autopilot_smart_date("expiry date", self.TODAY), self.TODAY)
+
+    def test_generic_date_hints_unaffected(self):
+        for hint in ("visit date", "assessment date", "date collected"):
+            self.assertEqual(bd._autopilot_smart_date(hint, self.TODAY), self.TODAY, hint)
+
+    def test_custom_birth_date_override(self):
+        self.assertEqual(
+            bd._autopilot_smart_date("date of birth", self.TODAY, birth_date="6/15/1985"),
+            "6/15/1985")
+
+    def test_dob_never_matches_inside_a_larger_word(self):
+        # "dob" is a real word-fragment inside unrelated words — must not
+        # fire on a generic date question just because a drug name or an
+        # app name happens to contain the letters "d-o-b".
+        for hint in ("date scanned via adobe reader",
+                     "administered dobutamine dose",
+                     "date recorded"):
+            self.assertEqual(bd._autopilot_smart_date(hint, self.TODAY), self.TODAY, hint)
+
+    def test_expir_never_matches_unrelated_words(self):
+        for hint in ("date experience began", "inspiration date",
+                     "date of expert review"):
+            self.assertEqual(bd._autopilot_smart_date(hint, self.TODAY), self.TODAY, hint)
 
 
 class TestDialogAcceptLabels(unittest.TestCase):

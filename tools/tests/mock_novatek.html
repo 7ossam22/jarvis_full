@@ -98,7 +98,7 @@ function questionsFor(formIdx) {
     { id: 'q1', kind: 'radio',    title: 'Choose the participant status',
       options: ['Option Alpha', 'Option Beta', 'Option Gamma'] },
     { id: 'q2', kind: 'text',     title: 'Enter participant name' },
-    { id: 'q3', kind: 'number',   title: 'Pain score (0-10)' },
+    { id: 'q3', kind: 'rangenum', title: 'Pain score (0-10)', min: 0, max: 10 },
     { id: 'q4', kind: 'strictnum',title: 'Enter the code' },
     { id: 'q5', kind: 'date',     title: 'Visit date' },
     { id: 'q6', kind: 'time',     title: 'Visit time' },
@@ -107,6 +107,7 @@ function questionsFor(formIdx) {
     { id: 'q8', kind: 'unit',     title: 'Weight' },
     { id: 'q9', kind: 'upload',   title: 'Upload signed consent document' },
     { id: 'q10', kind: 'sign',    title: 'Investigator signature' },
+    { id: 'q11', kind: 'date',    title: 'Date of birth' },
   ];
   return [
     { id: 'q1', kind: 'radio', title: 'Attendance status', options: ['Present', 'Absent'] },
@@ -208,6 +209,24 @@ function renderQuestion(q, idx) {
       err.classList.toggle('hidden', !bad);
       if (bad) err.removeAttribute('aria-hidden');
       a[q.id] = (v !== '' && isNum(v)) ? v : '';
+    });
+    wrap.appendChild(err);
+  } else if (q.kind === 'rangenum') {
+    // Enforces the SAME range stated in the question title (q.min/q.max) —
+    // this is what proves the daemon's answer-correctness checker: the flat
+    // '55' default is out of range and gets rejected here exactly like a
+    // real Novatek scored-field validator would reject it.
+    const errMsg = 'Value must be between ' + q.min + ' and ' + q.max;
+    const err = document.createElement('span');
+    err.className = 'err hidden';
+    err.setAttribute('aria-label', errMsg);
+    err.textContent = errMsg;
+    addInput(q.title, inp => {
+      const v = inp.value.trim();
+      const n = parseFloat(v);
+      const bad = v !== '' && (!isNum(v) || n < q.min || n > q.max);
+      err.classList.toggle('hidden', !bad);
+      a[q.id] = (v !== '' && !bad) ? v : '';
     });
     wrap.appendChild(err);
   } else if (q.kind === 'date') {

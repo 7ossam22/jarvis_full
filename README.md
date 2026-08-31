@@ -217,6 +217,17 @@ tools/tests/run_all.sh                               # full offline test suite
 
 Exit code 0 = verified complete; the `--json` flag prints the full report.
 
+**Answer-correctness checker**: the flat defaults are corrected against each
+question's own stated constraints before anything is typed — a "Pain score
+(0-10)" question gets a value inside 0-10, not the flat `55`; a "Date of
+birth" question gets a plausible fixed date, not today; an "…expiry…"
+question gets a date a year out, not one already in the past. Detection is
+pure regex/keyword (parenthesized ranges, "between X and Y", "min/max",
+"up to N", "at least N", birth/expiry keywords) — still zero AI, just reading
+the question instead of ignoring it. Override the fixed dates with
+`--birth-date` / `--expiry-date` on the CLI, or `birth_date_value` /
+`expiry_date_value` in the daemon payload.
+
 ## Troubleshooting
 
 | Symptom | Fix |

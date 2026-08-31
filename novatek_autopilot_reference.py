@@ -4,10 +4,8 @@
 Drives the deterministic form autopilot that lives inside the browser daemon
 (tools/browser_daemon.py) entirely from the command line: no LLM, no tokens,
 no model latency — just the rule engine (first option / 'test' / '55' /
-today's date / current time / consent PDF / Admin signature, corrected by an
-answer-correctness checker that reads each question's own stated numeric
-range or birth/expiry-date wording — see --birth-date/--expiry-date below)
-executed at machine speed over localhost HTTP.
+today's date / current time / consent PDF / Admin signature) executed at
+machine speed over localhost HTTP.
 
 Usage:
     python3 tools/novatek_autopilot.py status
@@ -215,8 +213,7 @@ def _fill_payload(args):
     payload = {"tab_index": args.tab}
     for k, opt in (("text_value", "text"), ("number_value", "number"),
                    ("file_path", "file"), ("username", "username"),
-                   ("password", "password"), ("birth_date_value", "birth_date"),
-                   ("expiry_date_value", "expiry_date")):
+                   ("password", "password")):
         v = getattr(args, opt, None)
         if v:
             payload[k] = v
@@ -308,10 +305,6 @@ def main(argv=None):
                        help=f"upload file (default {DEFAULT_CONSENT_PDF})")
         p.add_argument("--username", default=None, help="signature username")
         p.add_argument("--password", default=None, help="signature password")
-        p.add_argument("--birth-date", default=None,
-                       help="answer for 'date of birth'-style questions (default 1/1/1990)")
-        p.add_argument("--expiry-date", default=None,
-                       help="answer for '…expiry…'-style questions (default: one year out)")
         if name == "takeover":
             p.add_argument("--visits", type=int, default=5, help="max visits (default 5)")
 

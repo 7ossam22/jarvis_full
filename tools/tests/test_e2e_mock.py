@@ -12,6 +12,7 @@ Run:  python3 tools/tests/test_e2e_mock.py -v
 """
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -120,10 +121,14 @@ class E2E(unittest.TestCase):
         self.assertEqual(report.get("forms_progress"), "0/1")
 
     def test_02_form_fills_and_submits_long_form(self):
-        """The 10-question long form: radio, text, number, live-validated
-        number (error-retry path), date, time, checkboxes, unit dropdown,
-        file upload, and the signature dialog — plus the scroll loop and the
-        pre-submit sweep."""
+        """The 11-question long form: radio, text, a RANGE-VALIDATED number
+        (the answer-correctness checker must pick a value inside the
+        question's own stated 0-10 range, not the flat '55' default — the
+        mock rejects out-of-range values exactly like a real Novatek scored
+        field would), a live-validated number (error-retry path), date, time,
+        checkboxes, unit dropdown, file upload, the signature dialog, and a
+        'Date of birth' question (must get a plausible fixed birth date, not
+        today) — plus the scroll loop and the pre-submit sweep."""
         self.navigate(forms=1, visits=1)
         code, report = self.cli("form")
         self.assertEqual(code, 0, f"form run failed: {json.dumps(report, indent=2)[:2000]}")
@@ -132,11 +137,35 @@ class E2E(unittest.TestCase):
         self.assertEqual(report.get("unresolved"), [])
         self.assertEqual(report.get("progress_before"), "0/1")
         self.assertEqual(report.get("progress_after"), "1/1")
-        # Every one of the 10 questions must have been acted on.
-        answered_keys = {a["question"].split(" ")[0] for a in report.get("answered", [])}
-        for n in range(1, 11):
+        answered = report.get("answered", [])
+        # Every one of the 11 questions must have been acted on.
+        answered_keys = {a["question"].split(" ")[0] for a in answered}
+        for n in range(1, 12):
             self.assertIn(f"{n}.", answered_keys,
-                          f"question {n} never acted on: {report.get('answered')}")
+                          f"question {n} never acted on: {answered}")
+
+        def typed_value(marker):
+            entry = next(a for a in answered if a["question"].startswith(marker))
+            m = re.search(r"typed '([^']*)'", entry["action"])
+            self.assertIsNotNone(m, f"no typed value recorded for {marker}: {entry}")
+            return m.group(1), entry["action"]
+
+        # Answer-correctness: "Pain score (0-10)" must NOT be the flat '55'
+        # default (which the mock's own range validator rejects) — it must
+        # be a value the question's own stated range actually accepts.
+        pain_value, pain_action = typed_value("3.")
+        self.assertTrue(0 <= float(pain_value) <= 10,
+                        f"pain score answered out of its stated range: {pain_value!r}")
+        self.assertIn("range aware", pain_action)
+
+        # Answer-correctness: "Date of birth" must NOT be answered with
+        # today's date (a birth date of "today" is nonsense data) — it must
+        # be the plausible fixed birth-date default.
+        dob_value, dob_action = typed_value("11.")
+        self.assertEqual(dob_value, "1/1/1990")
+        self.assertIn("birth/expiry keyword aware", dob_action)
+        today = time.strftime("%-m/%-d/%Y")
+        self.assertNotEqual(dob_value, today)
 
     def test_03_visit_fills_both_forms(self):
         self.navigate(forms=2, visits=1)

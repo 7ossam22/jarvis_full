@@ -1571,6 +1571,11 @@ async def cmd_upload_file(payload):
 # deliberately hard-limited to the VISIT MODE screen (the one titled
 # "Visit Mode" with the sidebar Forms list and the N/M progress counter).
 # cmd_takeover_participant chains whole visits from the participant profile.
+# The flat defaults (text 'test', number 55, today's date) are corrected by
+# an answer-correctness checker (_autopilot_smart_number / _autopilot_
+# smart_date) that reads each question's OWN stated constraints — a '(0-10)'
+# scale gets its midpoint instead of 55, a 'date of birth' question gets a
+# plausible fixed date instead of today — before ever typing anything in.
 
 # Question markers: "1.", "4-1." (sub-questions).
 _AUTOPILOT_MARKER_RE = re.compile(r"^\d+(-\d+)?\.$")
@@ -1588,20 +1593,159 @@ _AUTOPILOT_DIALOG_ACCEPT = ("ok", "confirm", "done", "set", "save", "select", "a
 _AUTOPILOT_ERROR_HINTS = ("valid number", "invalid", "must be", "is required")
 
 
+# ----------------------------------------------------------------------------
+# Answer-correctness checker: instead of a flat fixed default (which is
+# WRONG for e.g. a "Pain score (0-10)" question typed as 55, or a "Date of
+# birth" question typed as today), read the question's own stated
+# constraints from its text and pick a value that is actually valid for that
+# specific question. Still zero AI — pure regex/keyword rules, same as the
+# rest of the engine, just reading the question instead of ignoring it.
+# ----------------------------------------------------------------------------
+
+# Ordered: the first pattern that matches wins. Each yields (lo, hi) as
+# floats, or (lo, None) / (None, hi) when only one bound is stated.
+_AUTOPILOT_RANGE_PATTERNS = (
+    # "(0-10)", "(0 to 10)", "(0 – 10)", "(1-5)"
+    (re.compile(r"\((\d+(?:\.\d+)?)\s*(?:-|to|–|—)\s*(\d+(?:\.\d+)?)\)"), "both"),
+    # "between 1 and 100", "between 1-100"
+    (re.compile(r"\bbetween\s+(\d+(?:\.\d+)?)\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)"), "both"),
+    # "min 2 max 8" / "minimum: 2 maximum: 8" (either order)
+    (re.compile(r"\bmin(?:imum)?\s*[:=]?\s*(\d+(?:\.\d+)?).{0,20}?"
+               r"\bmax(?:imum)?\s*[:=]?\s*(\d+(?:\.\d+)?)"), "both"),
+    (re.compile(r"\bmax(?:imum)?\s*[:=]?\s*(\d+(?:\.\d+)?).{0,20}?"
+               r"\bmin(?:imum)?\s*[:=]?\s*(\d+(?:\.\d+)?)"), "both_reversed"),
+    # "up to 20", "no more than 50", "at most 30" — an upper bound only; the
+    # floor is assumed 0 (every case observed on these forms is a count/score).
+    (re.compile(r"\b(?:up to|no more than|at most)\s+(\d+(?:\.\d+)?)"), "max_only"),
+    # "at least 10" — a lower bound only, no fabricated ceiling.
+    (re.compile(r"\bat least\s+(\d+(?:\.\d+)?)"), "min_only"),
+)
+
+
+def _autopilot_extract_range(hint):
+    """Reads a numeric range stated in the question's own text. Returns
+    (lo, hi) with either side possibly None, or None when no range is
+    stated at all."""
+    for pattern, kind in _AUTOPILOT_RANGE_PATTERNS:
+        m = pattern.search(hint)
+        if not m:
+            continue
+        if kind == "both":
+            lo, hi = float(m.group(1)), float(m.group(2))
+        elif kind == "both_reversed":
+            hi, lo = float(m.group(1)), float(m.group(2))
+        elif kind == "max_only":
+            lo, hi = 0.0, float(m.group(1))
+        else:  # min_only
+            lo, hi = float(m.group(1)), None
+        if hi is not None and lo > hi:
+            lo, hi = hi, lo
+        return (lo, hi)
+    return None
+
+
+def _autopilot_smart_number(hint, number_value, single_field=True):
+    """The flat number default, corrected against any range the question
+    states about itself. A '(0-10)' scale gets its midpoint, not '55'; 'at
+    least 10' with a default already ≥ 10 is left untouched; no stated range
+    leaves the flat default exactly as before (no behavior change).
+
+    single_field=False (a block with MORE THAN ONE empty number box, e.g. a
+    composite Systolic/Diastolic vitals question sharing one hint) disables
+    range extraction entirely: the hint's min/max wording can't be reliably
+    attributed to one particular box, and the lazy min...max regex can stitch
+    two different sub-fields' bounds into one bogus composite range — typing
+    that single guessed value into every box would put the SAME number in
+    both fields, which is worse than the old flat default (two identical
+    "55"s were obviously placeholder; two identical plausible-looking numbers
+    are not). Composite blocks keep the pre-existing flat behavior."""
+    if not single_field:
+        return number_value
+    rng = _autopilot_extract_range(hint)
+    if rng is None:
+        return number_value
+    lo, hi = rng
+    try:
+        current = float(number_value)
+    except (TypeError, ValueError):
+        current = None
+    if hi is None:
+        # Lower bound only: keep the default unless it violates the floor.
+        return number_value if current is not None and current >= lo else _fmt_num(lo)
+    if lo == hi:
+        return _fmt_num(lo)
+    if current is not None and lo <= current <= hi:
+        return number_value  # the flat default already satisfies this question
+    mid = lo + (hi - lo) // 2 if float(hi - lo).is_integer() else lo + (hi - lo) / 2
+    return _fmt_num(mid)
+
+
+def _fmt_num(n):
+    """Whole numbers print without a trailing '.0' — Novatek numeric fields
+    reject a decimal point on an integer-only question."""
+    return str(int(n)) if float(n).is_integer() else str(n)
+
+
+# Keyword -> which fixed, semantically sensible date to use instead of
+# "today". Checked in order; the first keyword found in the TITLE wins.
+# Word-bounded (\b) so a substring buried in a larger word never matches —
+# "dob" must not fire inside "Adobe" or "dobutamine", and a bare "expir"
+# would match "expired"/"experience" alike, so it requires the actual
+# expir(e|es|y|ation) word shape.
+_AUTOPILOT_DATE_KEYWORDS = (
+    (re.compile(r"\bdate of birth\b|\bbirth\s*date\b|\bdob\b"), "birth"),
+    (re.compile(r"\bexpir(?:e|es|ed|y|ation)\b"), "expiry"),
+)
+
+
+def _autopilot_smart_date(title, today, birth_date="1/1/1990", expiry_date=None):
+    """Which date default a date field gets. A birth-date question answered
+    with today's date, or an expiry question answered with a date already in
+    the past, is nonsense data even when the app's own validator accepts it
+    — so these get a plausible fixed date instead. Every other date question
+    (visit date, assessment date, …) keeps the existing 'today' rule.
+
+    Matches against the question's own TITLE only, never the full hint blob
+    (title + nearby helper-widget text) — an unrelated note near the question
+    ("badge expired, please renew", "note: expired consent version on file")
+    must never redirect an ordinary date field's answer; only the question
+    actually asking about a birth or expiry date should."""
+    for pattern, kind in _AUTOPILOT_DATE_KEYWORDS:
+        if pattern.search(title):
+            if kind == "birth":
+                return birth_date
+            return expiry_date or today
+    return today
+
+
 def _autopilot_answer_value(hint, numeric_error, attempt,
-                            text_value, number_value, today, now_hhmm):
+                            text_value, number_value, today, now_hhmm,
+                            birth_date="1/1/1990", expiry_date=None,
+                            title=None, single_field=True):
     """Which default answer a text field gets. Priority: an explicit "valid
     number" rejection wins outright; date/time hints beat everything else
     (a generic "is required" on a date field must still get a date, never
-    the number default); then number hints / retry rounds; then plain text."""
+    the number default); then number hints / retry rounds; then plain text.
+    Number and date defaults are corrected against the question's own stated
+    constraints (see _autopilot_smart_number / _autopilot_smart_date) before
+    being returned.
+
+    `title` is the question's own title text (lowercased) used ONLY for the
+    birth/expiry keyword check — it defaults to `hint` (title + nearby helper
+    text) for callers that don't separate the two, matching prior behavior;
+    real callers should pass the title alone so nearby note text can't
+    redirect the answer. `single_field` disables range-aware numbers on a
+    block with more than one empty box (see _autopilot_smart_number)."""
+    if title is None:
+        title = hint
     if numeric_error:
-        return number_value
+        return _autopilot_smart_number(hint, number_value, single_field)
     if "date" in hint:
-        return today
+        return _autopilot_smart_date(title, today, birth_date, expiry_date)
     if "time" in hint:
         return now_hhmm
     if attempt > 1 or any(h in hint for h in _AUTOPILOT_NUMBER_HINTS):
-        return number_value
+        return _autopilot_smart_number(hint, number_value, single_field)
     return text_value
 
 
@@ -1776,6 +1920,12 @@ async def cmd_autofill_form(payload):
     min_x = int(payload.get("panel_min_x", 330))
     max_rounds = int(payload.get("max_rounds", 100))
     tab_index = payload.get("tab_index")
+    # Answer-correctness overrides: a "Date of birth" question gets this
+    # instead of today, an "…expiry…" question gets one year out instead of
+    # a date already in the past. Both are payload-overridable.
+    birth_date_value = payload.get("birth_date_value") or "1/1/1990"
+    expiry_date_value = (payload.get("expiry_date_value")
+                         or time.strftime("%-m/%-d/%Y", time.localtime(time.time() + 365 * 86400)))
 
     page = await get_active_page(tab_index=tab_index)
     if not await is_flutter_page(page):
@@ -1894,11 +2044,29 @@ async def cmd_autofill_form(payload):
                     "valid number" in (w.get("label") or "").lower()
                     for w in blk["members"])
                 for box in boxes_empty:
+                    title_lower = (blk["title"] or "").lower()
+                    single_field = len(boxes_empty) <= 1
                     value = _autopilot_answer_value(
                         hint, numeric_error, attempts[key],
-                        text_value, number_value, today, now_hhmm)
+                        text_value, number_value, today, now_hhmm,
+                        birth_date_value, expiry_date_value,
+                        title=title_lower, single_field=single_field)
                     await _autopilot_type(page, box, value)
-                    actions_here.append(f"typed '{value}'")
+                    # Self-describing action text: flag it whenever the
+                    # question actually STATES a constraint the checker acted
+                    # on — a range or a birth/expiry keyword — even when the
+                    # resulting value happens to equal a flat default (e.g. a
+                    # "(0-100)" range whose midpoint coincides with '55').
+                    # Checking the question's own text directly (rather than
+                    # comparing the returned value against the flat defaults)
+                    # means the flag always reflects why the value was
+                    # chosen, not a coincidence of what it landed on.
+                    smart_note = ""
+                    if single_field and _autopilot_extract_range(hint) is not None:
+                        smart_note = " (range aware)"
+                    elif any(p.search(title_lower) for p, _ in _AUTOPILOT_DATE_KEYWORDS):
+                        smart_note = " (birth/expiry keyword aware)"
+                    actions_here.append(f"typed '{value}'{smart_note}")
                 if unit_btns and key not in units_done:
                     units_done.add(key)
                     snapshot = await extract_flutter_widgets(page)

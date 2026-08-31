@@ -330,8 +330,11 @@ def get_browser_tools():
                 "AUTOPILOT (fastest path, VISIT MODE ONLY): deterministically fill AND submit the form "
                 "currently open on the Novatek Visit Mode screen in one call, with the standard defaults "
                 "(first option, text 'test', number 55, today's date, current time, consent PDF, Admin "
-                "signature). Handles the whole answer/scroll/submit loop internally at machine speed and "
-                "returns a report: questions answered, anything unresolved (finish those yourself with "
+                "signature) — corrected by an answer-correctness checker that reads each question's own "
+                "stated constraints: a numeric range like '(0-10)' gets a value inside that range instead "
+                "of the flat 55, and a 'date of birth' / '…expiry…' question gets a plausible fixed date "
+                "instead of today. Handles the whole answer/scroll/submit loop internally at machine speed "
+                "and returns a report: questions answered, anything unresolved (finish those yourself with "
                 "browser_batch_actions), whether Submit was clicked, and the N/M forms-progress counter "
                 "before/after. Refuses to run on any screen other than Visit Mode."
             ),
