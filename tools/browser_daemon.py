@@ -1939,7 +1939,10 @@ class QuestionFiller:
         if any(w.get("role") == "button" and _is_sign_label(w.get("label"))
                for w in below_title):
             return "signature"
-        if _block_is_upload(blk):
+        # The file control may be in the visible members rather than the block
+        # snapshot, so both are checked — but still a CONTROL, never wording.
+        if _block_is_upload(blk) or any(
+                _FILE_CONTROL_RE.search(w.get("label") or "") for w in below_title):
             return "upload"
         if any(w.get("role") == "textbox" for w in below_title):
             return "text"
@@ -2677,10 +2680,32 @@ def _upload_state(blk):
     return "none"
 
 
+#: A control that actually takes a file. Narrower than _UPLOAD_KEYWORD_RE on
+#: purpose: that one hunts for the upload BUTTON and must match "Attach signed
+#: consent", so it includes bare "consent". Using it to decide whether a
+#: QUESTION is an upload made "Was informed consent obtained?" an upload
+#: question — one that can never be answered, because no file will ever arrive
+#: — so its perfectly good Yes was re-clicked every round.
+_FILE_CONTROL_RE = re.compile(
+    r"\b(upload|attach)\b|\b(select|choose)\s+files?\b|\bbrowse\b|"
+    r"\btap\s+to\s+select\b|\bdrag\s+and\s+drop\b|\bfile\s+chooser\b",
+    re.IGNORECASE,
+)
+
+
 def _block_is_upload(blk):
-    """Whether this question takes a file at all."""
-    return bool(_UPLOAD_KEYWORD_RE.search(blk.get("hint") or "")) or any(
-        _UPLOAD_KEYWORD_RE.search(w.get("label") or "") for w in blk["members"])
+    """Whether this question takes a FILE.
+
+    Judged on the presence of a real file control or an already-attached
+    filename — never on the question's wording. Two different jobs share the
+    word "upload": finding the button to click, and deciding what kind of
+    question this is. Only the second one belongs here.
+    """
+    for w in blk["members"]:
+        label = w.get("label") or ""
+        if _FILE_CONTROL_RE.search(label) or _ATTACHED_FILE_RE.search(label):
+            return True
+    return False
 
 
 def _autopilot_upload_in_flight(panel):
@@ -3008,6 +3033,7 @@ async def cmd_autofill_form(payload):
     units_done = set()    # blocks whose unit dropdown was already picked
     swept = False         # pre-submit top-to-bottom sweep completed
     blanket_retry = False # a no-inline-error refusal has already been retried
+    needs_resubmit = False # corrections were made and Submit has not been re-pressed
     llm_asked = set()     # questions already escalated (at most one ask each)
     choice_answered = set()  # answered by selecting an option — NEVER re-picked
     tried = {}            # per-question values the form has already refused
@@ -3306,6 +3332,7 @@ async def cmd_autofill_form(payload):
             if not submit:
                 continue
             await _autopilot_click(page, submit, settle=300)
+            needs_resubmit = False
             resubmits += 1
             report["submit_attempts"] = resubmits
             report["submitted"] = True
@@ -3399,6 +3426,14 @@ async def cmd_autofill_form(payload):
                             "stopping rather than rewriting good answers")
                         break
             swept = False
+            # Corrections were made, so a resubmit is DUE. Reset the stagnation
+            # budget: the questions below are the ones just corrected, not new
+            # ones, so without this the loop counts three "nothing new" rounds
+            # and quits with "reached the bottom without finding Submit" —
+            # having fixed everything the form complained about and never
+            # pressed Submit again.
+            stagnant = 0
+            needs_resubmit = True
             widgets = await _autopilot_scroll_to_form_top(page, tab_index, min_x)
             continue
 
@@ -3438,11 +3473,22 @@ async def cmd_autofill_form(payload):
                 break
             await page.wait_for_timeout(350)
             widgets = await extract_flutter_widgets(page)
-        fresh_keys = {b["key"] for b in _autopilot_blocks(_autopilot_panel(widgets, min_x))}
+        fresh_panel = _autopilot_panel(widgets, min_x)
+        fresh_keys = {b["key"] for b in _autopilot_blocks(fresh_panel)}
+        submit_here = any(_is_submit_label(w.get("label"))
+                          for w in fresh_panel if w.get("role") == "button")
         if not (fresh_keys - all_keys):
+            # Nothing new below. That is only a dead end when there is no
+            # Submit either — if the button is on screen the loop must be
+            # allowed to reach it, especially after a correction round when a
+            # resubmit is exactly what is owed.
+            if submit_here or needs_resubmit:
+                stagnant = 0
+                continue
             stagnant += 1
             if stagnant >= 3:
-                report["unresolved"].append("reached the bottom without finding Submit — stopped")
+                report["unresolved"].append(
+                    "reached the bottom and no Submit button was found — stopped")
                 break
         else:
             stagnant = 0
@@ -3664,13 +3710,13 @@ async def cmd_autofill_visit(payload):
     # Measure where this visit stands BEFORE touching it: how many forms are
     # submitted, what the visit date holds, whether anything blocks starting.
     # Deterministic on purpose — see VisitAssessment.
+    pilot = VisitAutopilot(page, payload)
     assessment = VisitAssessment(widgets, 330)
     report = pilot.report
     report["progress"] = _autopilot_progress(widgets)
     report["assessment"] = assessment.as_dict()
     if assessment.blocked_by:
         report["forms"].append({"error": f"cannot start: {assessment.blocked_by}"})
-    pilot = VisitAutopilot(page, payload)
     selector = pilot.selector          # owns "which form next", and never
                                        # re-targets one that carries its checkmark
     checker = pilot.checker            # owns the counter, the visit's only

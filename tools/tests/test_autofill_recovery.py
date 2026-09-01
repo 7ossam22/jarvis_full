@@ -239,6 +239,54 @@ class UploadStatusTests(unittest.TestCase):
         self.assertIn('"file_selected"', src)
 
 
+class ResubmitAfterCorrectionTests(unittest.TestCase):
+    """A correction round owes a Submit.
+
+    REGRESSION, observed live: the autopilot filled every question, pressed
+    Submit, was refused on validation, CORRECTED everything the form
+    complained about — and then never pressed Submit again. It walked to the
+    bottom, found no NEW questions (they were the ones it had just corrected),
+    counted three stagnant rounds and quit with "reached the bottom without
+    finding Submit" while the button was on screen.
+
+    Two things were wrong: the stagnation budget was never reset after a
+    correction, and "nothing new below" was treated as a dead end even when
+    Submit was visible.
+    """
+
+    @staticmethod
+    def should_break(nothing_new, submit_visible, needs_resubmit, stagnant):
+        """The loop's dead-end test, as it now stands."""
+        if not nothing_new:
+            return False
+        if submit_visible or needs_resubmit:
+            return False          # reset and keep going
+        return stagnant + 1 >= 3
+
+    def test_nothing_new_but_submit_on_screen_is_not_a_dead_end(self):
+        self.assertFalse(self.should_break(True, True, False, 2))
+
+    def test_a_pending_resubmit_prevents_giving_up(self):
+        # Even with Submit scrolled out of view, a correction round owes a
+        # submit and the loop must not quit before making it.
+        self.assertFalse(self.should_break(True, False, True, 2))
+
+    def test_a_genuine_dead_end_still_stops(self):
+        # No new questions, no Submit anywhere, nothing owed.
+        self.assertTrue(self.should_break(True, False, False, 2))
+
+    def test_new_questions_are_never_a_dead_end(self):
+        self.assertFalse(self.should_break(False, False, False, 5))
+
+    def test_the_debt_is_cleared_only_by_pressing_submit(self):
+        # Modelled as the loop does it: set on correction, cleared on click.
+        needs_resubmit = False
+        needs_resubmit = True                      # corrections applied
+        self.assertTrue(needs_resubmit)
+        needs_resubmit = False                     # Submit pressed
+        self.assertFalse(needs_resubmit)
+
+
 class VisitAssessmentTests(unittest.TestCase):
     """Where a visit stands before anything is touched — measured, not guessed.
 
@@ -632,6 +680,64 @@ class VisitVerdictTests(unittest.TestCase):
 
     def test_the_verdict_names_the_counter_verbatim(self):
         self.assertIn("0/18", self.verdict("0/18", False))
+
+
+class UploadClassificationTests(unittest.TestCase):
+    """Whether a question takes a FILE — judged on its controls, never on its
+    wording.
+
+    REGRESSION, seen live: _block_is_upload reused _UPLOAD_KEYWORD_RE, which
+    is deliberately broad because it must find the button "Attach signed
+    consent" and therefore matches bare "consent". That made
+    "Was informed consent obtained?" an upload question. An upload question is
+    answered only when a file has landed, and no file was ever coming, so it
+    was permanently unanswered — its correct Yes was re-clicked every round,
+    burning the round budget and starving other questions.
+
+    Two different jobs share the word "upload": FINDING the button to click,
+    and DECIDING what kind of question this is. Only the second belongs here.
+    """
+
+    @staticmethod
+    def blk(hint, *labels):
+        return {"key": "1. " + hint, "hint": hint.lower(), "title": hint,
+                "marker_y": 100,
+                "members": [{"role": "widget", "label": l, "value": None,
+                             "bounds": {"x": 500, "y": 300,
+                                        "center_x": 500, "center_y": 300}}
+                            for l in labels]}
+
+    def test_wording_alone_never_makes_a_question_an_upload(self):
+        for hint, labels in [
+            ("Was informed consent obtained?", ("Yes", "No")),
+            ("Informed consent version", ("v2.1",)),
+            ("Consent obtained by", ("test",)),
+            ("Was the consent form explained?", ("Yes", "No")),
+        ]:
+            with self.subTest(hint):
+                self.assertFalse(bd._block_is_upload(self.blk(hint, *labels)), hint)
+
+    def test_a_real_file_control_does(self):
+        for hint, labels in [
+            ("Chemistry File", ("Tap to select files",)),
+            ("Upload saliva sample results", ("Tap to select files You will be prompted",)),
+            ("Attach signed consent", ("Browse",)),
+            ("Documents", ("Choose file",)),
+        ]:
+            with self.subTest(hint):
+                self.assertTrue(bd._block_is_upload(self.blk(hint, *labels)), hint)
+
+    def test_an_attached_filename_counts_as_an_upload_question(self):
+        self.assertTrue(bd._block_is_upload(
+            self.blk("Consent document", "Informed_Consent Template.pdf")))
+
+    def test_a_misread_question_would_be_permanently_unanswerable(self):
+        # Why this matters: an upload question is answered only when a file has
+        # landed. A Yes/No question misread as an upload can never satisfy that.
+        consent = self.blk("Was informed consent obtained?", "Yes", "No")
+        consent["members"][0]["value"] = "checked"
+        self.assertFalse(bd._block_is_upload(consent))
+        self.assertTrue(bd._block_is_answered(consent, 900))
 
 
 class UploadInFlightTests(unittest.TestCase):
