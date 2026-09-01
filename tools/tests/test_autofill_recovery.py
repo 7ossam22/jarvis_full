@@ -239,6 +239,58 @@ class UploadStatusTests(unittest.TestCase):
         self.assertIn('"file_selected"', src)
 
 
+class VisitEnderTests(unittest.TestCase):
+    """The first sub-autopilot split out of the monolith: End Visit, then the
+    Continue participation dialog, then confirm the visit actually ended.
+
+    Clicking End Visit alone is NOT the end — Novatek raises a confirmation,
+    and leaving it unanswered halts the run on a modal.
+    """
+
+    @staticmethod
+    def btn(label):
+        return {"role": "button", "label": label,
+                "bounds": {"x": 400, "y": 800, "center_x": 500, "center_y": 800}}
+
+    def test_end_visit_matched_despite_leading_helper_text(self):
+        for label in ("End Visit",
+                      "You can end the visit only when all forms are completed. End Visit"):
+            with self.subTest(label):
+                self.assertIsNotNone(bd._end_visit_button([self.btn(label)]))
+
+    def test_other_buttons_are_not_end_visit(self):
+        for label in ("Submit", "Hold Visit", "Discard changes", "Continue"):
+            with self.subTest(label):
+                self.assertIsNone(bd._end_visit_button([self.btn(label)]))
+
+    def test_continue_wins_over_a_generic_ok(self):
+        # Specificity matters: a dialog offering both must not be answered
+        # with whichever button happens to come first in the tree.
+        got = bd._continue_button([self.btn("OK"), self.btn("Continue")])
+        self.assertEqual(got["label"], "Continue")
+
+    def test_continue_participation_is_matched(self):
+        got = bd._continue_button([self.btn("Cancel"), self.btn("Continue participation")])
+        self.assertEqual(got["label"], "Continue participation")
+
+    def test_a_dialog_with_only_cancel_is_not_confirmed(self):
+        # Better to report an unrecognised dialog than to click Cancel and
+        # silently abandon the end-visit step.
+        self.assertIsNone(bd._continue_button([self.btn("Cancel")]))
+
+    def test_cancel_is_never_chosen_as_the_confirmation(self):
+        got = bd._continue_button([self.btn("Cancel"), self.btn("Proceed")])
+        self.assertEqual(got["label"], "Proceed")
+
+    def test_the_ender_reports_a_structured_result(self):
+        ender = bd.VisitEnder(page=None)
+        result = ender._result(False, False, "not complete", "9/20")
+        self.assertEqual(set(result),
+                         {"clicked", "confirmed", "reason", "progress_at_end", "steps"})
+        # `confirmed` is the only field that means the visit is actually over.
+        self.assertFalse(result["confirmed"])
+
+
 class EndVisitGateTests(unittest.TestCase):
     """Ending a visit is irreversible, so it happens only when the progress
     counter verifies every form is submitted — and it DOES happen then. That
@@ -316,6 +368,69 @@ class VisitVerdictTests(unittest.TestCase):
 
     def test_the_verdict_names_the_counter_verbatim(self):
         self.assertIn("0/18", self.verdict("0/18", False))
+
+
+class UploadInFlightTests(unittest.TestCase):
+    """A file-upload question is answered only once the upload COMPLETES.
+
+    The card shows a circular progress indicator on its right while uploading,
+    which becomes a checkmark on success. Treating the question as answered
+    before that — or pressing Submit during it — produces a form that looks
+    filled and is not.
+    """
+
+    @staticmethod
+    def blk(*members):
+        return {"key": "2. Upload results", "hint": "upload saliva sample results",
+                "marker_y": 100, "title": "Upload results",
+                "members": [dict(m, bounds={"x": 500, "y": 200,
+                                            "center_x": 500, "center_y": 200})
+                            for m in members]}
+
+    SPINNER = {"role": "progressbar", "label": "", "value": None}
+    ATTACHED = {"role": "widget", "label": "Informed_Consent Template.pdf"}
+    EMPTY = {"role": "button", "label": "Tap to select files"}
+
+    def test_states(self):
+        self.assertEqual(bd._upload_state(self.blk(self.SPINNER, self.EMPTY)), "busy")
+        self.assertEqual(bd._upload_state(self.blk(self.ATTACHED)), "done")
+        self.assertEqual(bd._upload_state(self.blk(self.EMPTY)), "none")
+
+    def test_an_upload_is_answered_only_when_it_completed(self):
+        self.assertFalse(bd._block_is_answered(self.blk(self.SPINNER, self.EMPTY), 900))
+        self.assertFalse(bd._block_is_answered(self.blk(self.EMPTY), 900))
+        self.assertTrue(bd._block_is_answered(self.blk(self.ATTACHED), 900))
+
+    def test_a_progressbar_WITH_a_value_is_not_a_spinner(self):
+        # The visit's own progress ring always carries a value.
+        ring = {"role": "progressbar", "label": "", "value": "9"}
+        self.assertNotEqual(bd._upload_state(self.blk(ring, self.ATTACHED)), "busy")
+
+    def test_attached_file_types(self):
+        for name in ("scan.pdf", "result.PNG", "notes.docx", "labs.csv"):
+            with self.subTest(name):
+                self.assertEqual(
+                    bd._upload_state(self.blk({"role": "widget", "label": name})), "done")
+
+
+class StuckDefinitionTests(unittest.TestCase):
+    """Stuck is not a timer. It is: the form cannot be submitted AND the
+    deterministic path cannot resolve what is blocking it. That, and only
+    that, is what escalates to the model."""
+
+    def test_a_refusal_with_nothing_to_point_at_is_stuck(self):
+        self.assertTrue(bd._autopilot_is_stuck(0, ("a",), ("a",)))
+
+    def test_corrections_that_changed_nothing_are_stuck(self):
+        self.assertTrue(bd._autopilot_is_stuck(3, ("a", "b"), ("a", "b")))
+
+    def test_corrections_that_changed_something_are_not_stuck(self):
+        self.assertFalse(bd._autopilot_is_stuck(1, ("a", "b"), ("a", "c")))
+
+    def test_progress_means_keep_going_however_small(self):
+        before = (("1. Q", False, ""),)
+        after = (("1. Q", True, ""),)
+        self.assertFalse(bd._autopilot_is_stuck(1, before, after))
 
 
 class NeverClickTests(unittest.TestCase):

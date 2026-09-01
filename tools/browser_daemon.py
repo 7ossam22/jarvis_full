@@ -1721,52 +1721,152 @@ def _visit_is_complete(progress):
     return total > 0 and done == total
 
 
-async def _autopilot_end_visit(page, min_x, report):
-    """End the visit, but only once the counter says every form is submitted.
+#: The confirmation that follows End Visit. Novatek raises a "Continue
+#: participation" dialog and the visit is not ended until it is answered — so
+#: clicking End Visit alone leaves the run halted on a modal.
+_CONTINUE_LABELS = ("continue", "continue participation", "confirm", "yes", "ok", "proceed")
 
-    This is the last step of the flow: all forms filled and submitted, the
-    progress counter verifying it, then End Visit. It is gated rather than
-    forbidden — the click guard stops a STRAY click on End Visit during form
-    filling, which is a different thing from performing it on purpose here.
+
+def _end_visit_button(widgets):
+    """The End Visit control, or None.
+
+    Matched on `contains`: the accessible name is
+    "You can end the visit only when all forms are completed. End Visit" — the
+    helper text comes first, so a startswith test never found it.
     """
-    widgets = await extract_flutter_widgets(page)
-    progress = _autopilot_progress(widgets)
-    if not _visit_is_complete(progress):
-        report["end_visit"] = {
-            "clicked": False,
-            "reason": f"progress reads {progress or 'unknown'} — not ending a visit "
-                      "that is not verified complete",
-        }
-        return False
-    if any(w.get("role") == "dialog" for w in widgets):
-        await _autopilot_clear_dialog(page, widgets)
-        widgets = await extract_flutter_widgets(page)
+    return next((w for w in widgets if w.get("role") == "button"
+                 and "end visit" in (w.get("label") or "").strip().lower()), None)
 
-    # Contains, not startswith: the real label is
-    # "You can end the visit only when all forms are completed. End Visit" —
-    # the helper text is part of the accessible name.
-    button = next((w for w in widgets if w.get("role") == "button"
-                   and "end visit" in (w.get("label") or "").strip().lower()), None)
-    if not button:
-        report["end_visit"] = {"clicked": False, "reason": "no End Visit button on screen"}
+
+def _continue_button(widgets):
+    """The button that confirms the Continue participation dialog, or None.
+
+    Prefers the most specific label present rather than the first plausible
+    one, so a bare "Cancel"-adjacent "OK" cannot win over "Continue".
+    """
+    buttons = [w for w in widgets if w.get("role") == "button" and w.get("label")]
+    for wanted in _CONTINUE_LABELS:
+        for w in buttons:
+            label = (w.get("label") or "").strip().lower()
+            if label == wanted or label.startswith(wanted + " ") or wanted in label.split():
+                return w
+    return None
+
+
+class VisitEnder:
+    """Ends a visit: End Visit, then the Continue participation dialog, then
+    confirm it actually ended.
+
+    The first of the visit-mode sub-autopilots to be split out. It owns one
+    responsibility and reports one structured result, so the orchestrator above
+    it never has to inspect page state itself.
+
+    Two rules it will not break:
+
+    - It ends a visit ONLY when the progress counter reads N/N. Ending is
+      irreversible, so an unreadable or partial counter is a refusal, never a
+      guess.
+    - It will not act while an upload is still in flight, because a question
+      whose file has not landed is not answered, whatever the counter says.
+
+    Result: {"clicked", "confirmed", "reason", "progress_at_end", "steps"}.
+    `confirmed` is the only field that means the visit is actually over.
+    """
+
+    def __init__(self, page, min_x=330):
+        self.page = page
+        self.min_x = min_x
+        self.steps = []
+
+    def _note(self, step):
+        self.steps.append(step)
+
+    def _result(self, clicked, confirmed, reason, progress=None):
+        return {"clicked": clicked, "confirmed": confirmed, "reason": reason,
+                "progress_at_end": progress, "steps": list(self.steps)}
+
+    async def run(self):
+        widgets = await extract_flutter_widgets(self.page)
+
+        progress = _autopilot_progress(widgets)
+        if not _visit_is_complete(progress):
+            return self._result(
+                False, False,
+                f"progress reads {progress or 'unknown'} — not ending a visit that is "
+                "not verified complete", progress)
+
+        if _autopilot_upload_in_flight(_autopilot_panel(widgets, self.min_x)):
+            return self._result(
+                False, False,
+                "an upload is still in flight — the form holding it is not actually "
+                "answered yet", progress)
+
+        # A modal left over from filling would swallow the click.
+        if any(w.get("role") == "dialog" for w in widgets):
+            how = await _autopilot_clear_dialog(self.page, widgets)
+            self._note(f"cleared a dialog first ({how or 'could not'})")
+            widgets = await extract_flutter_widgets(self.page)
+
+        button = _end_visit_button(widgets)
+        if not button:
+            return self._result(False, False, "no End Visit button on screen", progress)
+
+        await _autopilot_click(self.page, button, settle=1500, allow_reserved=True)
+        self._note("clicked End Visit")
+
+        confirmed = await self._confirm_participation()
+        left = await self._left_visit_mode()
+
+        if left:
+            return self._result(True, True, "", progress)
+        reason = ("clicked End Visit"
+                  + (" and confirmed the dialog" if confirmed else
+                     " but the Continue participation dialog was not answered")
+                  + ", yet the Visit Mode screen is still showing")
+        return self._result(True, False, reason, progress)
+
+    async def _confirm_participation(self):
+        """Answer the Continue participation dialog, if it appears.
+
+        It may take a moment to render, and may chain, so this waits for it and
+        then answers up to three dialogs. Returns whether anything was
+        confirmed — False simply means none appeared, which is not a failure.
+        """
+        answered = False
+        for _ in range(3):
+            widgets = None
+            for _wait in range(8):
+                widgets = await extract_flutter_widgets(self.page)
+                if any(w.get("role") == "dialog" for w in widgets):
+                    break
+                await self.page.wait_for_timeout(400)
+            if not widgets or not any(w.get("role") == "dialog" for w in widgets):
+                break
+            button = _continue_button(widgets)
+            if not button:
+                how = await _autopilot_clear_dialog(self.page, widgets)
+                self._note(f"unrecognised dialog after End Visit ({how or 'could not clear'})")
+                break
+            await _autopilot_click(self.page, button, settle=1200, allow_reserved=True)
+            self._note(f"confirmed {(button.get('label') or '')[:40]!r}")
+            answered = True
+        return answered
+
+    async def _left_visit_mode(self):
+        """Leaving Visit Mode is how the end is confirmed — not the click."""
+        for _ in range(12):
+            widgets = await extract_flutter_widgets(self.page)
+            if not _autopilot_visit_ok(widgets):
+                return True
+            await self.page.wait_for_timeout(500)
         return False
 
-    await _autopilot_click(page, button, settle=1500, allow_reserved=True)
-    # Ending navigates away from Visit Mode; that is how it is confirmed.
-    after = await extract_flutter_widgets(page)
-    for _ in range(10):
-        if not _autopilot_visit_ok(after):
-            break
-        await page.wait_for_timeout(500)
-        after = await extract_flutter_widgets(page)
-    left_visit_mode = not _autopilot_visit_ok(after)
-    report["end_visit"] = {
-        "clicked": True,
-        "progress_at_end": progress,
-        "confirmed": left_visit_mode,
-        "reason": "" if left_visit_mode else "clicked, but still on the Visit Mode screen",
-    }
-    return left_visit_mode
+
+async def _autopilot_end_visit(page, min_x, report):
+    """Thin adapter kept so callers and the report shape do not change."""
+    result = await VisitEnder(page, min_x).run()
+    report["end_visit"] = result
+    return result["confirmed"]
 
 
 def _visit_date_box(widgets, min_x):
@@ -2120,6 +2220,32 @@ async def _autopilot_clear_dialog(page, widgets):
     return how
 
 
+def _autopilot_is_stuck(reopened, before_state, after_state):
+    """Whether the run is stuck, in the only sense that matters here.
+
+    Stuck is not "slow" and not "a timer expired". It is: the form cannot be
+    submitted, and the deterministic path cannot resolve what is blocking it —
+    a correction round ran and changed nothing. That is the trigger for asking
+    the model, and nothing else is.
+
+    Args:
+        reopened: how many questions the correction round re-opened.
+        before_state / after_state: comparable snapshots of what is answered,
+            taken either side of that round.
+    """
+    if reopened == 0:
+        return True                      # refused, and nothing to point at
+    return before_state == after_state   # corrections ran but changed nothing
+
+
+def _autopilot_answer_state(panel, inner_h):
+    """A comparable snapshot of what the form currently holds, used to tell a
+    correction round that changed something from one that did not."""
+    return tuple(sorted(
+        (blk["key"], _block_is_answered(blk, inner_h), _block_error_text(blk)[:40])
+        for blk in _autopilot_blocks(panel)))
+
+
 async def _autopilot_reopen_from_card(page, tab_index, min_x, done, attempts, variant,
                                       report, protected=frozenset()):
     """Re-open exactly the questions the Form Incomplete card names.
@@ -2197,6 +2323,48 @@ async def _autopilot_reopen_rejected(page, tab_index, min_x, done, attempts, var
     return reopened
 
 
+#: A filename in the block means the upload landed. Kept alongside the
+#: checkmark test because the card shows the attached file's name too.
+_ATTACHED_FILE_RE = re.compile(r"\.(pdf|png|jpe?g|docx?|csv|xlsx?)\b", re.IGNORECASE)
+
+
+def _upload_state(blk):
+    """"busy" | "done" | "none" for a file-upload question.
+
+    The card shows a circular progress indicator on its right while the file is
+    uploading, which becomes a checkmark on success. That distinction is the
+    whole answer to "is this question answered": it is NOT answered until the
+    upload completes, so the autopilot must neither move on nor press Submit
+    while the indicator is spinning — a form submitted mid-upload looks filled
+    and is not.
+
+    "busy" is an indeterminate progressbar inside the block. The visit's own
+    progress ring always carries a value and lives outside any block, so it is
+    not mistaken for one.
+    """
+    for w in blk["members"]:
+        if w.get("role") == "progressbar" and not str(w.get("value") or "").strip():
+            return "busy"
+    for w in blk["members"]:
+        if _ATTACHED_FILE_RE.search(w.get("label") or ""):
+            return "done"
+    return "none"
+
+
+def _block_is_upload(blk):
+    """Whether this question takes a file at all."""
+    return bool(_UPLOAD_KEYWORD_RE.search(blk.get("hint") or "")) or any(
+        _UPLOAD_KEYWORD_RE.search(w.get("label") or "") for w in blk["members"])
+
+
+def _autopilot_upload_in_flight(panel):
+    """True while any upload on screen is still going.
+
+    Nothing may be clicked — least of all Submit — until this clears.
+    """
+    return any(_upload_state(blk) == "busy" for blk in _autopilot_blocks(panel))
+
+
 def _block_is_answered(blk, inner_h):
     """True when this question already holds a valid answer and shows no error.
 
@@ -2210,6 +2378,10 @@ def _block_is_answered(blk, inner_h):
     """
     if _block_has_error(blk):
         return False
+    if _block_is_upload(blk):
+        # Answered only when the upload actually completed. A spinning
+        # indicator means in flight; nothing means no file yet.
+        return _upload_state(blk) == "done"
     members = [w for w in blk["members"]
                if w["bounds"]["center_y"] > blk["marker_y"] + 12
                and w["bounds"]["center_y"] < inner_h - 10]
@@ -2800,6 +2972,14 @@ async def cmd_autofill_form(payload):
         pending = all_keys - done - {k for k, n in attempts.items() if n >= 3}
         visible_pending = [b for b in blocks_now
                            if b["key"] in pending and b["marker_y"] < inner_h - _AUTOPILOT_BLOCK_MARGIN]
+
+        if _autopilot_upload_in_flight(panel):
+            # A file is still uploading. That question is not answered yet, so
+            # pressing Submit now would submit a form that only looks filled.
+            # Do nothing at all until the indicator clears.
+            await page.wait_for_timeout(600)
+            widgets = await extract_flutter_widgets(page)
+            continue
 
         if submit and not pending:
             # `blocks_now` empty means this is a TABLE form — Concomitant
