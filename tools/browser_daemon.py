@@ -1705,6 +1705,70 @@ def _block_error_text(blk):
 _DATE_TEXT_RE = re.compile(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}")
 
 
+def _visit_is_complete(progress):
+    """True only when the progress counter reads N/N with N > 0.
+
+    The single gate on ending a visit. Anything unreadable, malformed or short
+    of full is not complete — ending a visit is irreversible, so this errs
+    towards not doing it.
+    """
+    if not progress or progress.count("/") != 1:
+        return False
+    try:
+        done, total = (int(x) for x in progress.split("/"))
+    except (ValueError, TypeError):
+        return False
+    return total > 0 and done == total
+
+
+async def _autopilot_end_visit(page, min_x, report):
+    """End the visit, but only once the counter says every form is submitted.
+
+    This is the last step of the flow: all forms filled and submitted, the
+    progress counter verifying it, then End Visit. It is gated rather than
+    forbidden — the click guard stops a STRAY click on End Visit during form
+    filling, which is a different thing from performing it on purpose here.
+    """
+    widgets = await extract_flutter_widgets(page)
+    progress = _autopilot_progress(widgets)
+    if not _visit_is_complete(progress):
+        report["end_visit"] = {
+            "clicked": False,
+            "reason": f"progress reads {progress or 'unknown'} — not ending a visit "
+                      "that is not verified complete",
+        }
+        return False
+    if any(w.get("role") == "dialog" for w in widgets):
+        await _autopilot_clear_dialog(page, widgets)
+        widgets = await extract_flutter_widgets(page)
+
+    # Contains, not startswith: the real label is
+    # "You can end the visit only when all forms are completed. End Visit" —
+    # the helper text is part of the accessible name.
+    button = next((w for w in widgets if w.get("role") == "button"
+                   and "end visit" in (w.get("label") or "").strip().lower()), None)
+    if not button:
+        report["end_visit"] = {"clicked": False, "reason": "no End Visit button on screen"}
+        return False
+
+    await _autopilot_click(page, button, settle=1500, allow_reserved=True)
+    # Ending navigates away from Visit Mode; that is how it is confirmed.
+    after = await extract_flutter_widgets(page)
+    for _ in range(10):
+        if not _autopilot_visit_ok(after):
+            break
+        await page.wait_for_timeout(500)
+        after = await extract_flutter_widgets(page)
+    left_visit_mode = not _autopilot_visit_ok(after)
+    report["end_visit"] = {
+        "clicked": True,
+        "progress_at_end": progress,
+        "confirmed": left_visit_mode,
+        "reason": "" if left_visit_mode else "clicked, but still on the Visit Mode screen",
+    }
+    return left_visit_mode
+
+
 def _visit_date_box(widgets, min_x):
     """The visit's own date field, but ONLY when it is genuinely empty.
 
@@ -2277,15 +2341,20 @@ def _autopilot_click_forbidden(w):
     return ""
 
 
-async def _autopilot_click(page, w, settle=180):
+async def _autopilot_click(page, w, settle=180, allow_reserved=False):
     """Click a widget, unless it is something that would leave the form.
+
+    `allow_reserved` is the deliberate override, used only by
+    _autopilot_end_visit after the progress counter has verified every form is
+    submitted. The guard exists to stop STRAY clicks on those controls, not to
+    forbid the one place a reserved control is genuinely the right action.
 
     The single choke point for every click the autopilot makes, so the guard
     holds no matter which code path chose the widget — the participant-profile
     click that froze a visit walk came from the dropdown-option picker, not
     from the question loop.
     """
-    forbidden = _autopilot_click_forbidden(w)
+    forbidden = "" if allow_reserved else _autopilot_click_forbidden(w)
     if forbidden:
         print(f"[browser-daemon] refused to click {(w.get('label') or '')[:40]!r}: {forbidden}",
               file=sys.stderr)
@@ -3035,9 +3104,12 @@ async def cmd_autofill_visit(payload):
     own flow: each verified submission auto-selects the next unsubmitted form,
     so the loop just fills whatever is open; the sidebar is only consulted
     (via the pixel checkmark scan) when nothing is auto-selected. Stops when
-    the N/M progress counter is full or a form fails to advance it. Never
-    touches End Visit — cmd_takeover_participant (or the model) owns the
-    actual-date + End Visit step."""
+    the N/M progress counter is full or a form fails to advance it.
+
+    Then ends the visit — that is the flow: fill, submit, verify, end. The
+    Actual visit date is filled first, since a visit cannot be ended without
+    it, and End Visit is clicked ONLY once the counter reads N/N. Pass
+    end_visit=False to fill without finishing."""
     tab_index = payload.get("tab_index")
     page = await get_active_page(tab_index=tab_index)
     if not await is_flutter_page(page):
@@ -3196,6 +3268,15 @@ async def cmd_autofill_visit(payload):
     report["progress"] = _autopilot_progress(widgets)
     parts = (report["progress"] or "0/1").split("/")
     report["all_forms_submitted"] = len(parts) == 2 and parts[0] == parts[1]
+
+    # THE FLOW: every form filled and submitted, the counter verifying it, then
+    # End Visit. Gated on the counter alone — never on how the run "felt" it
+    # went. Pass end_visit=False to fill without finishing.
+    if report["all_forms_submitted"] and payload.get("end_visit", True):
+        if await _autopilot_fill_visit_date(page, widgets, time.strftime("%-m/%-d/%Y"),
+                                            report, 330):
+            widgets = await extract_flutter_widgets(page)
+        await _autopilot_end_visit(page, 330, report)
     report["status"] = "visit_filled" if report["all_forms_submitted"] else "visit_incomplete"
     # A blunt sentence, not a status code. The per-form entries each say
     # "autofill_done", and a model summarising this report will happily read a
@@ -3205,8 +3286,16 @@ async def cmd_autofill_visit(payload):
     # room to narrate around.
     counter = report.get("progress") or "unknown"
     if report["all_forms_submitted"]:
+        ended = report.get("end_visit") or {}
+        if ended.get("confirmed"):
+            tail = " The visit has been ended."
+        elif ended.get("clicked"):
+            tail = f" End Visit was clicked but not confirmed: {ended.get('reason', '')}"
+        else:
+            tail = f" The visit was NOT ended: {ended.get('reason', 'end_visit was disabled')}"
         report["verdict"] = (
-            f"COMPLETE - the progress counter reads {counter}. Every form is submitted.")
+            f"COMPLETE - the progress counter reads {counter}. Every form is submitted."
+            + tail)
     else:
         remaining = "unknown"
         try:

@@ -239,6 +239,46 @@ class UploadStatusTests(unittest.TestCase):
         self.assertIn('"file_selected"', src)
 
 
+class EndVisitGateTests(unittest.TestCase):
+    """Ending a visit is irreversible, so it happens only when the progress
+    counter verifies every form is submitted — and it DOES happen then. That
+    is the flow: fill, submit, verify, end.
+
+    The click guard still refuses a STRAY End Visit during form filling; the
+    gated path overrides it deliberately via allow_reserved.
+    """
+
+    def test_a_full_counter_is_complete(self):
+        for progress in ("20/20", "1/1", "18/18"):
+            with self.subTest(progress):
+                self.assertTrue(bd._visit_is_complete(progress))
+
+    def test_anything_short_of_full_is_not(self):
+        for progress in ("9/20", "0/18", "19/20"):
+            with self.subTest(progress):
+                self.assertFalse(bd._visit_is_complete(progress))
+
+    def test_an_unreadable_counter_is_never_complete(self):
+        # Irreversible action: anything ambiguous must fail closed.
+        for progress in (None, "", "unknown", "3", "a/b", "//", "0/0", "5/", "/5"):
+            with self.subTest(repr(progress)):
+                self.assertFalse(bd._visit_is_complete(progress))
+
+    def test_the_real_button_label_is_recognised(self):
+        # REGRESSION: the accessible name carries the helper text first —
+        # "You can end the visit only when all forms are completed. End Visit"
+        # — so a startswith("end visit") match never found it.
+        for label in ("End Visit",
+                      "You can end the visit only when all forms are completed. End Visit",
+                      "end visit"):
+            with self.subTest(label):
+                self.assertIn("end visit", label.strip().lower())
+
+    def test_a_stray_end_visit_click_is_still_refused(self):
+        self.assertTrue(bd._autopilot_click_forbidden(
+            {"label": "End Visit", "bounds": {"center_y": 840}}))
+
+
 class VisitVerdictTests(unittest.TestCase):
     """The visit report's plain-language verdict.
 
