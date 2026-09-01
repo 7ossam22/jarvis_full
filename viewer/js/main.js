@@ -13,6 +13,7 @@ import {
   initVoiceController, pauseMic, resumeMic, enableListening, hasRecognizer,
 } from "./controller/voiceController.js";
 import { handleSubmit, cancelPendingRequests } from "./controller/chatController.js";
+import { startSystemPanel } from "./view/systemPanel.js";
 
 async function boot() {
   initConsole();
@@ -50,3 +51,7 @@ async function boot() {
 }
 
 boot();
+
+// Live system diagnostics, bottom-left: what is running, what is stuck, and
+// every error the server recorded rather than only printing to stderr.
+startSystemPanel();

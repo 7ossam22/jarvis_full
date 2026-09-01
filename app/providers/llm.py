@@ -75,9 +75,22 @@ def call_model(cfg, system_prompt, messages, fallback_text):
     reply. Deliberately broad except: two very differently-shaped backends
     (HTTP APIs, a subprocess CLI) fail in idiosyncratic ways, and there is
     always a safe last resort (fallback_text) below this loop."""
+    from .. import telemetry
+
+    failures = []
     for provider in get_llm_providers(cfg):
         try:
             return provider.converse(system_prompt, messages)
         except Exception as e:
+            failures.append(f"{provider.name}: {e}")
             print(f"[jarvis] {provider.name} model call failed ({e}); trying next…", file=sys.stderr)
+            telemetry.record("provider", f"{provider.name} failed, trying the next backend", e)
+
+    # Every backend failed. Returning the canned apology alone would present a
+    # total outage as an ordinary answer, so say what actually happened — a
+    # silent fallback is how a broken run looks like a working one.
+    if failures:
+        telemetry.record("error", "every model backend failed", "; ".join(failures))
+        return (fallback_text + " (Nothing answered: " + "; ".join(failures)[:300] + ")")
+    telemetry.record("error", "no model backend is configured")
     return fallback_text

@@ -15,7 +15,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import controllers
+from . import controllers, telemetry
 from .config import Config
 from .graph import regenerate_graph
 
@@ -45,10 +45,14 @@ def _prune_chat_jobs():
 
 
 def _run_chat_job(job_id, cfg, body):
+    telemetry.job_started(job_id, (body.get("message") or "")[:80] or "chat")
     try:
         result, status = controllers.handle_chat(cfg, NOTES_DIR, VIEWER_DIR, body)
+        telemetry.job_finished(job_id, ok=(status == 200))
     except Exception as e:
         sys.stderr.write(f"[jarvis] chat job {job_id} failed: {e}\n")
+        telemetry.record("error", "chat job crashed", e)
+        telemetry.job_finished(job_id, ok=False, error=e)
         result, status = {"answer": f"I hit an internal error, sir: {e}", "error": str(e)}, 500
     with _chat_jobs_lock:
         job = _chat_jobs.get(job_id)
@@ -102,6 +106,13 @@ class JarvisHandler(BaseHTTPRequestHandler):
 
         if url_path == "/config":
             self._send_json(controllers.get_public_config(Config.load()))
+            return
+
+        if url_path == "/status":
+            # Live diagnostics for the viewer's system panel: what is running,
+            # whether it looks stuck, and every error that has been recorded
+            # rather than merely printed to a terminal nobody is watching.
+            self._send_json(controllers.handle_status(Config.load()))
             return
 
         if url_path == "/chat/result":

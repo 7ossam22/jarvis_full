@@ -69,9 +69,19 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
     import time
     from .connectors.jira import get_last_jira_result
 
+    from . import telemetry
+
     t0 = time.time()
     system_prompt = persona.build_system_prompt(cfg)
     answer = call_model(cfg, system_prompt, messages, fallback)
+
+    # Errors recorded during THIS turn travel back with the answer. The model
+    # is told to report them, but a small model narrates optimistically — it
+    # offered to end a visit that had not been filled — so the failure is also
+    # returned as data the interface can show regardless of what was said.
+    turn_errors = [e["message"] + (f" — {e['detail']}" if e.get("detail") else "")
+                   for e in telemetry.snapshot(limit=40)["events"]
+                   if e["kind"] == "error" and e["at"] >= t0]
     max_images = cfg.get("images.max_gallery", 6)
     answer, image_urls, video_urls, source_urls, show_url = extract_media_references(answer, max_images)
 
@@ -113,6 +123,7 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
         "show_url": show_url,
         "jira_data": jira_data,
         "screenshot_url": screenshot_url,
+        "errors": turn_errors,
     }, 200
 
 
@@ -359,3 +370,76 @@ def handle_form_assist(cfg, body):
         return {"action": "type", "value": value, "reason": str(parsed.get("reason", ""))[:60]}, 200
 
     return {"action": "skip", "reason": str(parsed.get("reason", ""))[:60]}, 200
+
+
+def handle_status(cfg):
+    """Everything the viewer's system panel shows — GET /status.
+
+    Answers "what is going on right now, and what has gone wrong", which the
+    app previously could not answer at all: a failure existed only as a stderr
+    line, so from the browser a broken run and a working one looked identical.
+
+    Reports live work (with a stuck flag), recorded errors, which model backend
+    is actually in use, how full the conversation is getting, and any config
+    problem that will bite later. Never raises — a diagnostics panel that
+    500s when something is wrong is worse than none.
+    """
+    from . import history, telemetry
+    from .connectors.registry import registry
+    from .providers.llm import get_llm_providers
+
+    snap = telemetry.snapshot()
+
+    problems = []
+    try:
+        providers = [p.name for p in get_llm_providers(cfg)]
+    except Exception as e:                                   # noqa: BLE001
+        providers, _ = [], problems.append(f"provider setup failed: {e}")
+    if not providers:
+        problems.append("no model backend is configured — JARVIS cannot answer at all")
+
+    chosen = (cfg.get("model.provider") or "").strip().lower()
+    if chosen and chosen not in providers:
+        problems.append(
+            f"model.provider is '{chosen}' but that backend is not usable; "
+            f"{'falling back to ' + providers[0] if providers else 'nothing is'}")
+
+    # Conversation size: the practical cause of "it forgot" and of slow turns.
+    max_turns = cfg.get("retrieval.max_history_turns", 6)
+    sessions = []
+    for session_id, turns in list(history.SESSIONS.items()):
+        chars = sum(len(str(t.get("content", ""))) for t in turns)
+        sessions.append({
+            "session": session_id[:8],
+            "turns": len(turns),
+            "chars": chars,
+            "full": len(turns) >= max_turns * 2,
+        })
+    if any(s["full"] for s in sessions):
+        problems.append(
+            f"a conversation has hit its {max_turns}-turn limit — older turns are being "
+            "dropped, so earlier context is already gone")
+
+    # A tool that keeps failing is worth naming before the user asks.
+    failing = {}
+    for event in snap["events"]:
+        if event["kind"] == "error" and event["message"].startswith("tool "):
+            failing[event["message"]] = failing.get(event["message"], 0) + 1
+    for message, count in failing.items():
+        if count >= 2:
+            problems.append(f"repeated failure: {message} ({count}x)")
+
+    return {
+        "busy": snap["busy"],
+        "stuck": snap["stuck"],
+        "running": snap["running"],
+        "error_count": snap["error_count"],
+        "events": snap["events"],
+        "providers": providers,
+        "provider_in_use": providers[0] if providers else None,
+        "model": (cfg.get("model.lmstudio_model_id") if providers[:1] == ["lmstudio"]
+                  else cfg.get("model.model_id")),
+        "tools": len(registry),
+        "sessions": sessions,
+        "problems": problems,
+    }

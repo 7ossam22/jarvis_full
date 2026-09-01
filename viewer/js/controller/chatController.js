@@ -115,6 +115,13 @@ async function handleChat(text) {
     if ((data.image_urls && data.image_urls.length) || (data.video_urls && data.video_urls.length)) {
       referenceWindows.showReferences(data.image_urls, data.video_urls);
     }
+    // A tool failed during this turn. Show it even if the reply did not
+    // mention it — a confident summary must not be the only thing the user
+    // sees when something actually broke.
+    if (Array.isArray(data.errors) && data.errors.length) {
+      for (const err of data.errors.slice(0, 4)) logLine(err, "error");
+    }
+
     if (data.show_url) {
       logLine(`Opening viewer: ${data.show_url}`, "system");
       openShowWindow(data.show_url);

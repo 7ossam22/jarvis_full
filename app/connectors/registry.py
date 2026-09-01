@@ -403,6 +403,7 @@ class ToolRegistry:
         """
         tool = self._tools.get(tool_name)
         if tool is None:
+            _telemetry().record("error", f"model asked for unknown tool {tool_name!r}")
             return {
                 "status": "error",
                 "error": f"Tool '{tool_name}' not found. Available: {', '.join(self.names())}",
@@ -426,12 +427,20 @@ class ToolRegistry:
         except Exception as exc:  # noqa: BLE001 — deliberate: see docstring
             sys.stderr.write(f"[jarvis] tool {tool_name} raised: {exc}\n")
             traceback.print_exc(file=sys.stderr)
+            _telemetry().record("error", f"tool {tool_name} raised", exc)
             return {"status": "error", "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
 # The process-wide registry, pre-loaded with every connector bundle
 # ---------------------------------------------------------------------------
+
+def _telemetry():
+    """Imported lazily: app.telemetry must not become a hard dependency of the
+    connector layer, which is also driven from tests and the CLI."""
+    from .. import telemetry
+    return telemetry
+
 
 registry = ToolRegistry()
 
