@@ -1753,6 +1753,106 @@ def _continue_button(widgets):
     return None
 
 
+class VisitAssessment:
+    """What state is this visit in, before anything is touched?
+
+    Deliberately deterministic. The obvious design is to ask the model "how
+    many forms are submitted, is the date valid, where should we start" — but
+    every one of those is something we read reliably ourselves (the counter,
+    the checkmark scan, the date field), and a model reading them is strictly
+    less reliable: this project produced one announcing a visit complete while
+    the counter read 0/18.
+
+    So the assessment is measured, and the model is consulted only about the
+    part measurement cannot settle — an unfamiliar validation message on the
+    visit date that the hint lists do not recognise.
+
+    Fields:
+        on_visit_mode   whether we are even on the right screen
+        progress        the N/M counter as read
+        submitted/total parsed from it, or None
+        remaining       how many forms still need submitting
+        visit_date      the date currently in the field, or None if empty
+        date_error      a validation message against it, or ""
+        date_blocking   True when the date needs fixing before anything else
+        blocked_by      a one-line reason when the visit cannot be worked on
+    """
+
+    def __init__(self, widgets, min_x=330):
+        self.on_visit_mode = _autopilot_visit_ok(widgets)
+        self.progress = _autopilot_progress(widgets)
+        self.submitted, self.total = ProgressChecker.submitted_of_total(self.progress)
+        self.remaining = ProgressChecker.remaining(self.progress)
+        self.complete = ProgressChecker.is_complete(self.progress)
+
+        box = _visit_date_box(widgets, min_x)
+        self.visit_date_empty = box is not None
+        self.visit_date = None if box is not None else self._current_date(widgets, min_x)
+        self.date_error = self._date_error(widgets, min_x)
+        # A date that is present and unchallenged is finished work: the form
+        # autopilot is forbidden from touching it.
+        self.date_blocking = bool(self.date_error) or self.visit_date_empty
+
+        self.blocked_by = ""
+        if not self.on_visit_mode:
+            self.blocked_by = "not on the Visit Mode screen"
+        elif any(w.get("role") == "dialog" for w in widgets):
+            self.blocked_by = "a dialog is covering the screen"
+
+    @staticmethod
+    def _current_date(widgets, min_x):
+        for w in widgets:
+            if w.get("role") != "textbox":
+                continue
+            if (w.get("bounds") or {}).get("center_x", 10 ** 9) >= min_x:
+                continue
+            value = (w.get("value") or "").strip()
+            if value:
+                return value
+            found = _DATE_TEXT_RE.search(w.get("label") or "")
+            if found:
+                return found.group(0)
+        return None
+
+    @staticmethod
+    def _date_error(widgets, min_x):
+        """A validation message against the visit date, if the app shows one."""
+        for w in widgets:
+            if (w.get("bounds") or {}).get("center_x", 10 ** 9) >= min_x:
+                continue
+            label = (w.get("label") or "").strip()
+            low = label.lower()
+            if "actual visit date" in low and any(h in low for h in _AUTOPILOT_ERROR_HINTS):
+                return label
+        return ""
+
+    def start_from(self):
+        """Where work should begin: "date", "forms", "end", or "blocked"."""
+        if self.blocked_by:
+            return "blocked"
+        if self.date_blocking:
+            return "date"
+        if self.complete:
+            return "end"
+        return "forms"
+
+    def as_dict(self):
+        return {
+            "on_visit_mode": self.on_visit_mode,
+            "progress": self.progress,
+            "submitted": self.submitted,
+            "total": self.total,
+            "remaining": self.remaining,
+            "complete": self.complete,
+            "visit_date": self.visit_date,
+            "visit_date_empty": self.visit_date_empty,
+            "date_error": self.date_error,
+            "date_blocking": self.date_blocking,
+            "blocked_by": self.blocked_by,
+            "start_from": self.start_from(),
+        }
+
+
 class QuestionFiller:
     """Decides what ONE question needs and what value belongs in it.
 
@@ -3481,6 +3581,65 @@ async def _sidebar_checkmarks(page, buttons):
             for b in buttons]
 
 
+class VisitAutopilot:
+    """Runs a visit to completion: assess, fill, verify, end.
+
+    The orchestrator. It owns the loop and the escalation policy; each
+    sub-autopilot owns one job and reports a result, so no component has to
+    inspect page state that is not its own.
+
+        VisitAssessment   where to start, measured not guessed
+        FormSelector      which form next; never one already submitted
+        FormAutopilot     one form, via cmd_autofill_form
+        ProgressChecker   did that submit actually land
+        VisitEnder        End Visit -> Continue participation -> confirm
+
+    The escalation rule, in the sense that was specified: the model is asked
+    ONLY when the deterministic path is stuck — the form cannot be submitted
+    and a correction round changed nothing. It is not a co-driver and not a
+    fallback for slowness. Once it has unstuck the form, the autopilot runs
+    again. That alternation continues until the visit is ended or the budget
+    is spent.
+
+    Budgets exist because "loop until done" against a live app is how a run
+    burns an afternoon: max_forms bounds the walk, max_escalations bounds how
+    often the model is consulted, and a form that fails to advance the counter
+    stops the run for review rather than being retried forever.
+    """
+
+    def __init__(self, page, payload):
+        self.page = page
+        self.payload = dict(payload)
+        self.min_x = int(payload.get("panel_min_x", 330))
+        self.selector = FormSelector(page, self.min_x)
+        self.checker = ProgressChecker()
+        self.max_forms = int(payload.get("max_forms", 40))
+        self.max_escalations = int(payload.get("max_escalations", 6))
+        self.escalations = 0
+        self.report = {"forms": [], "assessment": None, "escalations": [],
+                       "progress": None, "sidebar": []}
+
+    async def assess(self):
+        """Measure the visit before touching it. Recorded in the report so the
+        run's starting point is visible, not implied."""
+        widgets = await extract_flutter_widgets(self.page)
+        assessment = VisitAssessment(widgets, self.min_x)
+        self.report["assessment"] = assessment.as_dict()
+        self.checker.update(widgets)
+        return assessment, widgets
+
+    def note(self, entry):
+        self.report["forms"].append(entry)
+
+    def escalation_budget_left(self):
+        return self.escalations < self.max_escalations
+
+    def record_escalation(self, form, reason, outcome):
+        self.escalations += 1
+        self.report["escalations"].append(
+            {"form": form, "reason": reason, "outcome": outcome})
+
+
 async def cmd_autofill_visit(payload):
     """Fills and submits EVERY form of the visit-mode screen. Rides Novatek's
     own flow: each verified submission auto-selects the next unsubmitted form,
@@ -3502,10 +3661,19 @@ async def cmd_autofill_visit(payload):
         return {"error": "Not on the Visit Mode screen — the autopilot is restricted to visit mode. "
                          "Start the visit first."}
 
-    report = {"forms": [], "progress": _autopilot_progress(widgets)}
-    selector = FormSelector(page)      # owns "which form next", and never
+    # Measure where this visit stands BEFORE touching it: how many forms are
+    # submitted, what the visit date holds, whether anything blocks starting.
+    # Deterministic on purpose — see VisitAssessment.
+    assessment = VisitAssessment(widgets, 330)
+    report = pilot.report
+    report["progress"] = _autopilot_progress(widgets)
+    report["assessment"] = assessment.as_dict()
+    if assessment.blocked_by:
+        report["forms"].append({"error": f"cannot start: {assessment.blocked_by}"})
+    pilot = VisitAutopilot(page, payload)
+    selector = pilot.selector          # owns "which form next", and never
                                        # re-targets one that carries its checkmark
-    checker = ProgressChecker()        # owns the counter, the visit's only
+    checker = pilot.checker            # owns the counter, the visit's only
                                        # source of truth about what landed
     # "Fill whatever is open" is only safe AFTER a verified submit, when Novatek
     # has auto-selected the next unsubmitted form. On the very first pass the

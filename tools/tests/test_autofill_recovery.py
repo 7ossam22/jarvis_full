@@ -239,6 +239,106 @@ class UploadStatusTests(unittest.TestCase):
         self.assertIn('"file_selected"', src)
 
 
+class VisitAssessmentTests(unittest.TestCase):
+    """Where a visit stands before anything is touched — measured, not guessed.
+
+    The obvious design is to ask the model how many forms are submitted and
+    whether the date is valid. Every one of those is something we read
+    reliably ourselves, and a model reading them is strictly less reliable:
+    this project produced one announcing a visit complete while the counter
+    read 0/18. So this is deterministic, and the model is reserved for what
+    measurement cannot settle.
+    """
+
+    @staticmethod
+    def w(label, x=500, y=300, role="widget", value=None):
+        return {"role": role, "label": label, "value": value,
+                "bounds": {"x": x, "y": y, "center_x": x, "center_y": y}}
+
+    def visit(self, progress, date_value=None, date_error=None, on_mode=True):
+        ws = [self.w("Visit Mode" if on_mode else "Welcome Back"), self.w(progress)]
+        ws.append(self.w(date_value or "", 90, 146, "textbox", date_value))
+        if date_error:
+            ws.append(self.w(date_error, 90, 180))
+        return bd.VisitAssessment(ws)
+
+    def test_a_fresh_visit_starts_with_the_date(self):
+        a = self.visit("0/18")
+        self.assertEqual(a.start_from(), "date")
+        self.assertTrue(a.visit_date_empty)
+        self.assertEqual(a.remaining, 18)
+
+    def test_a_visit_mid_way_starts_with_the_forms(self):
+        a = self.visit("9/20", date_value="9/1/2026")
+        self.assertEqual(a.start_from(), "forms")
+        self.assertEqual(a.remaining, 11)
+        self.assertFalse(a.date_blocking)
+
+    def test_a_finished_visit_starts_at_the_end(self):
+        a = self.visit("20/20", date_value="9/1/2026")
+        self.assertEqual(a.start_from(), "end")
+        self.assertTrue(a.complete)
+        self.assertEqual(a.remaining, 0)
+
+    def test_a_rejected_date_blocks_the_forms(self):
+        # A date the app is complaining about must be fixed first — filling
+        # forms underneath it cannot make the visit submittable.
+        a = self.visit("9/20", date_value="9/1/2026",
+                       date_error="Actual visit date is required")
+        self.assertEqual(a.start_from(), "date")
+        self.assertTrue(a.date_blocking)
+
+    def test_a_date_that_is_set_and_unchallenged_is_finished_work(self):
+        a = self.visit("9/20", date_value="9/1/2026")
+        self.assertFalse(a.date_blocking)
+        self.assertEqual(a.visit_date, "9/1/2026")
+
+    def test_the_wrong_screen_is_blocked_not_guessed_at(self):
+        a = self.visit("0/18", on_mode=False)
+        self.assertEqual(a.start_from(), "blocked")
+        self.assertIn("Visit Mode", a.blocked_by)
+
+    def test_an_unreadable_counter_never_reads_as_complete(self):
+        for progress in ("unknown", "", "a/b"):
+            with self.subTest(progress):
+                a = self.visit(progress, date_value="9/1/2026")
+                self.assertFalse(a.complete)
+                self.assertIsNone(a.remaining)
+
+
+class VisitAutopilotTests(unittest.TestCase):
+    """The orchestrator's policy: budgets, and when the model is allowed in."""
+
+    def pilot(self, **payload):
+        return bd.VisitAutopilot(page=None, payload=payload)
+
+    def test_the_model_is_only_consulted_within_a_budget(self):
+        # "Loop until done" against a live app is how a run burns an afternoon.
+        p = self.pilot(max_escalations=2)
+        self.assertTrue(p.escalation_budget_left())
+        p.record_escalation("Form A", "submit refused, nothing changed", "typed 37")
+        self.assertTrue(p.escalation_budget_left())
+        p.record_escalation("Form B", "submit refused, nothing changed", "clicked Oral")
+        self.assertFalse(p.escalation_budget_left())
+
+    def test_escalations_are_recorded_with_their_reason(self):
+        p = self.pilot()
+        p.record_escalation("Serum Chemistry", "no inline error and no card entry", "skip")
+        entry = p.report["escalations"][0]
+        self.assertEqual(set(entry), {"form", "reason", "outcome"})
+        self.assertEqual(entry["form"], "Serum Chemistry")
+
+    def test_components_are_wired_and_shared(self):
+        p = self.pilot()
+        self.assertIsInstance(p.selector, bd.FormSelector)
+        self.assertIsInstance(p.checker, bd.ProgressChecker)
+
+    def test_budgets_are_configurable_per_run(self):
+        p = self.pilot(max_forms=3, max_escalations=1)
+        self.assertEqual(p.max_forms, 3)
+        self.assertEqual(p.max_escalations, 1)
+
+
 class QuestionFillerTests(unittest.TestCase):
     """What a question needs, and what value belongs in it.
 
