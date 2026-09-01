@@ -41,6 +41,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
+from .web_fetch import WEB_FETCH_SCHEMA, execute_web_fetch
 from .web_search import WEB_SEARCH_SCHEMA, execute_web_search
 
 # ---------------------------------------------------------------------------
@@ -498,18 +499,43 @@ _register_builtin_connectors(registry)
 # Standalone tools
 # ---------------------------------------------------------------------------
 
-# Web search is read-only, touches nothing on the machine, and is the one
-# capability every backend needs — so it is open to all of them. It replaces
-# the provider-native search tools (Anthropic's server-side `web_search`,
-# Gemini's `google_search`), which gave three different behaviours and left a
-# local LM Studio model with none at all. Registering it under the name
-# `web_search` is also why the Anthropic provider no longer declares its own:
-# two tools of that name in one request is an API error.
+# Web search, for the backends that have none of their own — which is the gap
+# this tool was written to fill. Anthropic and Gemini each run a real search
+# index server-side (`web_search` and `google_search`, declared in their own
+# provider modules), and those are markedly better than scraping DuckDuckGo
+# Lite: a real index, real ranking, no bot-blocking. A local LM Studio model
+# has nothing, so it gets this.
+#
+# Hence only_llm=True with no extra providers: not because search is dangerous,
+# but because on a hosted backend it would be the *worse* of two options. On
+# Anthropic it would also collide outright — its built-in tool is named
+# `web_search` too, and two tools of one name in a request is an API error.
+#
+# To hand every provider the same scraped search instead (identical behaviour
+# everywhere, at a quality cost), set only_llm=False here and delete the
+# native declarations in anthropic_provider.py and gemini_provider.py.
 registry.register(
     WEB_SEARCH_SCHEMA["name"],
     WEB_SEARCH_SCHEMA["description"],
     WEB_SEARCH_SCHEMA["input_schema"],
     execute_web_search,
+    only_llm=True,
+    allowed_providers=None,
+)
+
+# web_fetch reads one page the model picked, usually a URL web_search just
+# returned — snippets name a source but rarely carry the actual figure asked
+# for. Open to every provider on the same reasoning: it is read-only and
+# reaches nothing on this machine. That last part is enforced, not assumed —
+# app/connectors/web_fetch.py refuses non-http(s) schemes and any address that
+# is not globally routable, on the original URL and on every redirect hop, so
+# it cannot be turned into a way to read localhost:4701 (the browser daemon),
+# the cloud metadata endpoint, or file:///etc/passwd.
+registry.register(
+    WEB_FETCH_SCHEMA["name"],
+    WEB_FETCH_SCHEMA["description"],
+    WEB_FETCH_SCHEMA["input_schema"],
+    execute_web_fetch,
     only_llm=False,
     allowed_providers=[ANTHROPIC, GEMINI, LMSTUDIO],
 )

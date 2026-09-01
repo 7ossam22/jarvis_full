@@ -157,14 +157,36 @@ class RegistryTests(unittest.TestCase):
         return {t.get("name") or t["function"]["name"]
                 for t in registry.get_tools_for_provider(provider)}
 
-    def test_registered_and_offered_to_every_provider(self):
-        for p in (ANTHROPIC, GEMINI, LMSTUDIO):
+    def test_offered_only_to_backends_without_search_of_their_own(self):
+        # Anthropic and Gemini each run a real search index server-side
+        # (`web_search`, `google_search`), declared in their own provider
+        # modules and better than scraping DuckDuckGo. This tool exists for
+        # backends that have neither — see the registration in registry.py.
+        self.assertIn("web_search", self.offered(LMSTUDIO))
+        for p in (ANTHROPIC, GEMINI):
             with self.subTest(p):
-                self.assertIn("web_search", self.offered(p))
+                self.assertNotIn("web_search", self.offered(p))
 
-    def test_only_llm_false_reaches_even_an_unlisted_provider(self):
-        self.assertFalse(registry.get("web_search").only_llm)
-        self.assertTrue(registry.get("web_search").is_allowed_for(OPENAI))
+    def test_gated_as_local_only(self):
+        tool = registry.get("web_search")
+        self.assertTrue(tool.only_llm)
+        self.assertTrue(tool.is_allowed_for(LMSTUDIO))
+        for p in (ANTHROPIC, GEMINI, OPENAI):
+            with self.subTest(p):
+                self.assertFalse(tool.is_allowed_for(p))
+
+    def test_dispatch_refuses_a_hosted_provider(self):
+        out = registry.dispatch("web_search", {"query": "x"}, ANTHROPIC, None)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("restricted", out["error"])
+
+    def test_no_clash_with_anthropics_own_web_search(self):
+        # anthropic_provider.py injects {"name": "web_search"} of its own; the
+        # registry must not also offer one, or the request is rejected.
+        from app.providers import anthropic_provider as ap
+        self.assertNotIn("web_search", self.offered(ANTHROPIC))
+        import inspect
+        self.assertIn("web_search_20260209", inspect.getsource(ap.call_anthropic))
 
     def test_no_duplicate_tool_names_in_any_payload(self):
         # Regression: the Anthropic provider used to declare its own server-side
@@ -177,22 +199,23 @@ class RegistryTests(unittest.TestCase):
                 self.assertEqual(len(names), len(set(names)))
 
     def test_schema_shape_per_provider(self):
-        a = next(t for t in registry.get_tools_for_provider(ANTHROPIC) if t["name"] == "web_search")
-        g = next(t for t in registry.get_tools_for_provider(GEMINI) if t["name"] == "web_search")
+        # web_search is local-only now, so shape-check it on LM Studio and use
+        # web_fetch (offered everywhere) for the hosted wire formats.
         o = next(t for t in registry.get_tools_for_provider(LMSTUDIO)
                  if t["function"]["name"] == "web_search")
+        self.assertEqual(o["type"], "function")
+        self.assertEqual(o["function"]["parameters"]["required"], ["query"])
+        a = next(t for t in registry.get_tools_for_provider(ANTHROPIC) if t["name"] == "web_fetch")
+        g = next(t for t in registry.get_tools_for_provider(GEMINI) if t["name"] == "web_fetch")
         self.assertEqual(set(a), {"name", "description", "input_schema"})
         self.assertEqual(set(g), {"name", "description", "parameters"})
-        self.assertEqual(o["type"], "function")
-        for schema in (a["input_schema"], g["parameters"], o["function"]["parameters"]):
-            self.assertEqual(schema["required"], ["query"])
 
     def test_dispatch_shields_a_raising_handler(self):
         real = registry.get("web_search").handler
         try:
             object.__setattr__(registry.get("web_search"), "handler",
                                lambda _a: (_ for _ in ()).throw(RuntimeError("boom")))
-            out = registry.dispatch("web_search", {"query": "x"}, ANTHROPIC, None)
+            out = registry.dispatch("web_search", {"query": "x"}, LMSTUDIO, None)
             self.assertEqual(out, {"status": "error", "error": "boom"})
         finally:
             object.__setattr__(registry.get("web_search"), "handler", real)

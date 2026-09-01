@@ -39,13 +39,16 @@ def call_gemini(cfg, system_prompt, messages):
     api_key = cfg.get("model.gemini_api_key")
     model = cfg.get("model.gemini_model_id") or DEFAULT_MODEL
 
-    # Every tool comes from the registry, already converted to Gemini's shape
-    # and filtered to what this provider may see. Gemini's own server-side
-    # `google_search` used to sit alongside these; it was removed when
-    # app/connectors/web_search.py made search a locally-executed registry tool,
-    # so all three backends now search identically rather than each using
-    # whatever their vendor happened to provide.
+    # google_search is Gemini's own server-side tool: a real search index, run
+    # on Google's side, and markedly better than the registry's web_search
+    # (which scrapes DuckDuckGo Lite for backends that have no search at all).
+    # There is no name clash between the two — Anthropic's built-in happens to
+    # be called `web_search` and does clash, Gemini's does not — so nothing
+    # forced its removal, and removing it was a straight quality loss. The
+    # registry supplies everything else, already converted to Gemini's shape,
+    # web_fetch included, so the model can still read a page it found.
     tools = [
+        {"google_search": {}},
         {"function_declarations": registry.get_tools_for_provider(GEMINI)},
     ]
 
@@ -54,12 +57,10 @@ def call_gemini(cfg, system_prompt, messages):
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
         "tools": tools,
-        # NOTE: "tool_config": {"include_server_side_tool_invocations": True}
-        # used to be required here, but only because a built-in tool
-        # (google_search) was combined with custom function_declarations in one
-        # request. With no built-in tool left in the payload that condition no
-        # longer holds, so it is gone; restore it if a server-side tool is ever
-        # added back alongside the declarations.
+        # Required as of the current API whenever a built-in tool (google_search)
+        # is combined with custom function_declarations in one request — without
+        # it Gemini rejects the call with a 400 INVALID_ARGUMENT.
+        "tool_config": {"include_server_side_tool_invocations": True},
     }
 
     url = f"{API_BASE}/{model}:generateContent?key={api_key}"
