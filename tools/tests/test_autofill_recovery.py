@@ -239,6 +239,69 @@ class UploadStatusTests(unittest.TestCase):
         self.assertIn('"file_selected"', src)
 
 
+class ProgressCheckerTests(unittest.TestCase):
+    """The counter is the visit's only source of truth about what landed."""
+
+    def test_reads_submitted_and_total(self):
+        self.assertEqual(bd.ProgressChecker.submitted_of_total("9/20"), (9, 20))
+        self.assertEqual(bd.ProgressChecker.submitted_of_total("0/18"), (0, 18))
+
+    def test_unreadable_counters_yield_none(self):
+        for progress in (None, "", "3", "a/b", "//", "unknown"):
+            with self.subTest(repr(progress)):
+                self.assertEqual(bd.ProgressChecker.submitted_of_total(progress), (None, None))
+                self.assertIsNone(bd.ProgressChecker.remaining(progress))
+                self.assertFalse(bd.ProgressChecker.is_complete(progress))
+
+    def test_remaining_counts_what_is_left(self):
+        self.assertEqual(bd.ProgressChecker.remaining("9/20"), 11)
+        self.assertEqual(bd.ProgressChecker.remaining("20/20"), 0)
+
+    def test_update_reports_whether_a_submit_landed(self):
+        checker = bd.ProgressChecker()
+        w = lambda p: [{"role": "widget", "label": p,
+                        "bounds": {"x": 1, "y": 1, "center_x": 1, "center_y": 1}}]
+        # First reading establishes a baseline; it is not "advanced".
+        self.assertEqual(checker.update(w("9/20")), ("9/20", False))
+        self.assertEqual(checker.update(w("9/20")), ("9/20", False))
+        self.assertEqual(checker.update(w("10/20")), ("10/20", True))
+
+    def test_an_unreadable_reading_does_not_clobber_the_last_good_one(self):
+        checker = bd.ProgressChecker()
+        w = lambda p: [{"role": "widget", "label": p,
+                        "bounds": {"x": 1, "y": 1, "center_x": 1, "center_y": 1}}]
+        checker.update(w("9/20"))
+        checker.update(w("nothing here"))
+        self.assertEqual(checker.last, "9/20")
+
+
+class FormSelectorTests(unittest.TestCase):
+    """Which form to work on next — and which never to touch again."""
+
+    def test_a_selected_form_is_not_targeted_twice(self):
+        selector = bd.FormSelector(page=None)
+        row = {"label": "Vital Signs", "bounds": {"x": 16, "width": 288, "center_y": 330}}
+        selector.attempted.add(row["label"])
+        # The filter the scan applies: attempted forms drop out even when the
+        # checkmark scan still reports them unchecked.
+        remaining = [r for r, checked in [(row, False)]
+                     if not checked and r["label"] not in selector.attempted]
+        self.assertEqual(remaining, [])
+
+    def test_checked_forms_are_never_targeted(self):
+        selector = bd.FormSelector(page=None)
+        rows = [({"label": "Nivolumab Form"}, True), ({"label": "Saliva Samples"}, False)]
+        remaining = [r for r, checked in rows
+                     if not checked and r["label"] not in selector.attempted]
+        self.assertEqual([r["label"] for r in remaining], ["Saliva Samples"])
+
+    def test_the_scan_result_is_exposed_for_reporting(self):
+        # Whether a form counts as submitted decides if it gets re-answered,
+        # so it must be visible from outside rather than an internal detail.
+        selector = bd.FormSelector(page=None)
+        self.assertEqual(selector.last_scan, [])
+
+
 class VisitEnderTests(unittest.TestCase):
     """The first sub-autopilot split out of the monolith: End Visit, then the
     Continue participation dialog, then confirm the visit actually ended.

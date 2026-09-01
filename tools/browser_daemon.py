@@ -1753,6 +1753,134 @@ def _continue_button(widgets):
     return None
 
 
+class ProgressChecker:
+    """Reads the visit's N/M form-progress counter, and says what changed.
+
+    The counter is the visit's single source of truth: it decides whether a
+    form's submission actually landed, whether the visit may be ended, and
+    whether a run is making progress at all. Everything else — a form's own
+    "autofill_done", a success banner, the absence of a Submit button — is
+    weaker evidence, and this session produced a model claiming a visit was
+    finished while the counter read 0/18.
+
+    Holds the last reading so callers can ask "did that submit count?" without
+    tracking it themselves.
+    """
+
+    def __init__(self):
+        self.last = None
+
+    @staticmethod
+    def read(widgets):
+        """The counter as "N/M", or None when it cannot be read."""
+        return _autopilot_progress(widgets)
+
+    def update(self, widgets):
+        """Record a fresh reading. Returns (progress, advanced)."""
+        progress = _autopilot_progress(widgets)
+        advanced = bool(progress and self.last and progress != self.last)
+        if progress:
+            self.last = progress
+        return progress, advanced
+
+    @staticmethod
+    def submitted_of_total(progress):
+        """(submitted, total) or (None, None) if unreadable."""
+        if not progress or progress.count("/") != 1:
+            return None, None
+        try:
+            done, total = (int(x) for x in progress.split("/"))
+        except (ValueError, TypeError):
+            return None, None
+        return done, total
+
+    @classmethod
+    def is_complete(cls, progress):
+        return _visit_is_complete(progress)
+
+    @classmethod
+    def remaining(cls, progress):
+        """How many forms are still unsubmitted, or None."""
+        done, total = cls.submitted_of_total(progress)
+        return None if done is None else total - done
+
+
+class FormSelector:
+    """Finds the next form that still needs filling, and selects it.
+
+    Two rules, both learned the hard way:
+
+    - A form carrying the sidebar checkmark is NEVER selected. The semantics
+      tree renders checked and unchecked rows identically, so the checkmark
+      exists only as pixels; when that scan was broken, completed forms were
+      re-opened and re-answered.
+    - After a verified submit Novatek auto-selects the next unsubmitted form,
+      and filling whatever is open is then correct. But on the FIRST pass the
+      open form is whatever was last left selected and may already be done, so
+      the first target always comes from the scan.
+    """
+
+    def __init__(self, page, min_x=330):
+        self.page = page
+        self.min_x = min_x
+        self.attempted = set()
+        self.last_scan = []
+
+    async def _rows(self, widgets, inner_h):
+        rows = [w for w in widgets if w.get("role") == "button"
+                and w["bounds"]["center_x"] < self.min_x and w.get("label")
+                and not any(r in w["label"].lower() for r in _AUTOPILOT_SIDEBAR_RESERVED)
+                and w["bounds"]["center_y"] > 250
+                and w["bounds"]["center_y"] < inner_h - 20]
+        rows.sort(key=lambda w: w["bounds"]["center_y"])
+        return rows
+
+    async def scan(self, widgets, inner_h):
+        """Every sidebar form with whether it is already submitted.
+
+        Recorded on the instance so the caller can report it: whether a form
+        counts as submitted decides if it gets re-answered, and when that
+        judgement is wrong there is otherwise no way to see it from outside.
+        """
+        rows = await self._rows(widgets, inner_h)
+        if not rows:
+            self.last_scan = []
+            return []
+        checks = await _sidebar_checkmarks(self.page, rows)
+        self.last_scan = [
+            {"form": (r.get("label") or "")[:48], "checked": bool(c),
+             "bounds": {k: r["bounds"].get(k) for k in ("x", "width", "center_y")}}
+            for r, c in zip(rows, checks)]
+        return list(zip(rows, checks))
+
+    async def next_unsubmitted(self, widgets, inner_h, scroll_tries=6):
+        """The next form needing work, or None. Scrolls the list to find one."""
+        for _ in range(scroll_tries):
+            scanned = await self.scan(widgets, inner_h)
+            open_forms = [row for row, checked in scanned
+                          if not checked and (row.get("label") or "") not in self.attempted]
+            if open_forms:
+                return open_forms[0]
+            # Everything visible is done or already tried, yet the counter says
+            # more remain — the list itself scrolls.
+            await self.page.mouse.move(160, inner_h // 2)
+            await self.page.mouse.wheel(0, 400)
+            await self.page.wait_for_timeout(350)
+            widgets = await extract_flutter_widgets(self.page)
+        return None
+
+    async def select(self, row):
+        """Open a form and wait for its questions to render."""
+        self.attempted.add(row.get("label") or "")
+        await _autopilot_click(self.page, row, settle=1000)
+        for _ in range(10):
+            widgets = await extract_flutter_widgets(self.page)
+            if _autopilot_blocks(_autopilot_panel(widgets, self.min_x)):
+                return widgets
+            await self.page.wait_for_timeout(400)
+        return await extract_flutter_widgets(self.page)
+
+
 class VisitEnder:
     """Ends a visit: End Visit, then the Continue participation dialog, then
     confirm it actually ended.
@@ -3301,7 +3429,10 @@ async def cmd_autofill_visit(payload):
                          "Start the visit first."}
 
     report = {"forms": [], "progress": _autopilot_progress(widgets)}
-    attempted = set()  # form labels already worked on this run — never re-target
+    selector = FormSelector(page)      # owns "which form next", and never
+                                       # re-targets one that carries its checkmark
+    checker = ProgressChecker()        # owns the counter, the visit's only
+                                       # source of truth about what landed
     # "Fill whatever is open" is only safe AFTER a verified submit, when Novatek
     # has auto-selected the next unsubmitted form. On the very first pass the
     # open form is whatever the user happened to leave selected, which may
@@ -3372,7 +3503,7 @@ async def cmd_autofill_visit(payload):
             # Let the auto-selection of the next form settle before re-reading.
             await page.wait_for_timeout(1000)
             widgets = await extract_flutter_widgets(page)
-            new_progress = _autopilot_progress(widgets)
+            new_progress = checker.read(widgets)
             if new_progress == progress and not form_res.get("submit_verified"):
                 report["forms"].append({"note": "open form did not advance progress — stopping for review"})
                 break
@@ -3384,49 +3515,13 @@ async def cmd_autofill_visit(payload):
         # unchecked buttons identically — the checkmark exists only as
         # pixels, so this scan is what keeps an already-submitted form from
         # ever being re-selected.
-        target = None
         inner_h = await page.evaluate("() => window.innerHeight")
-        for _scroll_try in range(6):
-            sidebar = [w for w in widgets if w.get("role") == "button"
-                       and w["bounds"]["center_x"] < 330 and w.get("label")
-                       and not any(r in w["label"].lower() for r in _AUTOPILOT_SIDEBAR_RESERVED)
-                       and w["bounds"]["center_y"] > 250
-                       and w["bounds"]["center_y"] < inner_h - 20]
-            sidebar.sort(key=lambda w: w["bounds"]["center_y"])
-            if sidebar:
-                checks = await _sidebar_checkmarks(page, sidebar)
-                # Report what the scan actually saw. Whether a form counts as
-                # already submitted decides if it gets re-answered, so this is
-                # not incidental logging — when the scan is wrong the run
-                # rewrites finished work, and there was no way to see that from
-                # the outside.
-                report["sidebar"] = [
-                    {"form": (b.get("label") or "")[:48], "checked": bool(c),
-                     "bounds": {k: b["bounds"].get(k) for k in ("x", "width", "center_y")}}
-                    for b, c in zip(sidebar, checks)]
-                open_forms = [b for b, c in zip(sidebar, checks)
-                              if not c and (b.get("label") or "") not in attempted]
-                if open_forms:
-                    target = open_forms[0]
-                    break
-            # Every on-screen form is checked (or already attempted) but the
-            # counter says more remain — scroll the sidebar list for the rest.
-            await page.mouse.move(160, inner_h // 2)
-            await page.mouse.wheel(0, 400)
-            await page.wait_for_timeout(350)
-            widgets = await extract_flutter_widgets(page)
+        target = await selector.next_unsubmitted(widgets, inner_h)
+        report["sidebar"] = selector.last_scan
         if target is None:
             report["forms"].append({"error": "no unchecked form found in the sidebar despite incomplete progress"})
             break
-        await _autopilot_click(page, target, settle=1000)
-        # Give the form time to render its first questions.
-        for _ in range(10):
-            widgets = await extract_flutter_widgets(page)
-            if _autopilot_blocks(_autopilot_panel(widgets, 330)):
-                break
-            await page.wait_for_timeout(400)
-
-        attempted.add(target.get("label") or "")
+        widgets = await selector.select(target)
         trust_open_form = True   # from here on Novatek drives the selection
         form_res = await cmd_autofill_form(dict(payload, skip_visit_date=visit_date_done))
         visit_date_done = True   # visit-level: set once, never per form
