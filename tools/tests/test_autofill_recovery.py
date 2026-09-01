@@ -239,6 +239,107 @@ class UploadStatusTests(unittest.TestCase):
         self.assertIn('"file_selected"', src)
 
 
+class QuestionFillerTests(unittest.TestCase):
+    """What a question needs, and what value belongs in it.
+
+    Every classification bug of this project lived in this decision, so it is
+    tested as a pure function with the precedence spelled out: what the form
+    TELLS us beats what we infer, and guessing is the last resort.
+    """
+
+    @staticmethod
+    def blk(hint, *chips, role="widget"):
+        return {"key": "1. " + hint, "hint": hint.lower(), "title": hint,
+                "marker_y": 100,
+                "members": [{"role": role, "label": c,
+                             "bounds": {"x": 1, "y": 1, "center_x": 1, "center_y": 1}}
+                            for c in chips]}
+
+    def setUp(self):
+        self.f = bd.QuestionFiller(today="9/1/2026", now_hhmm="14:30")
+
+    # -- precedence -------------------------------------------------------
+
+    def test_a_named_format_beats_everything(self):
+        value, why = self.f.value_for(self.blk("visit date"), 0, "Invalid format (M/d/yyyy)")
+        self.assertIn("format from validator", why)
+        self.assertEqual(len(value.split("/")), 3)
+
+    def test_a_named_kind_beats_the_hint(self):
+        # "Who Administered the Dose?" matches the "dose" NUMBER hint, but the
+        # validator says letters — the validator wins.
+        value, why = self.f.value_for(
+            self.blk("who administered the dose?"), 0, "Only letters are allowed")
+        self.assertIn("letters only", why)
+        self.assertFalse(value.isdigit())
+
+    def test_a_displayed_range_beats_the_ladder(self):
+        value, why = self.f.value_for(self.blk("body temperature", "36.5 - 37.5"), 0)
+        self.assertIn("range", why)
+        self.assertTrue(36.5 <= float(value) <= 37.5)
+
+    def test_temperature_is_unanswerable_by_guessing(self):
+        # The decisive case for reading the chip: no ladder candidate is inside
+        # the only band the field accepts.
+        ladder = bd._autopilot_variants("body temperature", "9/1/2026", "14:30", "test", "55")
+        numeric = [c for c in ladder if c.replace(".", "").isdigit()]
+        self.assertFalse(any(36.5 <= float(c) <= 37.5 for c in numeric))
+
+    def test_date_and_time_chips_are_not_treated_as_value_bands(self):
+        # A date question's chips are not a numeric range to answer from.
+        value, _ = self.f.value_for(self.blk("visit date", "1 - 31"), 0)
+        self.assertIn("/", value)
+
+    # -- the ladder -------------------------------------------------------
+
+    def test_the_ladder_cycles_and_never_clamps(self):
+        seen = [self.f.value_for(self.blk("free entry"), i)[0] for i in range(10)]
+        ladder = self.f.candidates(self.blk("free entry"))
+        self.assertEqual(set(seen), set(ladder))
+        self.assertEqual(seen[0], seen[len(ladder)])   # wrapped, not stuck
+
+    def test_alpha_and_numeric_ladders_never_offer_the_wrong_kind(self):
+        for i in range(8):
+            alpha, _ = self.f.value_for(self.blk("name"), i, "only letters")
+            self.assertFalse(alpha.isdigit())
+            numeric, _ = self.f.value_for(self.blk("notes"), i, "valid number")
+            self.assertTrue(numeric.isdigit())
+
+    def test_every_reason_names_the_rule_that_decided(self):
+        # A wrong answer must be traceable to the rule that produced it.
+        for err, expect in [("Invalid format (M/d/yyyy)", "format"),
+                            ("only letters", "letters"),
+                            ("valid number", "numbers"),
+                            ("", "candidate")]:
+            with self.subTest(err):
+                _, why = self.f.value_for(self.blk("free entry"), 0, err)
+                self.assertIn(expect, why)
+
+    # -- classification ---------------------------------------------------
+
+    def test_classify_picks_what_the_question_NEEDS(self):
+        sign = [{"role": "button", "label": "Sign Now"}]
+        text = [{"role": "textbox", "label": ""}]
+        choice = [{"role": "button", "label": "Yes"}]
+        check = [{"role": "checkbox", "label": "", "value": None}]
+        self.assertEqual(self.f.classify(self.blk("sig"), sign), "signature")
+        self.assertEqual(self.f.classify(self.blk("notes"), text), "text")
+        self.assertEqual(self.f.classify(self.blk("route"), choice), "choice")
+        self.assertEqual(self.f.classify(self.blk("agree"), check), "checkbox")
+        self.assertEqual(self.f.classify(self.blk("nothing"), []), "none")
+
+    def test_signature_outranks_a_plain_choice(self):
+        # "Sign Now" is a button; treating it as an answer option opened the
+        # credentials modal and left it hanging.
+        members = [{"role": "button", "label": "Sign Now"}, {"role": "button", "label": "Yes"}]
+        self.assertEqual(self.f.classify(self.blk("signature"), members), "signature")
+
+    def test_an_upload_question_is_classified_as_upload(self):
+        blk = self.blk("upload saliva sample results")
+        self.assertEqual(self.f.classify(blk, [{"role": "button", "label": "Tap to select files"}]),
+                         "upload")
+
+
 class ProgressCheckerTests(unittest.TestCase):
     """The counter is the visit's only source of truth about what landed."""
 

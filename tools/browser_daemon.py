@@ -1753,6 +1753,104 @@ def _continue_button(widgets):
     return None
 
 
+class QuestionFiller:
+    """Decides what ONE question needs and what value belongs in it.
+
+    This is where every classification bug of this project lived, so it is
+    extracted as a pure decision — no page, no clicking — and tested directly:
+
+    - "Who Administered the Dose?" matched the "dose" number hint and was
+      answered with 55, into a field that accepts letters only.
+    - "SpO₂" uses a subscript two, so the "spo2" hint never matched and a
+      numeric field was sent "test".
+    - "spo" matched "response" as a bare substring.
+    - The candidate ladder clamped instead of cycling, so once past the end it
+      retyped the one invalid date format forever.
+
+    The precedence below is the lesson those bugs taught, in order of how much
+    the form itself is telling us:
+
+        1. a format the validator NAMED          "Invalid format (M/d/yyyy)"
+        2. a kind the validator NAMED            "only letters" / "valid number"
+        3. a range the question DISPLAYS         "Ranges: 36.5 - 37.5"
+        4. the type-hint ladder                  a guess, cycled not clamped
+
+    Guessing is the last resort, not the first move: no candidate in the
+    numeric ladder is inside 36.5-37.5, so a body-temperature question is
+    unanswerable by guessing and trivially answerable by reading its chip.
+    """
+
+    #: Used once the validator says a field takes letters. Every numeric
+    #: candidate is guaranteed to be refused, so the ladder is abandoned.
+    ALPHA_LADDER = ("Admin", "Nurse", "Staff")
+    #: Likewise once it says the field takes numbers.
+    NUMERIC_LADDER = ("1", "10", "0")
+
+    def __init__(self, text_value="test", number_value="55", today=None, now_hhmm=None):
+        self.text_value = text_value
+        self.number_value = str(number_value)
+        self.today = today or time.strftime("%-m/%-d/%Y")
+        self.now_hhmm = now_hhmm or time.strftime("%H:%M")
+
+    def candidates(self, blk):
+        """The ordered answers to try for a free-entry question.
+
+        A range the question displays is promoted to the front — it is stated
+        fact rather than inference — except for dates and times, whose chips
+        are not value bands.
+        """
+        hint = blk.get("hint") or ""
+        ladder = _autopilot_variants(hint, self.today, self.now_hhmm,
+                                     self.text_value, self.number_value)
+        in_range = _autopilot_range_value(blk)
+        if in_range and not any(k in hint for k in ("date", "time")):
+            return [in_range] + [c for c in ladder if c != in_range]
+        return ladder
+
+    def value_for(self, blk, variant_index=0, error_text=""):
+        """The value to type, and why. Returns (value, reason).
+
+        `reason` names which rule decided it, so a wrong answer is traceable
+        to the rule that produced it rather than being a bare string.
+        """
+        demanded = _format_from_error(error_text)
+        if demanded:
+            return time.strftime(demanded), f"format from validator: {demanded}"
+
+        kind = _kind_from_error(error_text)
+        if kind == "alpha":
+            ladder = (self.text_value,) + self.ALPHA_LADDER
+            return ladder[variant_index % len(ladder)], "validator says letters only"
+        if kind == "numeric":
+            ladder = (self.number_value,) + self.NUMERIC_LADDER
+            return ladder[variant_index % len(ladder)], "validator says numbers only"
+
+        candidates = self.candidates(blk)
+        # Cycle, never clamp: clamping parks on the LAST candidate forever, and
+        # for dates that one is the invalid format.
+        value = candidates[variant_index % len(candidates)]
+        if variant_index == 0 and _autopilot_range_value(blk) == value:
+            return value, "from the range the question displays"
+        return value, f"candidate {variant_index % len(candidates)}"
+
+    @staticmethod
+    def classify(blk, below_title):
+        """What kind of question this is: what it needs, not what it says."""
+        if any(w.get("role") == "button" and _is_sign_label(w.get("label"))
+               for w in below_title):
+            return "signature"
+        if _block_is_upload(blk):
+            return "upload"
+        if any(w.get("role") == "textbox" for w in below_title):
+            return "text"
+        if any(w.get("role") in ("checkbox", "switch") and w.get("value") != "checked"
+               for w in below_title):
+            return "checkbox"
+        if any(w.get("role") == "button" and w.get("label") for w in below_title):
+            return "choice"
+        return "none"
+
+
 class ProgressChecker:
     """Reads the visit's N/M form-progress counter, and says what changed.
 
@@ -2795,6 +2893,9 @@ async def cmd_autofill_form(payload):
 
     today = time.strftime("%-m/%-d/%Y")
     now_hhmm = time.strftime("%H:%M")
+    # Owns "what does this question need, and what value belongs in it" —
+    # the decision, separately from the clicking.
+    filler = QuestionFiller(text_value, number_value, today, now_hhmm)
 
     report = {"answered": [], "unresolved": [], "corrections": [], "llm_assists": [],
               "incomplete_card": [], "submit_outcome": None, "rounds": 0,
@@ -3002,13 +3103,6 @@ async def cmd_autofill_form(payload):
             elif boxes_empty:
                 # On a retry round, a swallowed 'test' means a digit-only
                 # field — go straight to the number default.
-                candidates = _autopilot_variants(hint, today, now_hhmm,
-                                                 text_value, number_value)
-                in_range = _autopilot_range_value(blk)
-                if in_range and not any(k in hint for k in ("date", "time")):
-                    # The question states its own valid bands — start there
-                    # rather than with a default that may be outside them.
-                    candidates = [in_range] + [c for c in candidates if c != in_range]
                 vi = variant.get(key, 0)
                 if error_here and vi == 0:
                     # First rejection of an untried block: skip past the plain
@@ -3018,28 +3112,8 @@ async def cmd_autofill_form(payload):
                     # Repeatedly typed and still empty — the field is swallowing
                     # the value, which in practice means it is digit-only.
                     vi = variant[key] = 1
-                # The form names the format it wants in its own rejection —
-                # obey that in preference to guessing.
-                demanded = _format_from_error(error_text) if error_here else None
-                kind = _kind_from_error(error_text) if error_here else None
-                if demanded:
-                    value = time.strftime(demanded)
-                    actions_here.append(f"format from validator: {demanded}")
-                elif kind == "alpha":
-                    # The field said letters only. Every numeric candidate is
-                    # guaranteed to be refused, so leave the ladder entirely.
-                    alpha = [text_value, "Admin", "Nurse", "Staff"]
-                    value = alpha[vi % len(alpha)]
-                    actions_here.append("validator says letters only")
-                elif kind == "numeric":
-                    numeric = [number_value, "1", "10", "0"]
-                    value = numeric[vi % len(numeric)]
-                    actions_here.append("validator says numbers only")
-                else:
-                    # Cycle, never clamp: clamping parks on the LAST candidate
-                    # forever, and if that one is the invalid one the retry can
-                    # never succeed no matter how many times it runs.
-                    value = candidates[vi % len(candidates)]
+                value, why = filler.value_for(blk, vi, error_text if error_here else "")
+                actions_here.append(why)
                 tried.setdefault(key, []).append(value)
                 for box in boxes_empty:
                     await _autopilot_type(page, box, value)
