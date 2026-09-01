@@ -13,6 +13,7 @@ that can be tested without that are tested here; the rest needs a live run.
 browser_daemon.py imports playwright, so it is loaded from the .venv-browser
 interpreter when available and skipped otherwise.
 """
+import asyncio
 import os
 import sys
 import time
@@ -680,6 +681,45 @@ class VisitVerdictTests(unittest.TestCase):
 
     def test_the_verdict_names_the_counter_verbatim(self):
         self.assertIn("0/18", self.verdict("0/18", False))
+
+
+class SelectionDetectionTests(unittest.TestCase):
+    """Selection is DRAWN, never described.
+
+    Verified against the live app: no choice widget ever exposes
+    value == "checked" — every one reads None, selected or not. So
+    _block_is_answered's "any option checked" test was always False, every
+    choice question looked permanently unanswered, and each round re-clicked
+    it. With a candidate index in play that lands on a DIFFERENT option: an
+    already-correct "Yes" became "No", which raised a mandatory reason modal
+    and blocked the run.
+    """
+
+    def test_the_semantics_tree_cannot_answer_this(self):
+        # The assumption the old code rested on, written down so it is not
+        # quietly reintroduced.
+        options = [{"role": "button", "label": "Yes", "value": None},
+                   {"role": "button", "label": "No", "value": None}]
+        self.assertFalse(any(o.get("value") == "checked" for o in options))
+
+    def test_a_failed_scan_assumes_answered_not_unanswered(self):
+        # Fail-safe direction matters: re-clicking a good answer is
+        # destructive and can flip it, while missing one the form still wants
+        # is simply reported back by the Form Incomplete card.
+        class Boom:
+            async def screenshot(self):
+                raise RuntimeError("no screenshot")
+            async def evaluate(self, _js):
+                raise RuntimeError("no page")
+
+        options = [{"bounds": {"center_x": 700, "center_y": 300}},
+                   {"bounds": {"center_x": 1400, "center_y": 300}}]
+        got = asyncio.run(bd._selected_options(Boom(), options))
+        self.assertEqual(got, [True, True])
+
+    def test_no_options_is_not_an_error(self):
+        got = asyncio.run(bd._selected_options(None, []))
+        self.assertEqual(got, [])
 
 
 class UploadClassificationTests(unittest.TestCase):

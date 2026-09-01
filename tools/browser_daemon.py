@@ -2524,14 +2524,32 @@ async def _autopilot_clear_dialog(page, widgets):
         return ""
     how = await _autopilot_accept_dialog(page)
     if not how:
-        field = next((w for w in widgets if w.get("role") == "textbox"
-                      or "why you selected" in (w.get("label") or "").lower()), None)
+        # Novatek's "reason for answering X" modal. Its only button is "Add to
+        # visit note", inert until the textarea holds something — so this is
+        # the one dialog that cannot be dismissed by clicking a button alone.
         note = next((w for w in widgets if w.get("role") == "button"
                      and "add to visit note" in (w.get("label") or "").lower()), None)
-        if field and note:
-            await _autopilot_type(page, field, "Jarvis Reason")
-            await _autopilot_click(page, note, settle=800)
-            how = "reason note"
+        if note:
+            field = next((w for w in widgets if w.get("role") == "textbox"
+                          or "why you selected" in (w.get("label") or "").lower()), None)
+            if field:
+                await _autopilot_type(page, field, "Jarvis Reason")
+            else:
+                # The textarea is not always exposed in the semantics tree —
+                # seen live with the dialog reporting four widgets and no
+                # textbox at all. Type where it renders: inside the dialog,
+                # above its button.
+                box = note["bounds"]
+                await page.mouse.click(box["center_x"], box["center_y"] - 110)
+                await page.wait_for_timeout(200)
+                await page.keyboard.type("Jarvis Reason")
+                await page.wait_for_timeout(200)
+            await _autopilot_click(page, note, settle=900)
+            # Only a closed dialog counts: typing into the wrong place leaves
+            # the button inert and the modal up.
+            if not any(w.get("role") == "dialog"
+                       for w in await extract_flutter_widgets(page)):
+                how = "reason note"
     if not how:
         close = next((w for w in widgets if w.get("role") == "button"
                       and (w.get("label") or "").strip().lower()
@@ -2691,6 +2709,53 @@ _FILE_CONTROL_RE = re.compile(
     r"\btap\s+to\s+select\b|\bdrag\s+and\s+drop\b|\bfile\s+chooser\b",
     re.IGNORECASE,
 )
+
+
+async def _selected_options(page, options):
+    """Which of these option buttons are currently SELECTED.
+
+    Selection is drawn, never described. Verified live: no choice widget in
+    this app ever exposes value=="checked" — every one reads None, selected or
+    not. So a question that WAS answered looks unanswered, gets re-clicked, and
+    the candidate index can land on a different option: a correct "Yes" became
+    "No", which raised a mandatory reason modal and blocked the run.
+
+    The selected option renders with a teal border and filled radio, so it is
+    found the same way the sidebar checkmark is: by looking at the pixels.
+    Returns a list of bools aligned with `options`.
+    """
+    if not options:
+        return []
+    try:
+        shot = await page.screenshot()
+        width, height, channels, pixels = _png_pixels(shot)
+        inner_w = await page.evaluate("() => window.innerWidth")
+    except Exception as e:
+        print(f"[browser-daemon] selection scan failed: {e}", file=sys.stderr)
+        # Fail SAFE: unknown means "assume answered", because re-clicking a
+        # good answer is destructive while skipping one the form still wants
+        # is merely reported back by the Form Incomplete card.
+        return [True] * len(options)
+    scale = (width / inner_w) if inner_w else 1.0
+
+    results = []
+    for opt in options:
+        box = opt.get("bounds") or {}
+        cx = int((box.get("center_x") or 0) * scale)
+        cy = int((box.get("center_y") or 0) * scale)
+        # The radio sits left of the label, inside the option card.
+        x0, x1 = max(0, cx - int(150 * scale)), min(width, cx + int(40 * scale))
+        y0, y1 = max(0, cy - int(20 * scale)), min(height, cy + int(20 * scale))
+        teal = 0
+        for yy in range(y0, y1, 2):
+            base = yy * width * channels
+            for xx in range(x0, x1, 2):
+                i = base + xx * channels
+                r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
+                if r < 110 and 80 < g < 200 and 80 < b < 200 and abs(g - b) < 45:
+                    teal += 1
+        results.append(teal >= 8)
+    return results
 
 
 def _block_is_upload(blk):
@@ -3091,6 +3156,40 @@ async def cmd_autofill_form(payload):
         panel = _autopilot_panel(widgets, min_x)
         blocks = _autopilot_blocks(panel)
         acted = False
+
+        # Which choice questions are ALREADY answered. Selection is drawn, not
+        # described — every option reads value None whether picked or not — so
+        # without this a question answered on a previous pass looks untouched,
+        # gets re-clicked, and the candidate index can land on a DIFFERENT
+        # option: a correct "Yes" became "No" and raised a mandatory reason
+        # modal. Feeding the result into choice_answered reuses the protection
+        # that already stops an answered choice being re-picked.
+        pending_choice_blocks = [
+            b for b in blocks
+            if b["key"] not in choice_answered and not b.get("is_container")
+            and b["marker_y"] < inner_h - _AUTOPILOT_BLOCK_MARGIN
+            and not _block_has_error(b)
+            and not any(w.get("role") == "textbox" for w in b["members"])
+            and any(w.get("role") == "button" and w.get("label")
+                    and not _is_submit_label(w.get("label"))
+                    and not _is_sign_label(w.get("label")) for w in b["members"])
+        ]
+        for blk_choice in pending_choice_blocks:
+            options_here = [w for w in blk_choice["members"]
+                            if w.get("role") == "button" and w.get("label")
+                            and not _is_submit_label(w.get("label"))
+                            and not _is_sign_label(w.get("label"))]
+            if not options_here:
+                continue
+            picked = await _selected_options(page, options_here)
+            if any(picked):
+                chosen = next(o for o, sel in zip(options_here, picked) if sel)
+                choice_answered.add(blk_choice["key"])
+                done.add(blk_choice["key"])
+                report["answered"].append({
+                    "question": blk_choice["key"][:80],
+                    "action": f"already answered {(chosen.get('label') or '')[:30]!r} — left alone",
+                })
 
         for blk in blocks:
             key = blk["key"]
