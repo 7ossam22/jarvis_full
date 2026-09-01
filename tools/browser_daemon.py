@@ -1570,20 +1570,440 @@ _AUTOPILOT_SIDEBAR_RESERVED = (
 _AUTOPILOT_NUMBER_HINTS = (
     "ranges", "number", "score", "count", "level", "dose", "age", "weight",
     "height", "temperature", "pulse", "systolic", "diastolic", "rate", "bpm",
-    "mmhg", "(0-", "scale", "duration", "result", "quantity", "spo",
+    "mmhg", "(0-", "scale", "duration", "quantity", "spo2", "sp02",
     "pressure", "how many", "how much",
 )
+#: Checked BEFORE _AUTOPILOT_NUMBER_HINTS, because a question can contain a
+#: quantity word and still want prose. "Who Administered the Dose?" matched
+#: "dose" and was answered with 55 — into a field that accepts letters only, so
+#: every candidate in the numeric ladder was guaranteed to be refused.
+_AUTOPILOT_TEXT_HINTS = (
+    "who ", "whom", "name", "personnel", "staff", "nurse", "physician",
+    "doctor", "investigator", "initials", "signature", "comment", "describe",
+    "description", "reason", "notes", "specify", "explain", "other (",
+    "title", "site", "email", "address",
+)
+
 _AUTOPILOT_DIALOG_ACCEPT = ("ok", "confirm", "done", "set", "save", "select", "apply", "yes")
 # Inline validation messages Novatek renders under a rejected field.
-_AUTOPILOT_ERROR_HINTS = ("valid number", "invalid", "must be", "is required")
+#: Substrings that identify an inline validation message. Deliberately phrases
+#: rather than single words: a bare "required" or "between" also occurs in
+#: ordinary question text ("Select a value between 1 and 10"), and a false
+#: positive here makes the autopilot retype a perfectly good answer forever.
+_AUTOPILOT_ERROR_HINTS = (
+    "valid number", "invalid", "must be", "is required", "required field",
+    "field is required", "please enter", "please select", "please provide",
+    "cannot be empty", "can't be empty", "not a valid", "enter a valid",
+    "out of range", "too long", "too short", "does not match", "no more than",
+)
+
+
+#: Novatek writes real typography in question titles — "SpO₂" uses U+2082, a
+#: subscript two, so a plain "spo2" hint never matched and the question fell
+#: through to the free-text ladder, typing "test" into a numeric field.
+_DIGIT_LOOKALIKES = str.maketrans("₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹", "01234567890123456789")
+
+
+def _normalize_hint(text):
+    """Lowercased text with subscript/superscript digits folded to ASCII."""
+    return (text or "").lower().translate(_DIGIT_LOOKALIKES)
+
+
+#: A "Ranges:" chip, e.g. "36.5 - 37.5" or "95 - 100". Novatek shows the valid
+#: bands beside every numeric question, which is a far better source for an
+#: answer than a fixed ladder: the temperature field accepts 36.5-37.5 only, and
+#: none of [55, 1, 10, 0, 100] is inside it.
+_RANGE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*[-\u2013\u2014]\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def _autopilot_range_value(blk):
+    """A value inside one of the range chips this question displays, or None.
+
+    Any in-range value satisfies the validator; clinical plausibility is not the
+    goal for test data. The last chip is used because it is a stable choice —
+    the bands are not ordered normal-first in any consistent way across
+    questions (SpO2 puts the healthy band last, respiration rate second).
+    """
+    ranges = []
+    for w in blk["members"]:
+        match = _RANGE_RE.match((w.get("label") or "").strip())
+        if match:
+            low, high = float(match.group(1)), float(match.group(2))
+            if high >= low:
+                ranges.append((low, high))
+    if not ranges:
+        return None
+    low, high = ranges[-1]
+    middle = (low + high) / 2
+    whole = round(middle)
+    return str(int(whole)) if low <= whole <= high else str(round(middle, 1))
+
+
+def _is_submit_label(label):
+    """True for the form's submit button, whatever it is called.
+
+    Prefix-matched, not equality: the question forms label it "Submit" but the
+    entry-table forms (Concomitant Medications) label it "Submit Form". An
+    exact test found the first and not the second, so the autopilot walked to
+    the bottom of that form and reported "reached the bottom without finding
+    Submit" while the button was on screen the whole time.
+    """
+    return (label or "").strip().lower().startswith("submit")
+
+
+def _is_sign_label(label):
+    """True for the signature button, whatever Novatek calls it today.
+
+    Matched on a prefix rather than equality: the real buttons are "Sign Now"
+    on the question and "Sign Document" in the dialog, and an exact "sign"
+    test missed both — the question button was then clicked as if it were an
+    ordinary answer option, which opened the credentials dialog and left it
+    hanging, and a hanging modal blocks every field under it.
+    """
+    return (label or "").strip().lower().startswith("sign")
+
+
+#: Screen-level messages that are NOT about any one question. The visit's own
+#: "Actual visit date is required" banner sits inside the question panel and
+#: was being attributed to whichever block it fell between — sending the
+#: autopilot through 20+ variants of a date that had never been wrong.
+_AUTOPILOT_SCREEN_LEVEL = ("actual visit date", "visit mode")
+
+
+def _block_error_text(blk):
+    """The inline validation message shown on this block, or "" if none."""
+    for w in blk["members"]:
+        label = (w.get("label") or "").strip()
+        low = label.lower()
+        if any(sl in low for sl in _AUTOPILOT_SCREEN_LEVEL):
+            continue
+        if any(h in low for h in _AUTOPILOT_ERROR_HINTS):
+            return label
+    return ""
+
+
+async def _autopilot_fill_visit_date(page, widgets, today, report, min_x=330):
+    """Fill the visit's own "Actual visit date" field if it is still empty.
+
+    It lives above the form, outside every question block, and is REQUIRED —
+    so a form whose questions are all answered is still refused until this is
+    set. Nothing in the question loop can reach it, which is why the submit
+    was rejected six times with a message that named this field and no
+    question. Returns True if it typed something.
+    """
+    # Located by POSITION, not by label. Novatek's date inputs frequently expose
+    # an empty accessible name — every date box on the form reads label "" — so
+    # matching on "actual visit date" found this field only when the render
+    # happened to populate it, and silently skipped it the rest of the time.
+    # It is the one textbox in the left sidebar, left of the question panel.
+    candidates = [w for w in widgets
+                  if w.get("role") == "textbox"
+                  and not (w.get("value") or "").strip()
+                  and (w.get("bounds") or {}).get("center_x", 10 ** 9) < min_x]
+    box = candidates[0] if candidates else None
+    if not box:
+        # Fall back to the label match for a layout where it is not in the rail.
+        box = next((w for w in widgets
+                    if w.get("role") == "textbox"
+                    and "actual visit date" in (w.get("label") or "").strip().lower()
+                    and not (w.get("value") or "").strip()), None)
+    if not box:
+        return False
+    await _autopilot_type(page, box, today)
+    report["answered"].append({"question": "(visit) Actual visit date",
+                               "action": f"typed '{today}'"})
+    return True
 
 
 def _block_has_error(blk):
     """True when the block shows an inline validation error — its field holds
     a WRONG value (not merely an empty one) and must be retyped."""
-    return any(
-        any(h in (w.get("label") or "").lower() for h in _AUTOPILOT_ERROR_HINTS)
-        for w in blk["members"])
+    return bool(_block_error_text(blk))
+
+
+#: Flutter/Java DateFormat tokens -> strftime, longest first so "yyyy" is not
+#: consumed as "yy" + "yy". Case matters: M is month, m is minute.
+_PATTERN_TOKENS = [
+    ("yyyy", "%Y"), ("yy", "%y"),
+    ("MMMM", "%B"), ("MMM", "%b"), ("MM", "%m"), ("M", "%-m"),
+    ("dd", "%d"), ("d", "%-d"),
+    ("HH", "%H"), ("H", "%-H"),
+    ("hh", "%I"), ("h", "%-I"),
+    ("mm", "%M"), ("m", "%-M"),
+    ("ss", "%S"), ("s", "%-S"),
+    ("a", "%p"),
+]
+
+#: Novatek states the format it wants inside the rejection itself — "Invalid
+#: format (M/d/yyyy)", "Invalid time format (HH:mm)". That is far better than
+#: any guess, so it is read straight out of the message.
+_ERROR_FORMAT_RE = re.compile(r"\(\s*([yYMdDhHmsa/:.\- ]{3,})\s*\)")
+
+
+#: Rejections that say what KIND of value the field takes. Same principle as
+#: _format_from_error: the form knows, so ask it rather than guessing.
+_ALPHA_ERROR_HINTS = (
+    "only letters", "letters only", "alphabetic", "alphabets only",
+    "no numbers", "cannot contain number", "must not contain number",
+    "should not contain number", "only characters", "text only",
+)
+_NUMERIC_ERROR_HINTS = (
+    "valid number", "numbers only", "only numbers", "numeric", "digits only",
+    "must be a number", "enter a number",
+)
+
+
+def _kind_from_error(text):
+    """"alpha", "numeric", or None — what the rejection says the field takes."""
+    low = (text or "").lower()
+    if any(h in low for h in _ALPHA_ERROR_HINTS):
+        return "alpha"
+    if any(h in low for h in _NUMERIC_ERROR_HINTS):
+        return "numeric"
+    return None
+
+
+def _strftime_from_pattern(pattern):
+    """A DateFormat pattern like "M/d/yyyy" as a strftime string."""
+    out, i = [], 0
+    while i < len(pattern):
+        for token, repl in _PATTERN_TOKENS:
+            if pattern.startswith(token, i):
+                out.append(repl)
+                i += len(token)
+                break
+        else:
+            out.append(pattern[i])
+            i += 1
+    return "".join(out)
+
+
+def _format_from_error(text):
+    """The strftime format a validation message demands, or None.
+
+    "Invalid format (M/d/yyyy)" -> "%-m/%-d/%Y". This turns a rejection into an
+    instruction: rather than working down a ladder of guesses, the next answer
+    is exactly the shape the form just said it wanted.
+    """
+    match = _ERROR_FORMAT_RE.search(text or "")
+    if not match:
+        return None
+    pattern = match.group(1).strip()
+    if not any(c in pattern for c in "yMdHhms"):
+        return None
+    return _strftime_from_pattern(pattern)
+
+
+def _autopilot_variants(hint, today, now_hhmm, text_value, number_value):
+    """Ordered candidate answers for one free-entry field.
+
+    Index 0 is the normal default; every later index is what to try after the
+    form rejected the previous one. This escalation is the whole point: the
+    Flutter semantics tree does not say whether a box wants a number, a date or
+    free text, so the first answer is a guess. Without alternatives a rejected
+    guess is retyped identically forever, which is what made the autopilot stall
+    on a validation error instead of working through it.
+    """
+    if "date" in hint:
+        return [today, time.strftime("%m/%d/%Y"), time.strftime("%Y-%m-%d"),
+                time.strftime("%d/%m/%Y")]
+    if "time" in hint:
+        return [now_hhmm, time.strftime("%I:%M %p"), time.strftime("%H:%M:%S")]
+    if any(h in hint for h in _AUTOPILOT_TEXT_HINTS):
+        # A name or free-text answer: never offer a bare number, which such a
+        # field usually rejects outright.
+        return [text_value, "Admin", "Nurse", "N/A"]
+    if any(h in hint for h in _AUTOPILOT_NUMBER_HINTS):
+        return [number_value, "1", "10", "0", "100"]
+    return [text_value, number_value, "1", "N/A", "Test"]
+
+
+#: Where the JARVIS server listens. The daemon runs in its own venv and cannot
+#: import the provider layer, so LLM help is fetched over HTTP from the server
+#: that started it.
+JARVIS_SERVER_URL = os.environ.get("JARVIS_SERVER_URL", "http://127.0.0.1:4700")
+
+
+def _ask_llm_blocking(payload, timeout):
+    """POST one stuck question to the server's assist endpoint. Blocking; the
+    caller runs it in an executor so the event loop keeps serving."""
+    import urllib.request
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        JARVIS_SERVER_URL.rstrip("/") + "/assist/form-question",
+        data=data, method="POST", headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+async def _autopilot_ask_llm(blk, error_text, tried, timeout=90):
+    """Ask the model what to do with ONE question the rules could not solve.
+
+    Fallback, not driver: reached only after the deterministic ladder is spent,
+    so an ordinary form still makes zero model calls. Any failure — server
+    down, model unconfigured, timeout, malformed reply — returns None and the
+    autopilot carries on exactly as it did before, which is why this can be
+    added without making the fill less reliable.
+    """
+    options = sorted({(w.get("label") or "").strip()
+                      for w in blk["members"]
+                      if w.get("role") in ("button", "checkbox", "switch")
+                      and (w.get("label") or "").strip()
+                      and not _is_submit_label(w.get("label"))})
+    fields = sorted({w.get("role") for w in blk["members"]
+                     if w.get("role") in ("textbox", "button", "checkbox", "switch")})
+    payload = {"question": blk["key"][:160], "error": error_text[:300],
+               "fields": fields, "options": options[:12], "tried": tried[:8]}
+    try:
+        loop = asyncio.get_running_loop()
+        reply = await loop.run_in_executor(None, _ask_llm_blocking, payload, timeout)
+    except Exception as e:
+        print(f"[browser-daemon] llm assist unavailable: {e}", file=sys.stderr)
+        return None
+    if not isinstance(reply, dict) or reply.get("action") in (None, "skip"):
+        return None
+    return reply
+
+
+#: The "Form Incomplete" card Novatek renders above the questions after a
+#: refused submit. It names each unsatisfied question by title with a reason —
+#: the app's own authoritative list of what is wrong, and the only signal for a
+#: question that shows no inline message of its own (the time questions show
+#: none at all, which is why a refusal used to arrive with nothing to act on).
+_CARD_HEADER = "form incomplete"
+_CARD_INTRO = "please correct the following"
+
+
+def _autopilot_incomplete_items(panel):
+    """Question titles named by the Form Incomplete card, in card order."""
+    # Take the TOPMOST match, not the first in document order: the card is
+    # wrapped in a group whose own centre sits mid-card, well below the items,
+    # and anchoring to that collected nothing at all.
+    headers = [w for w in panel
+               if _CARD_HEADER in (w.get("label") or "").strip().lower()]
+    if not headers:
+        return []
+    top = min(w["bounds"]["center_y"] for w in headers)
+    # The card ends where the first numbered question begins.
+    below = [w["bounds"]["center_y"] for w in panel
+             if _AUTOPILOT_MARKER_RE.match((w.get("label") or "").strip())
+             and w["bounds"]["center_y"] > top]
+    bottom = min(below) if below else top + 800
+
+    titles = []
+    for w in sorted((x for x in panel if top < x["bounds"]["center_y"] < bottom),
+                    key=lambda x: x["bounds"]["center_y"]):
+        label = (w.get("label") or "").strip()
+        low = label.lower()
+        if not label or _CARD_HEADER in low or _CARD_INTRO in low:
+            continue
+        # Skip the reason line under each title; keep the title itself.
+        if low.startswith("this question") or any(h in low for h in _AUTOPILOT_ERROR_HINTS):
+            continue
+        if label not in titles:
+            titles.append(label)
+    return titles
+
+
+async def _autopilot_reopen_from_card(page, tab_index, min_x, done, attempts, variant,
+                                      report, protected=frozenset()):
+    """Re-open exactly the questions the Form Incomplete card names.
+
+    Matches each card title against the block titles and clears those blocks'
+    state so the main loop answers them again. Returns how many were matched.
+    """
+    widgets = await extract_flutter_widgets(page)
+    panel = _autopilot_panel(widgets, min_x)
+    wanted = _autopilot_incomplete_items(panel)
+    if not wanted:
+        return 0
+
+    report["incomplete_card"] = wanted
+    blocks = {b["key"]: b for b in _autopilot_blocks(panel)}
+    matched = 0
+    for title in wanted:
+        low = title.lower()
+        for key, blk in blocks.items():
+            if key in protected:
+                continue
+            if low in (blk.get("title") or "").lower() or low in key.lower():
+                done.discard(key)
+                attempts[key] = 0
+                matched += 1
+                report["corrections"].append({
+                    "question": key[:80],
+                    "error": f"Form Incomplete card: {title}",
+                    "retry_with_variant": variant.get(key, 0),
+                })
+                break
+    return matched
+
+
+async def _autopilot_reopen_rejected(page, tab_index, min_x, done, attempts, variant,
+                                     report, protected=frozenset()):
+    """After a rejected submit, walk the whole form and re-open every question
+    the form actually complained about.
+
+    For each block showing an inline error: clear its "done" flag, reset its
+    attempt budget (so the 3-attempt cap can never permanently abandon a
+    question the form is explicitly blocking on), and advance it to the next
+    candidate answer so the retry is different from what was just refused.
+
+    Returns how many questions were re-opened. Zero means the submit was
+    refused with no inline explanation, which the caller handles separately.
+    """
+    reopened = 0
+    seen = set()
+    for _ in range(40):
+        widgets = await extract_flutter_widgets(page)
+        panel = _autopilot_panel(widgets, min_x)
+        for blk in _autopilot_blocks(panel):
+            key = blk["key"]
+            if key in seen or not _block_has_error(blk):
+                continue
+            if key in protected:
+                continue          # an answered choice: never re-picked
+            seen.add(key)
+            done.discard(key)
+            attempts[key] = 0
+            variant[key] = variant.get(key, 0) + 1
+            reopened += 1
+            report["corrections"].append({
+                "question": key[:80],
+                "error": _block_error_text(blk)[:120],
+                "retry_with_variant": variant[key],
+            })
+        at_bottom = any(_is_submit_label(w.get("label"))
+                        for w in panel if w.get("role") == "button")
+        if at_bottom:
+            break
+        await cmd_scroll({"direction": "down", "amount": 420, "tab_index": tab_index})
+        await page.wait_for_timeout(250)
+    return reopened
+
+
+def _block_is_answered(blk, inner_h):
+    """True when this question already holds a valid answer and shows no error.
+
+    The question-level counterpart of skipping a submitted form. Re-answering
+    a good answer is never free on this app: it re-opens date/time pickers,
+    and changing a choice can collapse every dependent question (flipping
+    "Was the dose administered per protocol?" from Yes to No hid questions
+    2-7 and raised a mandatory "reason" modal). So a question is touched only
+    when it is blank, or when the form itself flags it — an inline validation
+    message, or a Form Incomplete card entry.
+    """
+    if _block_has_error(blk):
+        return False
+    members = [w for w in blk["members"]
+               if w["bounds"]["center_y"] > blk["marker_y"] + 12
+               and w["bounds"]["center_y"] < inner_h - 10]
+    boxes = [w for w in members if w.get("role") == "textbox"]
+    if any(not (w.get("value") or "").strip() for w in boxes):
+        return False           # an empty field means unanswered, always
+    if boxes:
+        return True            # every visible field holds a value
+    return any(w.get("value") == "checked" for w in members)
 
 
 def _autopilot_visit_ok(widgets):
@@ -1628,6 +2048,9 @@ def _autopilot_blocks(panel):
             if w is m:
                 continue
             if abs(w["bounds"]["center_y"] - m["bounds"]["center_y"]) <= 12 and w.get("label"):
+                low = w["label"].strip().lower()
+                if _CARD_HEADER in low or _CARD_INTRO in low:
+                    continue     # the error card is not question 1's title
                 title = w["label"]
                 break
         extras = " ".join(
@@ -1636,11 +2059,20 @@ def _autopilot_blocks(panel):
             and 12 < w["bounds"]["center_y"] - m["bounds"]["center_y"] <= 70)
         blocks.append({
             "key": f"{m['label']} {title}".strip(),
+            "marker": (m.get("label") or "").strip(),
             "marker_y": m["bounds"]["center_y"],
             "title": title,
-            "hint": f"{title} {extras}".lower(),
+            "hint": _normalize_hint(f"{title} {extras}"),
             "members": members,
         })
+    # "3." is a heading whose real inputs live under "3-1." and "3-2." — it has
+    # no field of its own, so treating it as a question burned render-waits and
+    # then abandoned it as "inputs never became actionable", which in turn kept
+    # `pending` non-empty and stopped the run from ever reaching Submit.
+    markers = {b["marker"] for b in blocks}
+    for b in blocks:
+        prefix = b["marker"].rstrip(".") + "-"
+        b["is_container"] = any(other.startswith(prefix) for other in markers)
     return blocks
 
 
@@ -1720,7 +2152,8 @@ async def _autopilot_sign(page, w, username, password, report):
     widgets = await extract_flutter_widgets(page)
     for x in widgets:
         low = (x.get("label") or "").strip().lower()
-        if x.get("role") == "button" and low in ("confirm", "sign", "ok", "submit", "verify", "login"):
+        if x.get("role") == "button" and (
+                _is_sign_label(low) or low in ("confirm", "ok", "submit", "verify", "login")):
             await _autopilot_click(page, x, settle=700)
             return
     report["unresolved"].append("signature dialog: no confirm button found")
@@ -1754,7 +2187,16 @@ async def cmd_autofill_form(payload):
     username = payload.get("username") or os.environ.get("NOVATEK_USERNAME") or ""
     password = payload.get("password") or os.environ.get("NOVATEK_PASSWORD") or ""
     min_x = int(payload.get("panel_min_x", 330))
-    max_rounds = int(payload.get("max_rounds", 100))
+    # Raised from 100: each rejected submit now costs a full top-to-bottom
+    # correction sweep, and the point is to keep going until the form is
+    # accepted rather than to stop at a fixed budget.
+    max_rounds = int(payload.get("max_rounds", 250))
+    # How many times a rejected submit is corrected and retried before giving
+    # up. Every retry re-answers only the questions the form objected to, with
+    # a different value than the one it refused.
+    max_submit_attempts = int(payload.get("max_submit_attempts", 6))
+    # Set false for a strictly zero-AI run (offline, or to time the rules alone).
+    llm_assist = payload.get("llm_assist", True)
     tab_index = payload.get("tab_index")
 
     page = await get_active_page(tab_index=tab_index)
@@ -1764,13 +2206,20 @@ async def cmd_autofill_form(payload):
     today = time.strftime("%-m/%-d/%Y")
     now_hhmm = time.strftime("%H:%M")
 
-    report = {"answered": [], "unresolved": [], "rounds": 0,
-              "submitted": False, "submit_verified": False,
+    report = {"answered": [], "unresolved": [], "corrections": [], "llm_assists": [],
+              "incomplete_card": [], "rounds": 0,
+              "submitted": False, "submit_verified": False, "submit_attempts": 0,
               "progress_before": None, "progress_after": None}
     done = set()          # blocks whose answers were VERIFIED in place
     attempts = {}         # per-block answer attempts (cap 3, then unresolved)
+    variant = {}          # per-block index into _autopilot_variants — bumped
+                          # every time the form rejects that block's answer
     units_done = set()    # blocks whose unit dropdown was already picked
     swept = False         # pre-submit top-to-bottom sweep completed
+    blanket_retry = False # a no-inline-error refusal has already been retried
+    llm_asked = set()     # questions already escalated (at most one ask each)
+    choice_answered = set()  # answered by selecting an option — NEVER re-picked
+    tried = {}            # per-question values the form has already refused
     resubmits = 0
     render_waits = 0      # rounds spent waiting for a visible block's inputs to render
 
@@ -1780,9 +2229,37 @@ async def cmd_autofill_form(payload):
                          "Start the visit first."}
     report["progress_before"] = _autopilot_progress(widgets)
 
+    # Required, lives outside every question block, and blocks submission on
+    # its own. Do it up front rather than discovering it via a refusal.
+    if await _autopilot_fill_visit_date(page, widgets, today, report, min_x):
+        widgets = await extract_flutter_widgets(page)
+
     stagnant = 0
+    stray_dialogs = 0
     for round_no in range(1, max_rounds + 1):
         report["rounds"] = round_no
+
+        # A modal blocks every field under it, and one stray picker wedges the
+        # whole run: a date picker left open by a mis-aimed click made the rest
+        # of a visit walk meaningless, including the sidebar checkmark scan,
+        # which then read a dimmed page. Clear any dialog before doing anything
+        # else. Accepting is the right default — a date/time picker opens on
+        # today, which is the value the autopilot wants anyway — and Cancel is
+        # the fallback when nothing accepts.
+        if any(w.get("role") == "dialog" for w in widgets) and stray_dialogs < 8:
+            stray_dialogs += 1
+            accepted = await _autopilot_accept_dialog(page)
+            if not accepted:
+                cancel = next((w for w in widgets if w.get("role") == "button"
+                               and (w.get("label") or "").strip().lower()
+                               in ("cancel", "close", "dismiss")), None)
+                if cancel:
+                    await _autopilot_click(page, cancel, settle=500)
+                    accepted = "cancel"
+            report["answered"].append({"question": "(stray dialog)",
+                                       "action": f"dismissed via {accepted or 'no button found'}"})
+            widgets = await extract_flutter_widgets(page)
+            continue
         inner_h = await page.evaluate("() => window.innerHeight")
         panel = _autopilot_panel(widgets, min_x)
         blocks = _autopilot_blocks(panel)
@@ -1796,12 +2273,17 @@ async def cmd_autofill_form(payload):
             # questions that previously waited for a lucky later round.
             if blk["marker_y"] >= inner_h - 40:
                 continue
+            if blk.get("is_container"):
+                # Answered by its sub-questions; it has no input of its own.
+                done.add(key)
+                continue
             hint = blk["hint"]
             below_title = [w for w in blk["members"]
                            if w["bounds"]["center_y"] > blk["marker_y"] + 12
                            and w["bounds"]["center_y"] < inner_h - 10]
             boxes_empty = [w for w in below_title if w.get("role") == "textbox" and not w.get("value")]
-            error_here = _block_has_error(blk)
+            error_text = _block_error_text(blk)
+            error_here = bool(error_text)
             if error_here:
                 # A rejected value (e.g. a date that landed in a number field)
                 # is worse than an empty one — retype every field in the block.
@@ -1819,10 +2301,51 @@ async def cmd_autofill_form(payload):
                 already_checked = any(w.get("value") == "checked" for w in below_title)
                 already_uploaded = ("upload" in hint or "attach" in hint or "file" in hint) and any(
                     ".pdf" in (w.get("label") or "").lower() for w in blk["members"])
-                if (has_filled_box and not any_empty_box) or already_checked or already_uploaded:
+                # An EMPTY textbox always wins: the question is not answered,
+                # whatever else in the block looks set.
+                #
+                # Novatek's time questions carry a "Use 24-hour format" switch
+                # that ships already checked. Counting that as the answer marked
+                # "3-2. Dose Start Time" and "4-2. Dose End Time" done with their
+                # Hours:Minutes fields still blank — the form then refused the
+                # submit with "This question must be answered" and nothing
+                # inline to point at, because from the autopilot's side both
+                # questions looked complete.
+                if not any_empty_box and (has_filled_box or already_checked or already_uploaded):
                     done.add(key)
                     continue
             if attempts.get(key, 0) >= 3:
+                # The deterministic ladder is spent on this question. Ask the
+                # model once — it can read a validation phrasing the substring
+                # rules never anticipated — then go back to running on rails.
+                if llm_assist and key not in llm_asked:
+                    llm_asked.add(key)
+                    advice = await _autopilot_ask_llm(blk, error_text, tried.get(key, []))
+                    if advice:
+                        applied = None
+                        if advice["action"] == "type":
+                            box = next((w for w in below_title
+                                        if w.get("role") == "textbox"), None)
+                            if box:
+                                await _autopilot_type(page, box, advice["value"])
+                                tried.setdefault(key, []).append(advice["value"])
+                                applied = f"llm: typed {advice['value']!r}"
+                        elif advice["action"] == "click":
+                            target = next((w for w in below_title
+                                           if (w.get("label") or "").strip().lower()
+                                           == advice["label"].strip().lower()), None)
+                            if target:
+                                await _autopilot_click(page, target, settle=250)
+                                applied = f"llm: clicked {advice['label']!r}"
+                        if applied:
+                            attempts[key] = 0     # earned a fresh deterministic budget
+                            done.discard(key)
+                            report["llm_assists"].append({
+                                "question": key[:80], "error": error_text[:100],
+                                "did": applied, "why": advice.get("reason", "")})
+                            report["answered"].append({"question": key[:80], "action": applied})
+                            acted = True
+                            continue
                 continue
             attempts[key] = attempts.get(key, 0) + 1
             if attempts[key] == 3:
@@ -1830,7 +2353,7 @@ async def cmd_autofill_form(payload):
             actions_here = []
 
             sign_btn = next((w for w in below_title if w.get("role") == "button"
-                             and (w.get("label") or "").strip().lower() == "sign"), None)
+                             and _is_sign_label(w.get("label"))), None)
             upload_hit = ("upload" in hint or "attach" in hint) or any(
                 any(k in (w.get("label") or "").lower() for k in ("upload", "attach", "browse", "choose file"))
                 for w in below_title if w.get("role") == "button")
@@ -1841,10 +2364,18 @@ async def cmd_autofill_form(payload):
             # next to a textbox a button is a unit dropdown or calendar icon.
             options = [] if has_box else [
                 w for w in below_title if w.get("role") == "button" and w.get("label")
-                and (w.get("label") or "").strip().lower() not in ("sign", "submit")]
-            unit_btns = [w for w in below_title if has_box and w.get("role") == "button"
-                         and len((w.get("label") or "").strip()) <= 14
-                         and (w.get("label") or "").strip().lower() not in ("sign", "submit")]
+                and not _is_sign_label(w.get("label"))
+                and not _is_submit_label(w.get("label"))]
+            # A button beside a DATE or TIME box is a calendar/clock picker, not
+            # a unit dropdown. Clicking it opened a picker that wiped the value
+            # just typed — which is why a correctly formatted date still came
+            # back "Invalid format".
+            is_datetime = ("date" in hint or "time" in hint)
+            unit_btns = [] if is_datetime else [
+                w for w in below_title if has_box and w.get("role") == "button"
+                and len((w.get("label") or "").strip()) <= 14
+                and not _is_sign_label(w.get("label"))
+                and not _is_submit_label(w.get("label"))]
 
             if sign_btn:
                 await _autopilot_sign(page, sign_btn, username, password, report)
@@ -1865,21 +2396,48 @@ async def cmd_autofill_form(payload):
             elif boxes_empty:
                 # On a retry round, a swallowed 'test' means a digit-only
                 # field — go straight to the number default.
+                candidates = _autopilot_variants(hint, today, now_hhmm,
+                                                 text_value, number_value)
+                in_range = _autopilot_range_value(blk)
+                if in_range and not any(k in hint for k in ("date", "time")):
+                    # The question states its own valid bands — start there
+                    # rather than with a default that may be outside them.
+                    candidates = [in_range] + [c for c in candidates if c != in_range]
+                vi = variant.get(key, 0)
+                if error_here and vi == 0:
+                    # First rejection of an untried block: skip past the plain
+                    # text default rather than retyping what was just refused.
+                    vi = variant[key] = 1
+                elif attempts[key] > 1 and vi == 0:
+                    # Repeatedly typed and still empty — the field is swallowing
+                    # the value, which in practice means it is digit-only.
+                    vi = variant[key] = 1
+                # The form names the format it wants in its own rejection —
+                # obey that in preference to guessing.
+                demanded = _format_from_error(error_text) if error_here else None
+                kind = _kind_from_error(error_text) if error_here else None
+                if demanded:
+                    value = time.strftime(demanded)
+                    actions_here.append(f"format from validator: {demanded}")
+                elif kind == "alpha":
+                    # The field said letters only. Every numeric candidate is
+                    # guaranteed to be refused, so leave the ladder entirely.
+                    alpha = [text_value, "Admin", "Nurse", "Staff"]
+                    value = alpha[vi % len(alpha)]
+                    actions_here.append("validator says letters only")
+                elif kind == "numeric":
+                    numeric = [number_value, "1", "10", "0"]
+                    value = numeric[vi % len(numeric)]
+                    actions_here.append("validator says numbers only")
+                else:
+                    # Cycle, never clamp: clamping parks on the LAST candidate
+                    # forever, and if that one is the invalid one the retry can
+                    # never succeed no matter how many times it runs.
+                    value = candidates[vi % len(candidates)]
+                tried.setdefault(key, []).append(value)
                 for box in boxes_empty:
-                    if error_here and "please enter a valid number" not in hint:
-                        # The field rejected what it holds — the number default
-                        # satisfies every numeric validator we have seen.
-                        value = number_value
-                    elif "date" in hint:
-                        value = today
-                    elif "time" in hint:
-                        value = now_hhmm
-                    elif attempts[key] > 1 or any(h in hint for h in _AUTOPILOT_NUMBER_HINTS):
-                        value = number_value
-                    else:
-                        value = text_value
                     await _autopilot_type(page, box, value)
-                    actions_here.append(f"typed '{value}'")
+                    actions_here.append(f"typed '{value}'" + (f" (variant {vi})" if vi else ""))
                 if unit_btns and key not in units_done:
                     units_done.add(key)
                     snapshot = await extract_flutter_widgets(page)
@@ -1888,13 +2446,19 @@ async def cmd_autofill_form(payload):
                     actions_here.append(f"unit '{picked}'" if picked else "unit dropdown: nothing to pick")
             elif checkboxes:
                 await _autopilot_click(page, checkboxes[0])
+                choice_answered.add(key)
                 actions_here.append("checked first box")
             elif options:
                 if any(w.get("value") == "checked" for w in below_title):
                     actions_here.append("already answered")
                 else:
-                    await _autopilot_click(page, options[0])
-                    actions_here.append(f"clicked '{(options[0].get('label') or '')[:40]}'")
+                    # Normally the first option; a later one once the form has
+                    # rejected this block, since conditional forms do refuse
+                    # particular choices.
+                    pick = options[min(variant.get(key, 0), len(options) - 1)]
+                    await _autopilot_click(page, pick)
+                    choice_answered.add(key)
+                    actions_here.append(f"clicked '{(pick.get('label') or '')[:40]}'")
             else:
                 attempts[key] -= 1  # nothing actionable visible yet — not a real attempt
                 continue
@@ -1912,14 +2476,19 @@ async def cmd_autofill_form(payload):
             empty = [w for w in blk["members"] if w.get("role") == "textbox" and not w.get("value")
                      and w["bounds"]["center_y"] > blk["marker_y"] + 12
                      and w["bounds"]["center_y"] < inner_h - 10]
-            if empty or _block_has_error(blk):
+            if _block_has_error(blk):
+                # The form refused this value. Retyping the same thing would be
+                # refused identically, so step to the next candidate answer.
+                done.discard(blk["key"])
+                variant[blk["key"]] = variant.get(blk["key"], 0) + 1
+            elif empty:
                 done.discard(blk["key"])
             else:
                 done.add(blk["key"])
 
         panel = _autopilot_panel(widgets, min_x)
         submit = next((w for w in panel if w.get("role") == "button"
-                       and (w.get("label") or "").strip().lower() == "submit"), None)
+                       and _is_submit_label(w.get("label"))), None)
         blocks_now = _autopilot_blocks(panel)
         all_keys = {b["key"] for b in blocks_now}
         pending = all_keys - done - {k for k, n in attempts.items() if n >= 3}
@@ -1927,7 +2496,13 @@ async def cmd_autofill_form(payload):
                            if b["key"] in pending and b["marker_y"] < inner_h - 40]
 
         if submit and not pending:
-            if not swept:
+            # `blocks_now` empty means this is a TABLE form — Concomitant
+            # Medications and friends carry no numbered questions at all, just
+            # an entries table with "Add New Entry" and "Submit Form". There is
+            # nothing to fill and nothing to sweep for, so submit straight away
+            # rather than scrolling 20 times looking for a question 1 that does
+            # not exist.
+            if not swept and blocks_now:
                 # Full sweep before Submit: back to question 1, then walk down
                 # re-verifying every screenful, so nothing scrolled past
                 # unanswered can slip through.
@@ -1939,26 +2514,89 @@ async def cmd_autofill_form(payload):
                 widgets = await extract_flutter_widgets(page)
                 submit = next((w for w in _autopilot_panel(widgets, min_x)
                                if w.get("role") == "button"
-                               and (w.get("label") or "").strip().lower() == "submit"), None)
+                               and _is_submit_label(w.get("label"))), None)
             if not submit:
                 continue
             await _autopilot_click(page, submit, settle=1500)
+            resubmits += 1
+            report["submit_attempts"] = resubmits
             report["submitted"] = True
             widgets = await extract_flutter_widgets(page)
             report["progress_after"] = _autopilot_progress(widgets)
             advanced = (report["progress_after"] or "") != (report["progress_before"] or "")
-            still_open = any((w.get("label") or "").strip().lower() == "submit"
+            still_open = any(_is_submit_label(w.get("label"))
                              for w in _autopilot_panel(widgets, min_x))
             report["submit_verified"] = advanced or not still_open
-            if not report["submit_verified"] and resubmits < 1:
-                # Validation rejected it — something is still unanswered.
-                # Sweep once more from the top and try again.
-                resubmits += 1
-                swept = False
-                report["submitted"] = False
-                widgets = await _autopilot_scroll_to_form_top(page, tab_index, min_x)
-                continue
-            break
+            if report["submit_verified"]:
+                break
+
+            # ---- the form refused the submission -------------------------
+            # Do not stop here: find what it objected to, answer exactly that
+            # differently, and submit again. A form is only done when it has
+            # been ACCEPTED, and the validator is the one source of truth
+            # about what is still wrong with it.
+            report["submitted"] = False
+            if resubmits >= max_submit_attempts:
+                report["unresolved"].append(
+                    f"submit refused {resubmits} times — stopping. Last errors: "
+                    + "; ".join(str(c.get("error", "")) for c in report["corrections"][-3:]))
+                break
+
+            widgets = await _autopilot_scroll_to_form_top(page, tab_index, min_x)
+            # A refusal may be about the visit date rather than any question.
+            if await _autopilot_fill_visit_date(page, widgets, today, report, min_x):
+                widgets = await extract_flutter_widgets(page)
+            # The card names what is missing outright; the inline scan is the
+            # fallback for a refusal it does not cover.
+            reopened = await _autopilot_reopen_from_card(
+                page, tab_index, min_x, done, attempts, variant, report,
+                protected=choice_answered)
+            reopened += await _autopilot_reopen_rejected(
+                page, tab_index, min_x, done, attempts, variant, report,
+                protected=choice_answered)
+            if not reopened:
+                # Refused with no inline error anywhere. Escalate GENTLY: the
+                # first pass only returns abandoned questions to the queue, and
+                # leaves every verified answer alone. Bumping every variant here
+                # used to flip a correct "Yes" to "No", which on a conditional
+                # form changes which questions exist at all — turning one
+                # refusal into a worse form than we started with.
+                if not blanket_retry:
+                    blanket_retry = True
+                    attempts.clear()
+                    report["corrections"].append({
+                        "question": "(whole form)",
+                        "error": "submit refused with no inline validation message",
+                        "retry_with_variant": "re-queued abandoned questions only",
+                    })
+                else:
+                    # Still refused, and still nothing to point at. Re-queue
+                    # ONLY questions that are genuinely blank — never rewrite
+                    # one that already holds a valid answer. The card and the
+                    # inline messages are the sole authority on what is wrong;
+                    # guessing beyond them is what turned a correct "Yes" into
+                    # "No" and collapsed the form.
+                    requeued = 0
+                    for blk in _autopilot_blocks(_autopilot_panel(widgets, min_x)):
+                        k = blk["key"]
+                        if k in choice_answered or _block_is_answered(blk, inner_h):
+                            continue
+                        done.discard(k)
+                        attempts[k] = 0
+                        requeued += 1
+                    report["corrections"].append({
+                        "question": "(whole form)",
+                        "error": "refused with no inline message and no card entry",
+                        "retry_with_variant": f"re-queued {requeued} blank question(s) only",
+                    })
+                    if not requeued:
+                        report["unresolved"].append(
+                            "submit refused but every question already holds a valid answer — "
+                            "stopping rather than rewriting good answers")
+                        break
+            swept = False
+            widgets = await _autopilot_scroll_to_form_top(page, tab_index, min_x)
+            continue
 
         # SCROLLING IS EARNED, NEVER TIMED: while any visible question is
         # still unanswered, the loop stays on this screenful and retries —
@@ -1990,7 +2628,7 @@ async def cmd_autofill_form(payload):
         for _ in range(6):
             fresh_panel = _autopilot_panel(widgets, min_x)
             fresh_keys = {b["key"] for b in _autopilot_blocks(fresh_panel)}
-            submit_visible = any((w.get("label") or "").strip().lower() == "submit"
+            submit_visible = any(_is_submit_label(w.get("label"))
                                  for w in fresh_panel if w.get("role") == "button")
             if (fresh_keys - all_keys) or submit_visible:
                 break
@@ -2005,7 +2643,10 @@ async def cmd_autofill_form(payload):
         else:
             stagnant = 0
 
-    report["status"] = "autofill_done" if report["submitted"] else "autofill_incomplete"
+    # "done" means the form was ACCEPTED, not merely that Submit was clicked —
+    # a click the validator rejected leaves the form unfinished, and the caller
+    # (cmd_autofill_visit, or the model) must not move on from it.
+    report["status"] = "autofill_done" if report["submit_verified"] else "autofill_incomplete"
     report["widgets"] = _slim_widgets(widgets)
     return report
 
@@ -2073,7 +2714,12 @@ async def _sidebar_checkmarks(page, buttons):
     bottoms = [b["bounds"]["y"] + b["bounds"]["height"] for b in buttons]
     clip_y = max(0, min(tops) - 4)
     clip_h = max(bottoms) - clip_y + 4
-    clip_w = max(b["bounds"]["x"] + b["bounds"]["width"] for b in buttons) + 8
+    # The checkmark is drawn OUTSIDE the button's reported bounds: the sidebar
+    # rows report a right edge near CSS x=255 while the tick renders at x≈270-288.
+    # Clipping to the bounds cropped it out of the screenshot entirely, so the
+    # scan below could never find one and every completed form read as open —
+    # which is how an already-submitted form got re-opened and re-answered.
+    clip_w = max(b["bounds"]["x"] + b["bounds"]["width"] for b in buttons) + 80
     shot = await page.screenshot(clip={"x": 0, "y": clip_y, "width": clip_w, "height": clip_h})
     try:
         w, h, ch, px = _png_pixels(shot)
@@ -2084,8 +2730,11 @@ async def _sidebar_checkmarks(page, buttons):
     results = []
     for b in buttons:
         bb = b["bounds"]
-        x0 = int((bb["x"] + bb["width"] - 42) * scale)
-        x1 = int((bb["x"] + bb["width"] - 4) * scale)
+        # Span the row's right edge rather than sitting inside it, so the tick
+        # is covered wherever it renders relative to the reported bounds.
+        right = bb["x"] + bb["width"]
+        x0 = int((right - 30) * scale)
+        x1 = int((right + 70) * scale)
         y0 = int((bb["center_y"] - clip_y - 10) * scale)
         y1 = int((bb["center_y"] - clip_y + 10) * scale)
         green = 0
@@ -2120,6 +2769,13 @@ async def cmd_autofill_visit(payload):
 
     report = {"forms": [], "progress": _autopilot_progress(widgets)}
     attempted = set()  # form labels already worked on this run — never re-target
+    # "Fill whatever is open" is only safe AFTER a verified submit, when Novatek
+    # has auto-selected the next unsubmitted form. On the very first pass the
+    # open form is whatever the user happened to leave selected, which may
+    # already be complete — that is how a finished form got re-filled and
+    # re-submitted. So the first target always comes from the sidebar scan,
+    # which knows which forms carry the checkmark.
+    trust_open_form = False
 
     for _ in range(int(payload.get("max_forms", 40))):
         progress = _autopilot_progress(widgets)
@@ -2133,8 +2789,9 @@ async def cmd_autofill_visit(payload):
         # exactly the form that is open and DO NOT click the sidebar — a
         # manual sidebar click is what used to re-open an already-submitted
         # form and rewrite its answers.
-        blocks_open = bool(_autopilot_blocks(_autopilot_panel(widgets, 330)))
-        if not blocks_open:
+        blocks_open = trust_open_form and bool(
+            _autopilot_blocks(_autopilot_panel(widgets, 330)))
+        if not blocks_open and trust_open_form:
             for _ in range(8):
                 await page.wait_for_timeout(400)
                 widgets = await extract_flutter_widgets(page)
@@ -2200,6 +2857,7 @@ async def cmd_autofill_visit(payload):
             await page.wait_for_timeout(400)
 
         attempted.add(target.get("label") or "")
+        trust_open_form = True   # from here on Novatek drives the selection
         form_res = await cmd_autofill_form(dict(payload))
         report["forms"].append({
             "form": target.get("label"),

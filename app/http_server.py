@@ -172,6 +172,13 @@ class JarvisHandler(BaseHTTPRequestHandler):
             self._handle_remember()
         elif self.path == "/speak":
             self._handle_speak()
+        elif self.path == "/assist/form-question":
+            # The form autopilot in tools/browser_daemon.py runs in its own
+            # process and cannot reach the provider layer, so it asks here when
+            # its deterministic rules are exhausted on one question.
+            body = self._read_json_body()
+            result, status = controllers.handle_form_assist(Config.load(), body)
+            self._send_json(result, status=status)
         elif self.path == "/jira/action":
             self._handle_jira_action()
         else:
