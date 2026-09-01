@@ -128,6 +128,93 @@ class AlreadyAnsweredTests(unittest.TestCase):
             {"role": "textbox", "value": None, "y": 240}), self.INNER_H))
 
 
+class VisitDateTests(unittest.TestCase):
+    """The visit date belongs to the visit, is set once, and must never be
+    rewritten once it holds a value — typing into it re-opens the calendar
+    picker, whose modal then blocks the entire page."""
+
+    MIN_X = 330
+
+    @staticmethod
+    def box(value=None, label="", x=90):
+        return {"role": "textbox", "label": label, "value": value,
+                "bounds": {"x": x, "y": 140, "center_x": x, "center_y": 146}}
+
+    def test_an_empty_rail_field_is_offered(self):
+        self.assertIsNotNone(bd._visit_date_box([self.box()], self.MIN_X))
+
+    def test_a_filled_field_is_left_alone(self):
+        self.assertIsNone(bd._visit_date_box([self.box(value="9/1/2026")], self.MIN_X))
+
+    def test_a_date_shown_without_a_value_still_counts_as_set(self):
+        # REGRESSION: these inputs do not reliably expose `value`, so judging
+        # emptiness on it alone rewrote a field that was already correct.
+        self.assertIsNone(bd._visit_date_box(
+            [self.box(label="9/1/2026")], self.MIN_X))
+
+    def test_question_panel_fields_are_never_mistaken_for_it(self):
+        self.assertIsNone(bd._visit_date_box(
+            [self.box(x=800)], self.MIN_X))
+
+    def test_no_textbox_at_all(self):
+        self.assertIsNone(bd._visit_date_box([], self.MIN_X))
+
+    def test_date_pattern_matches_the_formats_novatek_uses(self):
+        for text in ("9/1/2026", "09/01/2026", "2026-09-01", "1-9-2026"):
+            with self.subTest(text):
+                self.assertIsNone(bd._visit_date_box([self.box(label=text)], self.MIN_X))
+        # ordinary prose must not read as a date
+        self.assertIsNotNone(bd._visit_date_box(
+            [self.box(label="Actual visit date")], self.MIN_X))
+
+
+class SubmitOutcomeTests(unittest.TestCase):
+    """Reading the result of a submit BEFORE the request finishes reports the
+    state from before it — an accepted submission still showed the old
+    progress counter. The page's own signals decide when it is done."""
+
+    @staticmethod
+    def w(label=None, role="widget", value=None):
+        return {"role": role, "label": label, "value": value,
+                "bounds": {"x": 400, "y": 200, "center_x": 500, "center_y": 200}}
+
+    def test_busy_while_a_spinner_is_up(self):
+        self.assertEqual(bd._autopilot_submit_state([self.w("Submitting...")], []), "busy")
+        self.assertEqual(bd._autopilot_submit_state([self.w("Please wait")], []), "busy")
+
+    def test_an_indeterminate_progressbar_is_a_spinner(self):
+        self.assertEqual(bd._autopilot_submit_state(
+            [self.w(role="progressbar", value=None)], []), "busy")
+
+    def test_the_visit_progress_ring_is_not_a_spinner(self):
+        # It always carries a value, so it must not read as "still loading".
+        self.assertIsNone(bd._autopilot_submit_state(
+            [self.w(role="progressbar", value="3")], []))
+
+    def test_success_and_backend_failure_are_distinguished(self):
+        self.assertEqual(bd._autopilot_submit_state([self.w("Success")], []), "success")
+        self.assertEqual(bd._autopilot_submit_state(
+            [self.w("Submission failed")], []), "failed")
+        self.assertEqual(bd._autopilot_submit_state(
+            [self.w("Something went wrong")], []), "failed")
+
+    def test_busy_wins_over_a_stale_banner(self):
+        # A success banner from the PREVIOUS submit must not be read as this
+        # one's result while the request is still in flight.
+        self.assertEqual(bd._autopilot_submit_state(
+            [self.w("Success"), self.w("Submitting...")], []), "busy")
+
+    def test_client_side_rejection_is_reported_separately(self):
+        panel = [self.w("Form Incomplete"), self.w("Dose Start Time"),
+                 self.w("This question must be answered."), self.w("1.")]
+        for x, y in zip(panel, (100, 140, 160, 200)):
+            x["bounds"]["center_y"] = y
+        self.assertEqual(bd._autopilot_submit_state(panel, panel), "rejected")
+
+    def test_silence_is_not_an_outcome(self):
+        self.assertIsNone(bd._autopilot_submit_state([self.w("Weight")], []))
+
+
 class SubmitLabelTests(unittest.TestCase):
     """The submit button is not called the same thing on every form."""
 

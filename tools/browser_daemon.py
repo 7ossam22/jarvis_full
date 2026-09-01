@@ -1682,6 +1682,33 @@ def _block_error_text(blk):
     return ""
 
 
+#: Any date-looking text, used to recognise a field that is already set even
+#: when the semantics tree does not expose its value.
+_DATE_TEXT_RE = re.compile(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}")
+
+
+def _visit_date_box(widgets, min_x):
+    """The visit's own date field, but ONLY when it is genuinely empty.
+
+    Returns None the moment it looks set. The field is visit-level and set
+    once; rewriting a valid one is pointless and actively harmful, because
+    typing into it re-opens the calendar picker whose modal then blocks the
+    whole page. Emptiness is judged on the value AND on any date-looking text
+    in the node, since these inputs do not reliably expose a value.
+    """
+    for w in widgets:
+        if w.get("role") != "textbox":
+            continue
+        if (w.get("bounds") or {}).get("center_x", 10 ** 9) >= min_x:
+            continue          # in the question panel, not the visit rail
+        if (w.get("value") or "").strip():
+            return None       # already answered
+        if _DATE_TEXT_RE.search(w.get("label") or ""):
+            return None       # shows a date even though value is unset
+        return w
+    return None
+
+
 async def _autopilot_fill_visit_date(page, widgets, today, report, min_x=330):
     """Fill the visit's own "Actual visit date" field if it is still empty.
 
@@ -1691,22 +1718,15 @@ async def _autopilot_fill_visit_date(page, widgets, today, report, min_x=330):
     was rejected six times with a message that named this field and no
     question. Returns True if it typed something.
     """
-    # Located by POSITION, not by label. Novatek's date inputs frequently expose
-    # an empty accessible name — every date box on the form reads label "" — so
-    # matching on "actual visit date" found this field only when the render
-    # happened to populate it, and silently skipped it the rest of the time.
-    # It is the one textbox in the left sidebar, left of the question panel.
-    candidates = [w for w in widgets
-                  if w.get("role") == "textbox"
-                  and not (w.get("value") or "").strip()
-                  and (w.get("bounds") or {}).get("center_x", 10 ** 9) < min_x]
-    box = candidates[0] if candidates else None
+    # Located by POSITION, not by label: Novatek's date inputs expose an empty
+    # accessible name, so matching on "actual visit date" found this field only
+    # when the render happened to populate it.
+    box = _visit_date_box(widgets, min_x)
     if not box:
-        # Fall back to the label match for a layout where it is not in the rail.
-        box = next((w for w in widgets
-                    if w.get("role") == "textbox"
-                    and "actual visit date" in (w.get("label") or "").strip().lower()
-                    and not (w.get("value") or "").strip()), None)
+        return False
+    # Confirm against a fresh read before typing — a stale snapshot is how a
+    # field that was already set got rewritten.
+    box = _visit_date_box(await extract_flutter_widgets(page), min_x)
     if not box:
         return False
     await _autopilot_type(page, box, today)
@@ -1903,6 +1923,81 @@ def _autopilot_incomplete_items(panel):
         if label not in titles:
             titles.append(label)
     return titles
+
+
+#: Text that appears once a submission has been accepted.
+_SUBMIT_SUCCESS_HINTS = (
+    "success", "submitted successfully", "saved successfully", "form submitted",
+    "submission successful",
+)
+#: Text shown while the request is in flight.
+_SUBMIT_BUSY_HINTS = ("loading", "submitting", "please wait", "saving", "processing")
+#: Text for a backend-side rejection, as opposed to client-side validation.
+_SUBMIT_FAILURE_HINTS = (
+    "submission failed", "failed to submit", "could not be submitted",
+    "something went wrong", "server error", "try again later",
+)
+
+
+def _autopilot_submit_state(widgets, panel):
+    """("busy" | "success" | "failed" | "rejected" | None) from the page.
+
+    None means the page says nothing yet — neither still working nor finished.
+    """
+    labels = " ".join((w.get("label") or "").lower() for w in widgets)
+    if any(h in labels for h in _SUBMIT_BUSY_HINTS):
+        return "busy"
+    # An indeterminate progress bar is a spinner; the visit's progress ring
+    # always carries a value, so it is not mistaken for one.
+    if any(w.get("role") == "progressbar" and not str(w.get("value") or "").strip()
+           for w in widgets):
+        return "busy"
+    if any(h in labels for h in _SUBMIT_FAILURE_HINTS):
+        return "failed"
+    if any(h in labels for h in _SUBMIT_SUCCESS_HINTS):
+        return "success"
+    if _autopilot_incomplete_items(panel) or any(
+            _block_has_error(b) for b in _autopilot_blocks(panel)):
+        return "rejected"
+    return None
+
+
+async def _autopilot_await_submit(page, min_x, before_progress, timeout_s=45):
+    """Wait for the backend to answer a submit, then report what it said.
+
+    Clicking Submit starts a loading indicator, and the outcome — a success
+    banner, a validation card, or a backend failure — only exists once that
+    clears. The previous code waited a fixed 1.5s and read immediately, so it
+    routinely saw the state from BEFORE the request finished: a submission
+    that was accepted still reported the old progress counter, and any action
+    taken in that window raced the app.
+
+    Returns (outcome, widgets) where outcome is one of "success", "failed",
+    "rejected", "timeout" or "quiet" (finished, but the page said nothing
+    either way — the caller falls back to comparing the progress counter).
+    """
+    deadline = time.time() + timeout_s
+    widgets = await extract_flutter_widgets(page)
+    settled = 0
+    while time.time() < deadline:
+        panel = _autopilot_panel(widgets, min_x)
+        state = _autopilot_submit_state(widgets, panel)
+        if state == "busy":
+            settled = 0
+        elif state in ("success", "failed", "rejected"):
+            return state, widgets
+        else:
+            progress = _autopilot_progress(widgets)
+            if progress and before_progress and progress != before_progress:
+                return "success", widgets
+            # Nothing said either way: only conclude once the page has stopped
+            # changing, so a still-rendering result is not read as silence.
+            settled += 1
+            if settled >= 3:
+                return "quiet", widgets
+        await page.wait_for_timeout(400)
+        widgets = await extract_flutter_widgets(page)
+    return "timeout", widgets
 
 
 async def _autopilot_reopen_from_card(page, tab_index, min_x, done, attempts, variant,
@@ -2207,7 +2302,7 @@ async def cmd_autofill_form(payload):
     now_hhmm = time.strftime("%H:%M")
 
     report = {"answered": [], "unresolved": [], "corrections": [], "llm_assists": [],
-              "incomplete_card": [], "rounds": 0,
+              "incomplete_card": [], "submit_outcome": None, "rounds": 0,
               "submitted": False, "submit_verified": False, "submit_attempts": 0,
               "progress_before": None, "progress_after": None}
     done = set()          # blocks whose answers were VERIFIED in place
@@ -2231,7 +2326,8 @@ async def cmd_autofill_form(payload):
 
     # Required, lives outside every question block, and blocks submission on
     # its own. Do it up front rather than discovering it via a refusal.
-    if await _autopilot_fill_visit_date(page, widgets, today, report, min_x):
+    if not payload.get("skip_visit_date") and await _autopilot_fill_visit_date(
+            page, widgets, today, report, min_x):
         widgets = await extract_flutter_widgets(page)
 
     stagnant = 0
@@ -2249,6 +2345,20 @@ async def cmd_autofill_form(payload):
         if any(w.get("role") == "dialog" for w in widgets) and stray_dialogs < 8:
             stray_dialogs += 1
             accepted = await _autopilot_accept_dialog(page)
+            if not accepted:
+                # Novatek's "reason for answering X" modal has no OK and no
+                # Cancel — its only button is "Add to visit note", and that
+                # stays inert until the textarea holds something. Left alone it
+                # blocks the entire page, which is how a visit walk ended with
+                # four widgets on screen and no way forward.
+                field = next((w for w in widgets if w.get("role") == "textbox"
+                              or "why you selected" in (w.get("label") or "").lower()), None)
+                note_btn = next((w for w in widgets if w.get("role") == "button"
+                                 and "add to visit note" in (w.get("label") or "").lower()), None)
+                if field and note_btn:
+                    await _autopilot_type(page, field, "Jarvis Reason")
+                    await _autopilot_click(page, note_btn, settle=800)
+                    accepted = "reason note"
             if not accepted:
                 cancel = next((w for w in widgets if w.get("role") == "button"
                                and (w.get("label") or "").strip().lower()
@@ -2517,16 +2627,29 @@ async def cmd_autofill_form(payload):
                                and _is_submit_label(w.get("label"))), None)
             if not submit:
                 continue
-            await _autopilot_click(page, submit, settle=1500)
+            await _autopilot_click(page, submit, settle=300)
             resubmits += 1
             report["submit_attempts"] = resubmits
             report["submitted"] = True
-            widgets = await extract_flutter_widgets(page)
+            # Do nothing until the request has actually finished.
+            outcome, widgets = await _autopilot_await_submit(
+                page, min_x, report["progress_before"])
+            report["submit_outcome"] = outcome
             report["progress_after"] = _autopilot_progress(widgets)
             advanced = (report["progress_after"] or "") != (report["progress_before"] or "")
             still_open = any(_is_submit_label(w.get("label"))
                              for w in _autopilot_panel(widgets, min_x))
-            report["submit_verified"] = advanced or not still_open
+            if outcome in ("failed", "rejected"):
+                report["submit_verified"] = False
+            elif outcome == "success":
+                report["submit_verified"] = True
+            else:
+                # "quiet" or "timeout": fall back to the observable signals.
+                report["submit_verified"] = advanced or not still_open
+            if outcome == "failed":
+                report["unresolved"].append(
+                    "the backend rejected the submission — retrying will not help "
+                    "until whatever it objected to is fixed")
             if report["submit_verified"]:
                 break
 
@@ -2543,9 +2666,12 @@ async def cmd_autofill_form(payload):
                 break
 
             widgets = await _autopilot_scroll_to_form_top(page, tab_index, min_x)
-            # A refusal may be about the visit date rather than any question.
-            if await _autopilot_fill_visit_date(page, widgets, today, report, min_x):
-                widgets = await extract_flutter_widgets(page)
+            # Only revisit the visit date when the refusal actually mentions it;
+            # otherwise leave a field that is already set completely alone.
+            refusal_text = " ".join((w.get("label") or "").lower() for w in widgets)
+            if "actual visit date" in refusal_text:
+                if await _autopilot_fill_visit_date(page, widgets, today, report, min_x):
+                    widgets = await extract_flutter_widgets(page)
             # The card names what is missing outright; the inline scan is the
             # fallback for a refusal it does not cover.
             reopened = await _autopilot_reopen_from_card(
@@ -2706,47 +2832,75 @@ def _png_pixels(data):
 
 async def _sidebar_checkmarks(page, buttons):
     """Which sidebar form buttons carry the green completion checkmark.
-    Takes ONE screenshot of the sidebar strip and samples the pixels at each
-    button's right edge. Returns a list of bools aligned with `buttons`."""
+
+    Self-calibrating on purpose. Every earlier version depended on knowing the
+    screenshot-to-CSS ratio up front, and every source for it was wrong here:
+    window.innerHeight gave a factor that made five of seven completed forms
+    read as open, and a clip-derived factor fared no better. The semantics
+    bounds are equally unhelpful about WHERE the tick is drawn — rows report a
+    right edge near 304 while the tick renders around 271-289 — so any sampling
+    window aimed from them is a guess.
+
+    So nothing is assumed. Find every green blob in the sidebar column, then
+    solve for the ratio that best lines those blobs up with the row centres,
+    and use it. A wrong answer here is expensive: a completed form read as open
+    is re-opened and re-answered, which is the exact thing this prevents.
+    """
     if not buttons:
         return []
-    tops = [b["bounds"]["y"] for b in buttons]
-    bottoms = [b["bounds"]["y"] + b["bounds"]["height"] for b in buttons]
-    clip_y = max(0, min(tops) - 4)
-    clip_h = max(bottoms) - clip_y + 4
-    # The checkmark is drawn OUTSIDE the button's reported bounds: the sidebar
-    # rows report a right edge near CSS x=255 while the tick renders at x≈270-288.
-    # Clipping to the bounds cropped it out of the screenshot entirely, so the
-    # scan below could never find one and every completed form read as open —
-    # which is how an already-submitted form got re-opened and re-answered.
-    clip_w = max(b["bounds"]["x"] + b["bounds"]["width"] for b in buttons) + 80
-    shot = await page.screenshot(clip={"x": 0, "y": clip_y, "width": clip_w, "height": clip_h})
     try:
-        w, h, ch, px = _png_pixels(shot)
+        shot = await page.screenshot()
+        width, height, channels, pixels = _png_pixels(shot)
     except Exception as e:
         print(f"[browser-daemon] checkmark pixel scan failed: {e}", file=sys.stderr)
         return [False] * len(buttons)
-    scale = w / clip_w  # device pixel ratio applied by the screenshot
-    results = []
-    for b in buttons:
-        bb = b["bounds"]
-        # Span the row's right edge rather than sitting inside it, so the tick
-        # is covered wherever it renders relative to the reported bounds.
-        right = bb["x"] + bb["width"]
-        x0 = int((right - 30) * scale)
-        x1 = int((right + 70) * scale)
-        y0 = int((bb["center_y"] - clip_y - 10) * scale)
-        y1 = int((bb["center_y"] - clip_y + 10) * scale)
-        green = 0
-        for yy in range(max(0, y0), min(h, y1)):
-            row = yy * w * ch
-            for xx in range(max(0, x0), min(w, x1)):
-                i = row + xx * ch
-                r, g, bl = px[i], px[i + 1], px[i + 2]
-                if g > 110 and g > r + 35 and g > bl + 35:
-                    green += 1
-        results.append(green >= 6)
-    return results
+
+    # The sidebar is the left column; a third of the width covers it at any
+    # plausible ratio, and nothing else there is green.
+    green_per_row = {}
+    for yy in range(0, height, 2):
+        base = yy * width * channels
+        count = 0
+        for xx in range(0, max(2, width // 3), 2):
+            i = base + xx * channels
+            r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
+            if g > 110 and g > r + 35 and g > b + 35:
+                count += 1
+        if count:
+            green_per_row[yy] = count
+
+    clusters, current = [], []
+    for y in sorted(green_per_row):
+        if current and y - current[-1] > 12:
+            clusters.append(current)
+            current = []
+        current.append(y)
+    if current:
+        clusters.append(current)
+    centres = [sum(c) // len(c) for c in clusters
+               if sum(green_per_row[y] for y in c) >= 8]
+    if not centres:
+        return [False] * len(buttons)
+
+    rows = [b["bounds"]["center_y"] for b in buttons]
+    # Solve for the ratio: every (blob, row) pair proposes one, and the right
+    # one explains the most blobs at once.
+    best_scale, best_hits = 1.0, -1
+    for centre in centres:
+        for row_y in rows:
+            if row_y <= 0:
+                continue
+            candidate = centre / row_y
+            if not 0.2 <= candidate <= 4.0:
+                continue
+            hits = sum(1 for c in centres
+                       if any(abs(c - r * candidate) < 16 for r in rows))
+            if hits > best_hits:
+                best_scale, best_hits = candidate, hits
+
+    return [any(abs(centre - b["bounds"]["center_y"] * best_scale) < 16
+                for centre in centres)
+            for b in buttons]
 
 
 async def cmd_autofill_visit(payload):
@@ -2776,6 +2930,7 @@ async def cmd_autofill_visit(payload):
     # re-submitted. So the first target always comes from the sidebar scan,
     # which knows which forms carry the checkmark.
     trust_open_form = False
+    visit_date_done = False   # the visit date belongs to the visit, not a form
 
     for _ in range(int(payload.get("max_forms", 40))):
         progress = _autopilot_progress(widgets)
@@ -2800,7 +2955,8 @@ async def cmd_autofill_visit(payload):
                     break
         if blocks_open:
             target_label = "(auto-selected form)"
-            form_res = await cmd_autofill_form(dict(payload))
+            form_res = await cmd_autofill_form(dict(payload, skip_visit_date=visit_date_done))
+            visit_date_done = True
             report["forms"].append({
                 "form": target_label,
                 "status": form_res.get("status", form_res.get("error")),
@@ -2834,6 +2990,15 @@ async def cmd_autofill_visit(payload):
             sidebar.sort(key=lambda w: w["bounds"]["center_y"])
             if sidebar:
                 checks = await _sidebar_checkmarks(page, sidebar)
+                # Report what the scan actually saw. Whether a form counts as
+                # already submitted decides if it gets re-answered, so this is
+                # not incidental logging — when the scan is wrong the run
+                # rewrites finished work, and there was no way to see that from
+                # the outside.
+                report["sidebar"] = [
+                    {"form": (b.get("label") or "")[:48], "checked": bool(c),
+                     "bounds": {k: b["bounds"].get(k) for k in ("x", "width", "center_y")}}
+                    for b, c in zip(sidebar, checks)]
                 open_forms = [b for b, c in zip(sidebar, checks)
                               if not c and (b.get("label") or "") not in attempted]
                 if open_forms:
@@ -2858,7 +3023,8 @@ async def cmd_autofill_visit(payload):
 
         attempted.add(target.get("label") or "")
         trust_open_form = True   # from here on Novatek drives the selection
-        form_res = await cmd_autofill_form(dict(payload))
+        form_res = await cmd_autofill_form(dict(payload, skip_visit_date=visit_date_done))
+        visit_date_done = True   # visit-level: set once, never per form
         report["forms"].append({
             "form": target.get("label"),
             "status": form_res.get("status", form_res.get("error")),
