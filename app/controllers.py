@@ -192,3 +192,80 @@ def handle_speak(cfg, body):
             print(f"[jarvis] {tts.name} TTS failed ({e})", file=sys.stderr)
 
     return "json", {"error": "tts failed"}, 502
+
+
+def handle_embeddable(cfg, body):
+    """Returns (response_dict, http_status) for GET/POST /embeddable.
+
+    The viewer's SHOW window renders a page in an iframe, but many sites send
+    `X-Frame-Options: DENY` or `Content-Security-Policy: frame-ancestors 'none'`
+    and Chrome then paints a blank broken-document box. That refusal is
+    invisible to the page doing the embedding — a cross-origin iframe reports
+    nothing readable either way — so the browser cannot tell "still loading"
+    from "refused" and used to just look broken.
+
+    The server has no such restriction: it can read the headers itself. This
+    endpoint reports one of three verdicts so the viewer can choose what to
+    render:
+
+      embeddable "yes"     -> iframe it, as before.
+      embeddable "no"      -> the site explicitly refuses framing. `readable`
+                              carries extracted text so the window can show the
+                              content anyway, when it could be fetched.
+      embeddable "unknown" -> we could not tell (the site blocks server-side
+                              requests too — Cloudflare returns 403 to anything
+                              that is not a real browser). The viewer should
+                              still try the iframe, since a real browser often
+                              succeeds where this probe cannot.
+    """
+    from .connectors.web_fetch import (
+        UnsafeURLError, _assert_fetchable, execute_web_fetch, USER_AGENT,
+    )
+    import urllib.error
+    import urllib.request
+
+    url = (body.get("url") or "").strip()
+    if not url:
+        return {"error": "empty url"}, 400
+
+    # Same guard the web_fetch tool uses: this endpoint takes a URL from the
+    # browser, so it is exactly as exposed as the tool is.
+    try:
+        _assert_fetchable(url)
+    except UnsafeURLError as e:
+        return {"embeddable": "no", "reason": str(e), "readable": None}, 200
+
+    request = urllib.request.Request(url, method="GET", headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            xfo = (resp.headers.get("X-Frame-Options") or "").strip().lower()
+            csp = (resp.headers.get("Content-Security-Policy") or "").lower()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        # Probe blocked or failed. Not a verdict — let the browser try.
+        return {"embeddable": "unknown", "reason": str(e), "readable": None}, 200
+
+    refuses = "deny" in xfo or "sameorigin" in xfo
+    if "frame-ancestors" in csp:
+        directive = csp.split("frame-ancestors", 1)[1].split(";", 1)[0]
+        # 'none' or a host allowlist that cannot include us — either way this
+        # origin is not permitted to frame it.
+        refuses = refuses or "'none'" in directive or "*" not in directive
+
+    if not refuses:
+        return {"embeddable": "yes", "reason": "", "readable": None}, 200
+
+    # Refused: fetch the text so the window has something to show.
+    fetched = execute_web_fetch({"url": url})
+    readable = None
+    if fetched.get("status") == "ok" and fetched.get("content"):
+        readable = {"title": fetched.get("title", ""), "content": fetched["content"]}
+    return {
+        "embeddable": "no",
+        "reason": f"the site sends {'X-Frame-Options: ' + xfo if xfo else 'a frame-ancestors policy'}",
+        "readable": readable,
+    }, 200

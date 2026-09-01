@@ -63,7 +63,7 @@ class JarvisHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[jarvis] " + (fmt % args) + "\n")
 
-    def _send_bytes(self, data, content_type, status=200):
+    def _send_bytes(self, data, content_type, status=200, no_cache=False):
         # The client may have given up (page refresh, browser request timeout)
         # long before a slow tool-using answer finished — the work is already
         # done at this point, so a vanished socket is not an error worth a
@@ -72,6 +72,12 @@ class JarvisHandler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+            if no_cache:
+                # The viewer is edited live and reloaded in place. Without this
+                # the browser heuristically caches js/css (no validator is sent
+                # otherwise), so a code change appears not to have taken effect
+                # until a manual hard reload — which looks exactly like a bug.
+                self.send_header("Cache-Control", "no-cache, must-revalidate")
             self.end_headers()
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
@@ -100,6 +106,14 @@ class JarvisHandler(BaseHTTPRequestHandler):
 
         if url_path == "/chat/result":
             self._handle_chat_result(parsed.query)
+            return
+
+        if url_path == "/embeddable":
+            # The SHOW window asks whether a page can be iframed before trying,
+            # because a cross-origin refusal is invisible to the browser.
+            target = (parse_qs(parsed.query).get("url") or [""])[0]
+            result, status = controllers.handle_embeddable(Config.load(), {"url": target})
+            self._send_json(result, status=status)
             return
 
         if url_path.startswith("/captures/"):
@@ -134,7 +148,7 @@ class JarvisHandler(BaseHTTPRequestHandler):
         content_type = self._guess_content_type(target)
         with open(target, "rb") as f:
             data = f.read()
-        self._send_bytes(data, content_type)
+        self._send_bytes(data, content_type, no_cache=True)
 
     @staticmethod
     def _guess_content_type(path):
