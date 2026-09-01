@@ -1477,13 +1477,31 @@ async def cmd_upload_file(payload):
                 widgets = await extract_flutter_widgets(page)
                 for w in widgets:
                     lbl = (w.get("label") or "").lower()
-                    if any(kw in lbl for kw in ("upload", "signed consent", "file", "attach", "browse", "choose", "select", "consent")):
-                        candidates.append(w.get("label"))
+                    # Whole words only. Substring matching put the navbar's
+                    # "View Profile PARTICIPANT ID …" chip in this list, because
+                    # "file" is inside "Profile" — clicking it opened the
+                    # participant profile dialog instead of a file chooser, over
+                    # and over.
+                    if not _UPLOAD_KEYWORD_RE.search(lbl):
+                        continue
+                    if _autopilot_click_forbidden(w):
+                        continue
+                    candidates.append(w.get("label"))
 
             for target in candidates:
                 if not target:
                     continue
                 cx, cy, matched_label = await find_flutter_widget_coords(page, target)
+                # Never let an upload click land on page furniture. This path
+                # clicks with page.mouse.click directly, so the guard in
+                # _autopilot_click does not cover it — and the participant chip
+                # was reaching it (see _UPLOAD_KEYWORD_RE) and opening a profile
+                # dialog in a loop.
+                if cx is not None and cy is not None and _autopilot_click_forbidden(
+                        {"label": matched_label or target, "bounds": {"center_y": cy}}):
+                    print(f"[browser-daemon] upload: refusing target {str(target)[:40]!r}",
+                          file=sys.stderr)
+                    continue
                 if cx is not None and cy is not None:
                     try:
                         async with page.expect_file_chooser(timeout=3500) as fc_info:
@@ -2000,6 +2018,44 @@ async def _autopilot_await_submit(page, min_x, before_progress, timeout_s=45):
     return "timeout", widgets
 
 
+async def _autopilot_clear_dialog(page, widgets):
+    """Dismiss a blocking modal. Returns how it was cleared, or "" if it could
+    not be, and "" also when there was nothing to clear.
+
+    Accepting is the default — a date/time picker opens on today, which is the
+    value wanted anyway. The "reason for answering X" modal has no OK and no
+    Cancel and needs its textarea filled first. Escape is the last resort for
+    a dialog nobody anticipated, such as the participant-queries panel.
+    """
+    if not any(w.get("role") == "dialog" for w in widgets):
+        return ""
+    how = await _autopilot_accept_dialog(page)
+    if not how:
+        field = next((w for w in widgets if w.get("role") == "textbox"
+                      or "why you selected" in (w.get("label") or "").lower()), None)
+        note = next((w for w in widgets if w.get("role") == "button"
+                     and "add to visit note" in (w.get("label") or "").lower()), None)
+        if field and note:
+            await _autopilot_type(page, field, "Jarvis Reason")
+            await _autopilot_click(page, note, settle=800)
+            how = "reason note"
+    if not how:
+        close = next((w for w in widgets if w.get("role") == "button"
+                      and (w.get("label") or "").strip().lower()
+                      in ("cancel", "close", "dismiss", "back", "x",
+                          "\u2715", "\u2716", "\u00d7")), None)
+        if close:
+            await _autopilot_click(page, close, settle=500)
+            how = "close button"
+    if not how:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(400)
+        if not any(w.get("role") == "dialog"
+                   for w in await extract_flutter_widgets(page)):
+            how = "escape"
+    return how
+
+
 async def _autopilot_reopen_from_card(page, tab_index, min_x, done, attempts, variant,
                                       report, protected=frozenset()):
     """Re-open exactly the questions the Form Incomplete card names.
@@ -2177,10 +2233,73 @@ def _widget_sig(w):
             round((b.get("center_x") or 0) / 25), round((b.get("center_y") or 0) / 25))
 
 
+#: How much room a question needs below its marker before it counts as being
+#: on screen. Novatek renders the input roughly 100px under its number, so a
+#: marker sitting just above the fold has its field just below it: the loop saw
+#: a "visible" question with nothing actionable in it, waited, then abandoned it
+#: as "inputs never became actionable" instead of simply scrolling down to it.
+_AUTOPILOT_BLOCK_MARGIN = 170
+
+#: Labels that identify a file-upload control, matched on WHOLE WORDS. The
+#: earlier substring test matched "file" inside "Profile" and so treated the
+#: navbar's participant chip as an upload button.
+_UPLOAD_KEYWORD_RE = re.compile(
+    r"\b(upload|attach|browse|consent)\b|\bfiles?\b|\bchoose\s+file\b|"
+    r"\bselect\s+file\b|\bsigned\s+consent\b",
+    re.IGNORECASE,
+)
+
+
+#: Controls the autopilot must never click, whatever code path selects them.
+#: These navigate away from or out of the form — the participant chip opens a
+#: profile dialog that the autopilot cannot dismiss, which froze a visit walk
+#: mid-run. "Add to visit note" is deliberately absent: the dialog guard needs
+#: it to clear the mandatory reason modal.
+_AUTOPILOT_NEVER_CLICK = (
+    "view profile", "participant id", "prt-", "account admin", "notification",
+    "end visit", "hold visit", "discard changes", "early termination",
+    "view/edit visit note", "log out", "logout", "sign out", "navigation menu",
+)
+
+#: The top navigation strip. Nothing the autopilot legitimately clicks lives
+#: above this, and everything up there navigates away from the form.
+_AUTOPILOT_TOP_BAR_Y = 90
+
+
+def _autopilot_click_forbidden(w):
+    """Why this widget must not be clicked, or "" when it is safe."""
+    label = (w.get("label") or "").strip().lower()
+    for reserved in _AUTOPILOT_NEVER_CLICK:
+        if reserved in label:
+            return f"reserved control {reserved!r}"
+    if (w.get("bounds") or {}).get("center_y", 999) < _AUTOPILOT_TOP_BAR_Y:
+        return "in the top navigation bar"
+    return ""
+
+
 async def _autopilot_click(page, w, settle=180):
+    """Click a widget, unless it is something that would leave the form.
+
+    The single choke point for every click the autopilot makes, so the guard
+    holds no matter which code path chose the widget — the participant-profile
+    click that froze a visit walk came from the dropdown-option picker, not
+    from the question loop.
+    """
+    forbidden = _autopilot_click_forbidden(w)
+    if forbidden:
+        print(f"[browser-daemon] refused to click {(w.get('label') or '')[:40]!r}: {forbidden}",
+              file=sys.stderr)
+        return False
     b = w["bounds"]
+    # Every click the autopilot makes, logged. A stray click that navigates out
+    # of the visit is otherwise impossible to attribute after the fact — the
+    # page has already changed by the time anything notices.
+    print(f"[browser-daemon] click {(w.get('label') or '')[:46]!r} "
+          f"role={w.get('role')} at ({int(b['center_x'])},{int(b['center_y'])})",
+          file=sys.stderr)
     await page.mouse.click(b["center_x"], b["center_y"])
     await page.wait_for_timeout(settle)
+    return True
 
 
 async def _autopilot_type(page, w, text):
@@ -2214,6 +2333,13 @@ async def _autopilot_first_dropdown_option(page, before_widgets):
     widgets = await extract_flutter_widgets(page)
     fresh = [w for w in widgets if _widget_sig(w) not in before and w.get("label")]
     fresh = [w for w in fresh if w.get("role") in ("option", "button", "menuitem", "widget")]
+    # A re-render makes unrelated widgets look "fresh". Anything outside the
+    # question area is not a dropdown option — this is how the participant
+    # chip in the top bar got clicked, opening a profile dialog the autopilot
+    # could not dismiss.
+    fresh = [w for w in fresh
+             if (w.get("bounds") or {}).get("center_y", 0) > _AUTOPILOT_TOP_BAR_Y
+             and not _autopilot_click_forbidden(w)]
     fresh.sort(key=lambda w: (0 if w.get("role") == "option" else 1,
                               w["bounds"]["center_y"], w["bounds"]["center_x"]))
     if fresh:
@@ -2319,6 +2445,22 @@ async def cmd_autofill_form(payload):
     render_waits = 0      # rounds spent waiting for a visible block's inputs to render
 
     widgets = await extract_flutter_widgets(page)
+
+    # Clear a blocking modal BEFORE deciding whether we are on Visit Mode. A
+    # dialog covers the screen, so this check saw eight widgets, none of them
+    # "Visit Mode", and refused to start — while the guard that would have
+    # dismissed it lives inside the round loop it never reached. Arriving with
+    # one open is normal: a file upload legitimately ends on a date picker.
+    for _ in range(3):
+        if not any(w.get("role") == "dialog" for w in widgets):
+            break
+        how = await _autopilot_clear_dialog(page, widgets)
+        report["answered"].append({"question": "(dialog on entry)",
+                                   "action": f"dismissed via {how or 'no button found'}"})
+        widgets = await extract_flutter_widgets(page)
+        if not how:
+            break
+
     if not _autopilot_visit_ok(widgets):
         return {"error": "Not on the Visit Mode screen — the autopilot is restricted to visit mode. "
                          "Start the visit first."}
@@ -2344,28 +2486,7 @@ async def cmd_autofill_form(payload):
         # the fallback when nothing accepts.
         if any(w.get("role") == "dialog" for w in widgets) and stray_dialogs < 8:
             stray_dialogs += 1
-            accepted = await _autopilot_accept_dialog(page)
-            if not accepted:
-                # Novatek's "reason for answering X" modal has no OK and no
-                # Cancel — its only button is "Add to visit note", and that
-                # stays inert until the textarea holds something. Left alone it
-                # blocks the entire page, which is how a visit walk ended with
-                # four widgets on screen and no way forward.
-                field = next((w for w in widgets if w.get("role") == "textbox"
-                              or "why you selected" in (w.get("label") or "").lower()), None)
-                note_btn = next((w for w in widgets if w.get("role") == "button"
-                                 and "add to visit note" in (w.get("label") or "").lower()), None)
-                if field and note_btn:
-                    await _autopilot_type(page, field, "Jarvis Reason")
-                    await _autopilot_click(page, note_btn, settle=800)
-                    accepted = "reason note"
-            if not accepted:
-                cancel = next((w for w in widgets if w.get("role") == "button"
-                               and (w.get("label") or "").strip().lower()
-                               in ("cancel", "close", "dismiss")), None)
-                if cancel:
-                    await _autopilot_click(page, cancel, settle=500)
-                    accepted = "cancel"
+            accepted = await _autopilot_clear_dialog(page, widgets)
             report["answered"].append({"question": "(stray dialog)",
                                        "action": f"dismissed via {accepted or 'no button found'}"})
             widgets = await extract_flutter_widgets(page)
@@ -2381,7 +2502,7 @@ async def cmd_autofill_form(payload):
             # if its textbox shows no value, the answer didn't register and
             # it is retried NOW — this is the fix for visible-but-skipped
             # questions that previously waited for a lucky later round.
-            if blk["marker_y"] >= inner_h - 40:
+            if blk["marker_y"] >= inner_h - _AUTOPILOT_BLOCK_MARGIN:
                 continue
             if blk.get("is_container"):
                 # Answered by its sub-questions; it has no input of its own.
@@ -2492,7 +2613,13 @@ async def cmd_autofill_form(payload):
                 actions_here.append("signature")
             elif upload_hit:
                 res = await cmd_upload_file({"file_path": file_path, "tab_index": tab_index})
-                if res.get("status") == "file_uploaded":
+                # Both are successes. "file_uploaded" is the DOM path
+                # (set_input_files on a real <input type=file>); "file_selected"
+                # is the Flutter path, where the daemon intercepts the native
+                # file chooser and picks the file for it. Treating the latter as
+                # a failure made the autopilot retry a completed upload, which
+                # re-opened the chooser — the modal that kept stalling the walk.
+                if res.get("status") in ("file_uploaded", "file_selected"):
                     actions_here.append("upload")
                     # Consent uploads chain calendar + time pickers; both
                     # default to now, so accepting them IS the current
@@ -2581,7 +2708,7 @@ async def cmd_autofill_form(payload):
         # are marked done; the rest stay eligible for an immediate retry.
         widgets = await extract_flutter_widgets(page)
         for blk in _autopilot_blocks(_autopilot_panel(widgets, min_x)):
-            if blk["marker_y"] >= inner_h - 40 or attempts.get(blk["key"], 0) == 0:
+            if blk["marker_y"] >= inner_h - _AUTOPILOT_BLOCK_MARGIN or attempts.get(blk["key"], 0) == 0:
                 continue
             empty = [w for w in blk["members"] if w.get("role") == "textbox" and not w.get("value")
                      and w["bounds"]["center_y"] > blk["marker_y"] + 12
@@ -2603,7 +2730,7 @@ async def cmd_autofill_form(payload):
         all_keys = {b["key"] for b in blocks_now}
         pending = all_keys - done - {k for k, n in attempts.items() if n >= 3}
         visible_pending = [b for b in blocks_now
-                           if b["key"] in pending and b["marker_y"] < inner_h - 40]
+                           if b["key"] in pending and b["marker_y"] < inner_h - _AUTOPILOT_BLOCK_MARGIN]
 
         if submit and not pending:
             # `blocks_now` empty means this is a TABLE form — Concomitant
@@ -2933,6 +3060,32 @@ async def cmd_autofill_visit(payload):
     visit_date_done = False   # the visit date belongs to the visit, not a form
 
     for _ in range(int(payload.get("max_forms", 40))):
+        # Re-establish the ground truth every iteration. Visit Mode was checked
+        # once at the start and never again, so a modal opened mid-walk left the
+        # walker clicking blind: a participant-queries dialog stayed up across
+        # runs and every subsequent "click" landed inside it — including one
+        # that looked like the sidebar's Saliva Samples row and one that looked
+        # like the visit-date field.
+        for _attempt in range(3):
+            if not any(w.get("role") == "dialog" for w in widgets):
+                break
+            how = await _autopilot_clear_dialog(page, widgets)
+            report["forms"].append({
+                "note": f"cleared a blocking dialog ({how or 'could not close it'})"})
+            widgets = await extract_flutter_widgets(page)
+            if not how:
+                break
+        if any(w.get("role") == "dialog" for w in widgets):
+            report["forms"].append({
+                "error": "a dialog is open and could not be dismissed — stopping rather "
+                         "than clicking blind underneath it"})
+            break
+        if not _autopilot_visit_ok(widgets):
+            report["forms"].append({
+                "error": "no longer on the Visit Mode screen — stopping. Every click from "
+                         "here would land on whatever replaced it."})
+            break
+
         progress = _autopilot_progress(widgets)
         if progress:
             done_n, total_n = (int(x) for x in progress.split("/"))
@@ -3044,6 +3197,29 @@ async def cmd_autofill_visit(payload):
     parts = (report["progress"] or "0/1").split("/")
     report["all_forms_submitted"] = len(parts) == 2 and parts[0] == parts[1]
     report["status"] = "visit_filled" if report["all_forms_submitted"] else "visit_incomplete"
+    # A blunt sentence, not a status code. The per-form entries each say
+    # "autofill_done", and a model summarising this report will happily read a
+    # handful of those as "the visit is finished" — one did exactly that and
+    # offered to End Visit on a visit sitting at 0/18 with nothing submitted.
+    # The counter is the only authority, so it is stated in words that leave no
+    # room to narrate around.
+    counter = report.get("progress") or "unknown"
+    if report["all_forms_submitted"]:
+        report["verdict"] = (
+            f"COMPLETE - the progress counter reads {counter}. Every form is submitted.")
+    else:
+        remaining = "unknown"
+        try:
+            # `parts` are the strings either side of the "/" — they are compared
+            # as strings above, so they must be converted before arithmetic.
+            remaining = str(int(parts[1]) - int(parts[0]))
+        except (ValueError, IndexError, TypeError):
+            pass
+        report["verdict"] = (
+            f"NOT COMPLETE - the progress counter reads {counter}, so {remaining} form(s) "
+            "are still unsubmitted. Do NOT say the visit is finished, do NOT say every "
+            "form has a checkmark, and do NOT offer to End Visit. Report the counter as "
+            "it stands and say which forms remain.")
     report["widgets"] = _slim_widgets(widgets)
     return report
 

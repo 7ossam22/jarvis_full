@@ -128,6 +128,199 @@ class AlreadyAnsweredTests(unittest.TestCase):
             {"role": "textbox", "value": None, "y": 240}), self.INNER_H))
 
 
+class BlockOnScreenTests(unittest.TestCase):
+    """A question only counts as on screen when there is room for its INPUT.
+
+    REGRESSION: measured on the live Serum Chemistry form, the marker "1-1."
+    sits at y=418 and its textbox at y=520 — about 100px lower. With a 40px
+    margin, a marker just above the fold was "visible" while its field was
+    below it, so the loop found nothing actionable, exhausted its render waits
+    and abandoned the question as "inputs never became actionable" instead of
+    scrolling to it.
+    """
+
+    INNER_H = 860
+
+    def on_screen(self, marker_y):
+        return marker_y < self.INNER_H - bd._AUTOPILOT_BLOCK_MARGIN
+
+    def test_margin_leaves_room_for_the_input(self):
+        # The real gap between a marker and its field, with headroom.
+        self.assertGreaterEqual(bd._AUTOPILOT_BLOCK_MARGIN, 102)
+
+    def test_a_marker_near_the_fold_is_not_treated_as_reachable(self):
+        # Marker visible at 750, but its input would land at ~852 — off screen.
+        self.assertFalse(self.on_screen(750))
+
+    def test_a_marker_with_room_below_it_is_reachable(self):
+        self.assertTrue(self.on_screen(418))
+        self.assertTrue(self.on_screen(600))
+
+    def test_markers_well_below_the_fold_stay_unreachable(self):
+        for y in (900, 1446, 2474):
+            with self.subTest(y):
+                self.assertFalse(self.on_screen(y))
+
+
+class UploadTargetTests(unittest.TestCase):
+    """Which labels count as a file-upload control.
+
+    REGRESSION: the match was a plain substring test, so "file" inside
+    "Pro-file" made the navbar's "View Profile PARTICIPANT ID ..." chip an
+    upload target. cmd_upload_file clicks with page.mouse.click directly,
+    bypassing the guard in _autopilot_click, so it opened the participant
+    profile dialog — repeatedly, since the upload never succeeded and was
+    retried.
+    """
+
+    def hit(self, label):
+        return bool(bd._UPLOAD_KEYWORD_RE.search(label.lower()))
+
+    def test_the_navbar_chip_is_not_an_upload_target(self):
+        for label in ("View Profile PARTICIPANT ID PRT-100-013-463",
+                      "Profile settings", "View Profile", "profile"):
+            with self.subTest(label):
+                self.assertFalse(self.hit(label), label)
+
+    def test_real_upload_controls_still_match(self):
+        for label in ("Upload saliva sample results and/or related documents",
+                      "Attach signed consent", "Choose file", "Browse",
+                      "Files", "Signed consent form",
+                      "Informed Consent Template.pdf"):
+            with self.subTest(label):
+                self.assertTrue(self.hit(label), label)
+
+    def test_unrelated_controls_do_not_match(self):
+        for label in ("Select an option", "Account Admin Admin A",
+                      "Date of Data Entry", "Submit", "Yes",
+                      "View all participant queries"):
+            with self.subTest(label):
+                self.assertFalse(self.hit(label), label)
+
+    def test_the_click_guard_also_covers_upload_targets(self):
+        # Belt and braces: even if a label slipped through the keyword test,
+        # a navbar position or reserved label must still refuse the click.
+        self.assertTrue(bd._autopilot_click_forbidden(
+            {"label": "View Profile PARTICIPANT ID PRT-100-013-463",
+             "bounds": {"center_y": 65}}))
+
+
+class UploadStatusTests(unittest.TestCase):
+    """cmd_upload_file has two success returns and the autopilot must accept
+    both.
+
+    REGRESSION: only "file_uploaded" counted, so the Flutter path's
+    "file_selected" — returned after the daemon intercepts the native file
+    chooser and picks the file — was read as a failure. The autopilot then
+    retried a completed upload, re-opening the chooser modal, which stalled
+    the visit walk repeatedly.
+    """
+
+    SUCCESS = ("file_uploaded", "file_selected")
+
+    @staticmethod
+    def accepted(status):
+        return status in ("file_uploaded", "file_selected")
+
+    def test_both_success_statuses_are_accepted(self):
+        for status in self.SUCCESS:
+            with self.subTest(status):
+                self.assertTrue(self.accepted(status))
+
+    def test_genuine_failures_are_still_failures(self):
+        for status in ("error", "no_input_found", None, "", "cancelled"):
+            with self.subTest(status):
+                self.assertFalse(self.accepted(status))
+
+    def test_the_daemon_still_returns_both(self):
+        import inspect
+        src = inspect.getsource(bd.cmd_upload_file)
+        self.assertIn('"file_uploaded"', src)
+        self.assertIn('"file_selected"', src)
+
+
+class VisitVerdictTests(unittest.TestCase):
+    """The visit report's plain-language verdict.
+
+    REGRESSION: the first version did arithmetic on the progress counter's
+    halves, which are strings — every visit walk died with
+    "unsupported operand type(s) for -: 'str' and 'str'".
+    """
+
+    @staticmethod
+    def verdict(progress, all_done):
+        parts = (progress or "0/1").split("/")
+        counter = progress or "unknown"
+        if all_done:
+            return f"COMPLETE - the progress counter reads {counter}. Every form is submitted."
+        remaining = "unknown"
+        try:
+            remaining = str(int(parts[1]) - int(parts[0]))
+        except (ValueError, IndexError, TypeError):
+            pass
+        return (f"NOT COMPLETE - the progress counter reads {counter}, so {remaining} "
+                "form(s) are still unsubmitted.")
+
+    def test_counts_the_remaining_forms(self):
+        self.assertIn("18 form(s)", self.verdict("0/18", False))
+        self.assertIn("3 form(s)", self.verdict("7/10", False))
+        self.assertIn("1 form(s)", self.verdict("17/18", False))
+
+    def test_a_complete_visit_says_so(self):
+        self.assertTrue(self.verdict("18/18", True).startswith("COMPLETE"))
+
+    def test_an_unreadable_counter_does_not_raise(self):
+        for progress in (None, "", "unknown", "3", "a/b", "//"):
+            with self.subTest(repr(progress)):
+                self.assertIn("NOT COMPLETE", self.verdict(progress, False))
+
+    def test_the_verdict_names_the_counter_verbatim(self):
+        self.assertIn("0/18", self.verdict("0/18", False))
+
+
+class NeverClickTests(unittest.TestCase):
+    """Controls that navigate away from the form are unclickable, whatever
+    code path picks them.
+
+    REGRESSION: during a visit walk the dropdown-option picker treated a
+    re-rendered top-bar widget as a fresh option and clicked the participant
+    chip. That opened a profile dialog the autopilot could not dismiss, and
+    the whole run froze. The guard lives in _autopilot_click — the single
+    point every click goes through — so no future code path can reach one.
+    """
+
+    @staticmethod
+    def w(label, y=400):
+        return {"label": label, "bounds": {"center_x": 600, "center_y": y}}
+
+    def test_navigation_and_destructive_controls_are_refused(self):
+        for label, y in [("View Profile", 70),
+                         ("PARTICIPANT ID PRT-100-013-463", 70),
+                         ("Account Admin Admin A", 70),
+                         ("End Visit", 840), ("Hold Visit", 840),
+                         ("Discard changes", 780), ("Early Termination", 810),
+                         ("View/Edit visit note", 750), ("Log out", 70)]:
+            with self.subTest(label):
+                self.assertTrue(bd._autopilot_click_forbidden(self.w(label, y)), label)
+
+    def test_anything_in_the_top_bar_is_refused_even_unlabelled(self):
+        self.assertIn("top navigation",
+                      bd._autopilot_click_forbidden(self.w("", 40)))
+
+    def test_the_controls_the_autopilot_needs_stay_clickable(self):
+        for label, y in [("Submit", 800), ("Submit Form", 820), ("Yes", 400),
+                         ("No", 400), ("Injection (INJ)", 530), ("Sign Now", 600),
+                         ("Sign Document", 620), ("OK", 700), ("kg", 170),
+                         # required to clear the mandatory reason modal
+                         ("Add to visit note", 540)]:
+            with self.subTest(label):
+                self.assertEqual(bd._autopilot_click_forbidden(self.w(label, y)), "", label)
+
+    def test_the_guard_is_case_insensitive(self):
+        self.assertTrue(bd._autopilot_click_forbidden(self.w("END VISIT", 800)))
+        self.assertTrue(bd._autopilot_click_forbidden(self.w("view profile", 800)))
+
+
 class VisitDateTests(unittest.TestCase):
     """The visit date belongs to the visit, is set once, and must never be
     rewritten once it holds a value — typing into it re-opens the calendar
