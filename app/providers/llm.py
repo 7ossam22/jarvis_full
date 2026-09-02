@@ -42,6 +42,18 @@ class LLMProvider(ABC):
         """True when this backend has what it needs to attempt a call at all
         (an API key, or — Anthropic only — a `claude` CLI found on PATH)."""
 
+    def supports_vision(self):
+        """True when this backend can actually LOOK at an image in a turn.
+
+        Separate from being configured or reachable, because a backend can be
+        both and still be blind — the `claude` CLI fallback flattens a turn to
+        text, so an attached camera frame vanishes on the way out. Silently
+        handing a picture to a blind backend is the worst outcome available:
+        the model sees the note saying a frame was captured, sees no frame, and
+        narrates the confusion back to the user as though the camera failed.
+        """
+        return False
+
     def is_reachable(self):
         """True when this backend can plausibly be reached right now.
 
@@ -99,7 +111,8 @@ def get_llm_providers(cfg, prefer=None):
     return ordered
 
 
-def call_model(cfg, system_prompt, messages, fallback_text, prefer=None):
+def call_model(cfg, system_prompt, messages, fallback_text, prefer=None,
+               needs_vision=False):
     """Tries each configured provider in order, returning the first successful
     reply. Deliberately broad except: two very differently-shaped backends
     (HTTP APIs, a subprocess CLI) fail in idiosyncratic ways, and there is
@@ -110,8 +123,24 @@ def call_model(cfg, system_prompt, messages, fallback_text, prefer=None):
     down still reaches the others."""
     from .. import telemetry
 
+    providers = get_llm_providers(cfg, prefer=prefer)
+
+    if needs_vision:
+        # A turn carrying a camera frame may only go to a backend that can see
+        # it. Ordering is not enough — falling through to a blind one would
+        # answer a question about a picture without the picture.
+        seeing = [p for p in providers if p.supports_vision()]
+        if not seeing:
+            names = ", ".join(p.name for p in providers) or "none"
+            telemetry.record("error", "a camera frame was captured but no backend can see",
+                             f"configured: {names}")
+            return ("I captured the frame, sir, but none of my configured models can "
+                    "actually look at an image right now. Set model.provider_api_key for "
+                    "Claude, or use the Gemini key — the `claude` CLI fallback is text-only.")
+        providers = seeing
+
     failures = []
-    for provider in get_llm_providers(cfg, prefer=prefer):
+    for provider in providers:
         try:
             telemetry.activity(f"Asking {provider.name}…")
             return provider.converse(system_prompt, messages)

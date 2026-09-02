@@ -30,6 +30,7 @@ import urllib.parse
 import urllib.request
 
 from .llm import LLMProvider
+from .. import vision
 from ..connectors.registry import LMSTUDIO, registry
 
 DEFAULT_MODEL = "local-model"
@@ -42,7 +43,9 @@ def _to_openai_messages(system_prompt, messages):
     out = [{"role": "system", "content": system_prompt}]
     for m in messages:
         role = "assistant" if m.get("role") == "assistant" else "user"
-        out.append({"role": role, "content": str(m.get("content", ""))})
+        out.append({"role": role,
+                    "content": vision.to_openai_content(str(m.get("content", "")),
+                                                        vision.images_of(m))})
     return out
 
 
@@ -131,6 +134,13 @@ class LMStudioProvider(LLMProvider):
 
     def is_configured(self):
         return bool((self._cfg.get("model.lmstudio_base_url") or "").strip())
+
+    def supports_vision(self):
+        # Depends entirely on the model loaded in LM Studio, which this server
+        # cannot inspect — and a text-only model handed an image typically
+        # ignores it rather than erroring, which is the silent failure this
+        # whole capability check exists to prevent. Opt in deliberately.
+        return bool(self._cfg.get("model.lmstudio_vision"))
 
     def is_reachable(self):
         """One TCP knock at the LM Studio host, cached briefly.

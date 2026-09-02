@@ -4,6 +4,7 @@
 // the session ID, and is the target callback voiceController invokes for
 // anything heard on the mic (wired by main.js).
 import { chatRequest, rememberRequest } from "../model/api.js";
+import * as camera from "../view/cameraWindow.js";
 import { graphData, neighborsOf, nodeById } from "../model/graphData.js";
 import { showAnswer } from "../view/toast.js";
 import { setStatus } from "../view/statusLine.js";
@@ -120,6 +121,49 @@ function onChatProgress({ activity, seconds, notable, stuck }) {
   speak(activity);
 }
 
+// The camera on THIS device is reachable only from here, so whether to open it
+// is decided before the message is sent — mirrors app/turn.py, which makes the
+// same call server-side for the machine's own camera. Deliberately not shared
+// code: these answer different questions about different hardware.
+const LOOK_RE = /\b(look at (me|this|that|my|the)|open (your|the) eyes|(what|who|how many|anything|describe).{0,30}you see|can you see|see (me|this|what)|use your eyes|(open|start|turn on)\s+(the\s+)?(cam|camera|webcam)|take a look)\b/i;
+const CLOSE_RE = /\b(close (your|the) eyes|stop (looking|watching|the camera)|(close|turn off|shut off|stop)\s+(the\s+)?(cam|camera|webcam))\b/i;
+// "Remote" means the machine running the server; the server handles that one
+// itself, and this device's camera must stay out of it.
+const REMOTE_RE = /\b(remote|machine|server|host|pc|laptop|desktop)('?s)?\s+(cam|camera|webcam)\b|\bcamera\s+on\s+the\s+(machine|server|pc|laptop)\b/i;
+
+/** Frames to send with this message, opening the camera first if asked. */
+async function framesFor(text) {
+  if (REMOTE_RE.test(text)) return [];        // the server's own camera
+  if (CLOSE_RE.test(text)) { camera.closeEyes(); logLine("Camera closed.", "system"); return []; }
+
+  if (!camera.eyesAreOpen()) {
+    if (!LOOK_RE.test(text)) return [];
+    setStatus("● opening the camera…");
+    const problem = await camera.openEyes();
+    if (problem) {
+      // Never let a blind turn look like a sighted one: say it in the log AND
+      // let the server know, so the model answers "I cannot see" rather than
+      // inventing a description.
+      logLine(`Cannot see — ${problem}`, "error");
+      showAnswer(`I cannot open the camera, sir — ${problem}`);
+      speak("I cannot open the camera, sir.");
+      return [];
+    }
+    logLine("Camera open — eyes on.", "system");
+  }
+
+  const frame = await camera.captureFrame();
+  if (!frame) {
+    // The eyes are open but nothing came out. Saying so beats sending an empty
+    // turn and letting the model narrate a camera failure it can only guess at.
+    const why = camera.lastCameraError() || "no frame could be captured";
+    logLine(`Camera open but blind — ${why}`, "error");
+    return [];
+  }
+  logLine(`Frame captured (${Math.round(frame.length / 1365)} KB) — sending it along.`, "system");
+  return [frame];
+}
+
 async function handleChat(text) {
   const seq = ++requestSeq;
   // A new turn earns one spoken update straight away; the gap only throttles
@@ -132,7 +176,7 @@ async function handleChat(text) {
 
   logLine(`POST /chat "${text}"`, "net");
   try {
-    const data = await chatRequest(text, sessionId, onChatProgress);
+    const data = await chatRequest(text, sessionId, onChatProgress, await framesFor(text));
     if (seq !== requestSeq) {
       logLine(`(stale reply dropped: "${(data.answer || "").slice(0, 60)}…")`, "system");
       return;

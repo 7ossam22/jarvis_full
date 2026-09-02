@@ -5,6 +5,7 @@ specifics (no self.send_response, no headers). app/http_server.py adapts
 these to actual HTTP requests/responses. This separation is what makes the
 business logic here testable/reusable independent of the transport.
 """
+import base64
 import os
 import re
 import sys
@@ -60,7 +61,41 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
 
     max_turns = cfg.get("retrieval.max_history_turns", 6)
     hist = history.get_history(session_id)
-    messages = hist + [{"role": "user", "content": user_content}]
+
+    # Sight. Frames reach the model as part of THIS turn rather than as a tool
+    # result, because a tool result is JSON text — a model cannot look at a
+    # JPEG described to it in a string. Two sources, never mixed:
+    #   - the browser sends frames from the camera on the device showing the
+    #     interface (the default: "look at me", "what do you see"),
+    #   - the server grabs one from its own webcam when the user says "remote".
+    from . import turn, vision
+    turn.bind_message(question)
+
+    frames = vision.normalize_images(body.get("images"))
+    camera_note = None
+    if turn.wants_remote_camera(question):
+        from .connectors import camera
+        shot = camera.capture_frame()
+        if shot["ok"]:
+            frames = vision.normalize_images(
+                [{"media_type": "image/jpeg",
+                  "data": base64.b64encode(shot["jpeg"]).decode("ascii")}])
+            camera_note = f"[live frame from the machine's camera, {shot['device']}]"
+        else:
+            # Say it in the turn itself. A failed capture that only lands in a
+            # log produces an answer describing a scene that was never seen.
+            camera_note = f"[the machine's camera could not be read: {shot['error']}]"
+            telemetry.record("error", "machine camera capture failed", shot["error"])
+    elif frames:
+        camera_note = f"[live frame{'s' if len(frames) > 1 else ''} from the user's camera, just captured]"
+
+    if camera_note:
+        user_content = f"{camera_note}\n{user_content}"
+
+    last_turn = {"role": "user", "content": user_content}
+    if frames:
+        last_turn["images"] = frames
+    messages = hist + [last_turn]
 
     fallback = persona.no_brain_apology(cfg)
     if relevant:
@@ -72,14 +107,18 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
     from . import telemetry
 
     t0 = time.time()
-    # Tool handlers run several layers below this and cannot otherwise see what
-    # was asked — which is the only thing separating "play it" from "open it in
-    # the browser". See app/turn.py.
-    from . import turn
-    turn.bind_message(question)
-
     system_prompt = persona.build_system_prompt(cfg)
-    answer = call_model(cfg, system_prompt, messages, fallback)
+    # `model.vision_provider` picks which backend does the LOOKING, separately
+    # from the one that does the talking — the same split as
+    # `model.assist_provider`, and for the same reason: a local multimodal
+    # model can describe a camera frame all day without touching a metered
+    # quota, while the conversation still goes wherever `model.provider` says.
+    # Unset, vision follows `model.provider` like everything else, and failover
+    # is unchanged either way: preferring a backend that is down or blind still
+    # reaches another one that can see.
+    answer = call_model(cfg, system_prompt, messages, fallback,
+                        needs_vision=bool(frames),
+                        prefer=cfg.get("model.vision_provider") if frames else None)
 
     # Errors recorded during THIS turn travel back with the answer. The model
     # is told to report them, but a small model narrates optimistically — it

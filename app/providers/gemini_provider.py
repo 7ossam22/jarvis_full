@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 
 from .llm import LLMProvider
-from .. import telemetry
+from .. import telemetry, vision
 from ..connectors.registry import GEMINI, registry
 
 DEFAULT_MODEL = "gemini-flash-latest"
@@ -90,7 +90,9 @@ def _to_gemini_contents(messages):
     contents = []
     for m in messages:
         role = "model" if m.get("role") == "assistant" else "user"
-        contents.append({"role": role, "parts": [{"text": str(m.get("content", ""))}]})
+        contents.append({"role": role,
+                         "parts": vision.to_gemini_parts(str(m.get("content", "")),
+                                                         vision.images_of(m))})
     return contents
 
 
@@ -239,6 +241,9 @@ class GeminiProvider(LLMProvider):
     def is_configured(self):
         key = self._cfg.get("model.gemini_api_key") or ""
         return bool(key.strip()) and "PUT-YOUR" not in key
+
+    def supports_vision(self):
+        return True
 
     def converse(self, system_prompt, messages):
         return call_gemini(self._cfg, system_prompt, messages)

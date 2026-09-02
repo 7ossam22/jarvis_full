@@ -6,6 +6,7 @@
   "model": {
     "provider": "",
     "assist_provider": "",
+    "vision_provider": "",
     "provider_api_key": "PUT-YOUR-KEY-HERE",
     "model_id": "claude-sonnet-5",
     "gemini_api_key": "PUT-YOUR-GEMINI-KEY-HERE",
@@ -13,7 +14,8 @@
     "lmstudio_base_url": "",
     "lmstudio_model_id": "",
     "lmstudio_api_key": "lm-studio",
-    "lmstudio_use_tools": true
+    "lmstudio_use_tools": true,
+    "lmstudio_vision": false
   },
   "browser": {
     "automation_hosts": [

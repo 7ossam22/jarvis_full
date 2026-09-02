@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 
 from .llm import LLMProvider
+from .. import vision
 from ..connectors.registry import ANTHROPIC, registry
 
 
@@ -31,7 +32,15 @@ def call_anthropic(cfg, system_prompt, messages):
     ]
     tools.extend(registry.get_tools_for_provider(ANTHROPIC))
 
-    curr_messages = list(messages)
+    # Images ride as content blocks; a turn without them stays a plain string,
+    # so ordinary conversations send byte-identical payloads to before.
+    curr_messages = [
+        {"role": m.get("role", "user"),
+         "content": vision.to_anthropic_content(str(m.get("content", "")),
+                                                vision.images_of(m))}
+        if isinstance(m, dict) and vision.images_of(m) else m
+        for m in messages
+    ]
     payload_dict = {
         "model": model,
         "max_tokens": 1024,
@@ -169,6 +178,14 @@ def call_claude_cli(cfg, system_prompt, messages):
                     f"{json.dumps(result)}\n"
                 )
 
+    # Defence in depth: call_model already keeps image turns away from here,
+    # and if that ever stops being true this must fail loudly to the next
+    # backend rather than quietly answer a question about an unseen picture.
+    if vision.has_images(messages):
+        raise RuntimeError(
+            "the claude CLI fallback is text-only and cannot see an image; "
+            "set model.provider_api_key to use the vision-capable API")
+
     convo = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
     full_prompt = f"{convo}{extra_context}\n\nASSISTANT:"
     result = subprocess.run(
@@ -189,6 +206,11 @@ class AnthropicProvider(LLMProvider):
 
     def is_configured(self):
         return self._cfg.has_real_api_key() or shutil.which("claude") is not None
+
+    def supports_vision(self):
+        # Only the direct API carries image blocks. The `claude -p` fallback
+        # takes a single text prompt, so a frame cannot reach it at all.
+        return self._cfg.has_real_api_key()
 
     def converse(self, system_prompt, messages):
         cfg = self._cfg

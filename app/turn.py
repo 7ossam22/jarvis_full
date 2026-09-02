@@ -148,6 +148,49 @@ _REDIRECT = {
 }
 
 
+# ---- camera routing --------------------------------------------------------
+# Two different cameras, told apart by one word. "Remote" means the machine
+# this server runs on; everything else means the camera on the device showing
+# the interface, which the browser owns and the server cannot reach.
+_REMOTE_CAMERA_RE = re.compile(
+    r"\b(remote|machine|server|host|pc|laptop|desktop)('?s)?\s+(cam|camera|webcam)\b"
+    r"|\bcamera\s+on\s+the\s+(machine|server|pc|laptop)\b", re.IGNORECASE)
+
+#: "Look at me" is a request for sight, not for a device. These turn the eyes
+#: ON; while they are open every following question gets a fresh frame, so
+#: "what am I holding?" needs no ceremony of its own.
+_LOOK_RE = re.compile(
+    r"\b(look at (me|this|that|my|the)"
+    r"|open (your|the) eyes"
+    r"|(what|who|how many|anything|describe).{0,30}you see"
+    r"|can you see"
+    r"|see (me|this|what)"
+    r"|use your eyes"
+    r"|(open|start|turn on)\s+(the\s+)?(cam|camera|webcam)"
+    r"|take a look)\b", re.IGNORECASE)
+
+_EYES_CLOSED_RE = re.compile(
+    r"\b(close (your|the) eyes"
+    r"|stop (looking|watching|the camera)"
+    r"|(close|turn off|shut off|stop)\s+(the\s+)?(cam|camera|webcam))\b",
+    re.IGNORECASE)
+
+
+def wants_remote_camera(text=None):
+    """The user asked for the camera on the machine running this server."""
+    return bool(_REMOTE_CAMERA_RE.search(text if text is not None else _message.get()))
+
+
+def wants_to_be_seen(text=None):
+    """The user asked to be looked at, without naming the machine."""
+    text = text if text is not None else _message.get()
+    return bool(_LOOK_RE.search(text)) and not wants_remote_camera(text)
+
+
+def wants_eyes_closed(text=None):
+    return bool(_EYES_CLOSED_RE.search(text if text is not None else _message.get()))
+
+
 def browser_policy_violation(url, automation_hosts=DEFAULT_AUTOMATION_HOSTS):
     """The refusal text when opening `url` in the real browser goes against
     what the user asked for, or None when it is allowed.

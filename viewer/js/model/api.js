@@ -17,11 +17,16 @@ const CHAT_POLL_DEADLINE_MS = 60 * 60 * 1000;
  *   the server reports something new about the running turn. `notable` is true
  *   only for the handful of updates worth interrupting the user over.
  */
-export async function chatRequest(message, sessionId, onProgress) {
+export async function chatRequest(message, sessionId, onProgress, images) {
   const res = await fetch("/chat", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ message, session_id: sessionId, async: true }),
+    body: JSON.stringify({
+      message, session_id: sessionId, async: true,
+      // Camera frames from this device, as data: URLs. Omitted entirely when
+      // the eyes are shut, so an ordinary turn sends exactly what it did.
+      ...(images && images.length ? { images } : {}),
+    }),
   });
   const started = await res.json();
   if (!started.job_id) return started; // server answered synchronously
