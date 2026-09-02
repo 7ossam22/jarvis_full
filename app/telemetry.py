@@ -16,6 +16,7 @@ running process, not history worth keeping.
 Thread-safe: the server is a ThreadingHTTPServer and chat runs on worker
 threads, so several of these can be written at once.
 """
+import contextvars
 import threading
 import time
 
@@ -31,6 +32,61 @@ STUCK_AFTER_S = 180
 _lock = threading.Lock()
 _events = []
 _jobs = {}
+
+#: The chat job running on this thread, so code deep inside a provider's tool
+#: loop can report progress without every layer between here and there having
+#: to pass an id down. Each worker thread starts with its own empty context, so
+#: two concurrent chats cannot see each other's.
+_current_job = contextvars.ContextVar("jarvis_job_id", default=None)
+
+
+def current_job():
+    return _current_job.get()
+
+
+def bind_job(job_id):
+    """Marks this thread as working on `job_id`. Called once, at the top of the
+    worker thread."""
+    _current_job.set(job_id)
+
+
+def activity(message, notable=False, job_id=None):
+    """Say what is happening RIGHT NOW in the running turn.
+
+    Distinct from record(): events are a history worth scrolling, this is a
+    single replaceable line answering "why is nothing happening yet". A long
+    tool-using turn is otherwise completely silent from the outside, which is
+    exactly how waiting on a rate limit and hanging forever look identical.
+
+    `notable` marks the ones a person would want SAID out loud rather than
+    merely shown — a stall, a failure, a wait long enough to worry about. Most
+    progress is not notable; narrating every tool call would be unbearable.
+    """
+    job_id = job_id or _current_job.get()
+    if job_id is None:
+        return
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is not None:
+            job["activity"] = str(message)[:200]
+            job["activity_at"] = time.time()
+            if notable:
+                job["notable_seq"] = job.get("notable_seq", 0) + 1
+
+
+def job_activity(job_id):
+    """What that job is doing now, for the viewer's poll. `seq` changes only on
+    notable updates, so the client can speak those and stay quiet otherwise."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return None
+        return {
+            "activity": job.get("activity"),
+            "seconds": round(time.time() - job["started"], 1),
+            "notable_seq": job.get("notable_seq", 0),
+            "stuck": (time.time() - job["started"]) > STUCK_AFTER_S,
+        }
 
 
 def record(kind, message, detail=None):
@@ -56,7 +112,8 @@ def job_started(job_id, what):
     """Note that a long-running unit of work began."""
     with _lock:
         _jobs[job_id] = {"what": str(what)[:200], "started": time.time(),
-                         "finished": None, "ok": None, "error": None}
+                         "finished": None, "ok": None, "error": None,
+                         "activity": None, "activity_at": None, "notable_seq": 0}
 
 
 def job_finished(job_id, ok=True, error=None):
@@ -70,6 +127,7 @@ def job_finished(job_id, ok=True, error=None):
 def _running_jobs_locked(now):
     return [
         {"what": j["what"], "seconds": round(now - j["started"], 1),
+         "activity": j.get("activity"),
          "stuck": (now - j["started"]) > STUCK_AFTER_S}
         for j in _jobs.values() if j["finished"] is None
     ]

@@ -12,7 +12,12 @@ const CHAT_POLL_INTERVAL_MS = 1500;
 // before the server does left the workflow finishing invisibly.
 const CHAT_POLL_DEADLINE_MS = 60 * 60 * 1000;
 
-export async function chatRequest(message, sessionId) {
+/**
+ * @param onProgress Called with {activity, seconds, notable, stuck} each time
+ *   the server reports something new about the running turn. `notable` is true
+ *   only for the handful of updates worth interrupting the user over.
+ */
+export async function chatRequest(message, sessionId, onProgress) {
   const res = await fetch("/chat", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -22,6 +27,8 @@ export async function chatRequest(message, sessionId) {
   if (!started.job_id) return started; // server answered synchronously
 
   const deadline = Date.now() + CHAT_POLL_DEADLINE_MS;
+  let lastActivity = null;
+  let lastNotable = 0;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, CHAT_POLL_INTERVAL_MS));
     let data;
@@ -33,6 +40,16 @@ export async function chatRequest(message, sessionId) {
     }
     if (data.status === "done") return data.result;
     if (data.status === "unknown") throw new Error("chat job vanished on the server");
+
+    // Only report genuine CHANGES. The poll fires every 1.5s; re-announcing
+    // the same line each time would turn a status into a stutter.
+    if (onProgress && data.activity && data.activity !== lastActivity) {
+      lastActivity = data.activity;
+      const notable = (data.notable_seq || 0) > lastNotable;
+      lastNotable = data.notable_seq || 0;
+      onProgress({ activity: data.activity, seconds: data.seconds,
+                   notable, stuck: !!data.stuck });
+    }
   }
   throw new Error("chat job timed out");
 }

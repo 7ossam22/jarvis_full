@@ -94,8 +94,37 @@ export async function handleSubmit(text) {
   await handleChat(text);
 }
 
+// How long between spoken progress updates. Saying every change out loud
+// would be intolerable — a busy turn changes activity several times a second —
+// but saying nothing for two minutes is what made a rate limit look like a
+// crash. Only `notable` updates are ever spoken, and never more often than
+// this.
+const SPOKEN_PROGRESS_GAP_MS = 25000;
+let lastSpokenProgress = 0;
+
+/** Live progress for the turn in flight: shown always, spoken rarely. */
+function onChatProgress({ activity, seconds, notable, stuck }) {
+  const elapsed = seconds >= 60
+    ? `${Math.floor(seconds / 60)}m${String(Math.round(seconds % 60)).padStart(2, "0")}s`
+    : `${Math.round(seconds)}s`;
+  setStatus(`● ${activity} · ${elapsed}`);
+  showAnswer(activity);
+  logLine(activity, stuck ? "error" : "system");
+
+  // Speech is the interrupting channel, so it gets the strictest filter: only
+  // things that changed the situation, and only if we have been quiet a while.
+  if (!notable) return;
+  const now = Date.now();
+  if (now - lastSpokenProgress < SPOKEN_PROGRESS_GAP_MS) return;
+  lastSpokenProgress = now;
+  speak(activity);
+}
+
 async function handleChat(text) {
   const seq = ++requestSeq;
+  // A new turn earns one spoken update straight away; the gap only throttles
+  // repeats WITHIN a turn.
+  lastSpokenProgress = 0;
   const cue = getRandomThinkingCue();
   setStatus(`● thinking… (${cue})`);
   showAnswer(cue);
@@ -103,7 +132,7 @@ async function handleChat(text) {
 
   logLine(`POST /chat "${text}"`, "net");
   try {
-    const data = await chatRequest(text, sessionId);
+    const data = await chatRequest(text, sessionId, onChatProgress);
     if (seq !== requestSeq) {
       logLine(`(stale reply dropped: "${(data.answer || "").slice(0, 60)}…")`, "system");
       return;

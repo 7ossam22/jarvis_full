@@ -420,6 +420,11 @@ class ToolRegistry:
                 "error": f"Tool '{tool_name}' expects an object of arguments, got {type(arguments).__name__}.",
             }
 
+        # Every provider's tool loop funnels through here, so this one line
+        # gives all of them live progress: the turn can now say "reading the
+        # form" instead of going silent for two minutes.
+        _telemetry().activity(f"{_describe(tool_name, arguments)}…")
+
         try:
             if tool.wants_cfg:
                 return tool.handler(arguments, cfg)
@@ -428,12 +433,45 @@ class ToolRegistry:
             sys.stderr.write(f"[jarvis] tool {tool_name} raised: {exc}\n")
             traceback.print_exc(file=sys.stderr)
             _telemetry().record("error", f"tool {tool_name} raised", exc)
+            # Worth SAYING: a tool blowing up mid-turn is the moment the user
+            # most needs telling, and it is the moment they are least likely to
+            # be watching a panel.
+            _telemetry().activity(f"{tool_name} failed: {exc}", notable=True)
             return {"status": "error", "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
 # The process-wide registry, pre-loaded with every connector bundle
 # ---------------------------------------------------------------------------
+
+#: Phrasing for the live progress line. A raw tool name and a JSON blob is a
+#: developer's view; this is the one the user reads while they wait.
+_ACTIVITY_VERBS = {
+    "web_search": "Searching the web",
+    "web_fetch": "Reading",
+    "browser_autofill_visit": "Filling the visit forms",
+    "browser_fill_form": "Filling the form",
+    "browser_screenshot": "Looking at the screen",
+    "browser_navigate": "Opening",
+    "gmail_list": "Checking your mail",
+    "gmail_send": "Sending mail",
+    "jira_search": "Searching Jira",
+    "discord_send": "Sending on Discord",
+}
+
+#: The argument worth showing alongside the verb, per tool.
+_ACTIVITY_SUBJECT = ("query", "url", "to", "subject", "label", "text")
+
+
+def _describe(tool_name, arguments):
+    verb = _ACTIVITY_VERBS.get(tool_name) or tool_name.replace("_", " ").capitalize()
+    if isinstance(arguments, dict):
+        for key in _ACTIVITY_SUBJECT:
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"{verb} {value.strip()[:60]}"
+    return verb
+
 
 def _telemetry():
     """Imported lazily: app.telemetry must not become a hard dependency of the

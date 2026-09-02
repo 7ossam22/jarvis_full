@@ -338,7 +338,18 @@ def handle_form_assist(cfg, body):
         "What is the single next action?"
     )
 
-    raw = call_model(cfg, FORM_ASSIST_SYSTEM, [{"role": "user", "content": prompt}], "")
+    # The autopilot escalates here only when its deterministic rules run out on
+    # one question — but a stuck visit produces a burst of these, dozens in a
+    # couple of minutes. That burst is what exhausts a per-minute API quota
+    # (a free-tier Gemini key allows ~10 requests/minute), and the run then
+    # dies on a rate limit rather than on the problem it was actually solving.
+    # `model.assist_provider` points this one path at a backend with no such
+    # ceiling — typically the local LM Studio model, which is more than capable
+    # of a single constrained-JSON decision. Unset, it simply follows
+    # `model.provider` like everything else, and failover is unchanged either
+    # way, so a preferred backend being down still gets the question answered.
+    raw = call_model(cfg, FORM_ASSIST_SYSTEM, [{"role": "user", "content": prompt}], "",
+                     prefer=cfg.get("model.assist_provider"))
     if not raw or "{" not in raw:
         return {"action": "skip", "reason": "no usable model reply"}, 200
 

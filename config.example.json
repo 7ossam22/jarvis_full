@@ -5,6 +5,7 @@
   },
   "model": {
     "provider": "",
+    "assist_provider": "",
     "provider_api_key": "PUT-YOUR-KEY-HERE",
     "model_id": "claude-sonnet-5",
     "gemini_api_key": "PUT-YOUR-GEMINI-KEY-HERE",
@@ -43,7 +44,7 @@
     "closing_lines": [
       "Very good, sir. I'll be here when you need me.",
       "Until next time, sir.",
-      "Anytime, sir — just say the word.",
+      "Anytime, sir \u2014 just say the word.",
       "Standing by, sir."
     ]
   },
@@ -75,4 +76,3 @@
     "access_token": "YOUR-GMAIL-OAUTH-ACCESS-TOKEN"
   }
 }
-

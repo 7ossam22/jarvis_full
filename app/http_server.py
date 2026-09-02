@@ -46,6 +46,10 @@ def _prune_chat_jobs():
 
 def _run_chat_job(job_id, cfg, body):
     telemetry.job_started(job_id, (body.get("message") or "")[:80] or "chat")
+    # Everything downstream on this thread — provider calls, the tool loop —
+    # can now report progress without threading an id through every layer.
+    telemetry.bind_job(job_id)
+    telemetry.activity("Starting…")
     try:
         result, status = controllers.handle_chat(cfg, NOTES_DIR, VIEWER_DIR, body)
         telemetry.job_finished(job_id, ok=(status == 200))
@@ -61,10 +65,25 @@ def _run_chat_job(job_id, cfg, body):
                         "finished": time.time()})
 
 
+# The viewer's two pollers: /status every 2s for the system panel, and
+# /chat/result every 1.5s for as long as an answer is pending. Logged like
+# every other request they emit ~70 lines a minute of "200 -", which is exactly
+# how the two lines that mattered — five dead TTS keys, a rate-limited model —
+# ended up buried in a wall of successful noise during a two-minute wait.
+_QUIET_POLL_PATHS = ("/status", "/chat/result")
+
+
 class JarvisHandler(BaseHTTPRequestHandler):
     server_version = "JarvisServer/1.0"
 
     def log_message(self, fmt, *args):
+        # A poll that SUCCEEDS is not news, so it is silent. A poll that fails
+        # is news, and still gets logged — as does everything else.
+        status = str(args[1]) if len(args) > 1 else ""
+        if status.startswith("2"):
+            path = getattr(self, "path", "").split("?")[0]
+            if path in _QUIET_POLL_PATHS:
+                return
         sys.stderr.write("[jarvis] " + (fmt % args) + "\n")
 
     def _send_bytes(self, data, content_type, status=200, no_cache=False):
@@ -248,7 +267,10 @@ class JarvisHandler(BaseHTTPRequestHandler):
         if snapshot is None:
             self._send_json({"status": "unknown"}, status=404)
         elif snapshot["status"] == "pending":
-            self._send_json({"status": "pending"})
+            # The poll is already happening every 1.5s, so live progress rides
+            # back on it for free — no extra requests, and the turn stops being
+            # a silent void the user cannot tell from a hang.
+            self._send_json({"status": "pending", **(telemetry.job_activity(job_id) or {})})
         else:
             self._send_json({"status": "done", "http_status": snapshot["http_status"],
                              "result": snapshot["result"]})

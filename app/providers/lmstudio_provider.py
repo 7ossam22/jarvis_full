@@ -23,7 +23,10 @@ config.json:
 """
 import json
 import re
+import socket
 import sys
+import time
+import urllib.parse
 import urllib.request
 
 from .llm import LLMProvider
@@ -115,11 +118,48 @@ def call_lmstudio(cfg, system_prompt, messages):
     return ""
 
 
+# Reachability probes are cached so a burst of autopilot escalations does not
+# re-knock on a dead host once per question. Short enough that starting LM
+# Studio mid-session is picked up within seconds.
+_reachable_cache = {}
+_REACHABLE_TTL_S = 15.0
+_PROBE_TIMEOUT_S = 1.5
+
+
 class LMStudioProvider(LLMProvider):
     name = "lmstudio"
 
     def is_configured(self):
         return bool((self._cfg.get("model.lmstudio_base_url") or "").strip())
+
+    def is_reachable(self):
+        """One TCP knock at the LM Studio host, cached briefly.
+
+        The machine serving this is on the LAN and gets switched off, and a
+        chat request to a host that is not there blocks for the full 180s
+        timeout in call_lmstudio() before failover even begins. That is a long
+        time to look frozen, and it is intolerable on the form-autopilot path,
+        whose whole purpose is to get UNstuck quickly. A connect probe costs
+        about a millisecond when the host is up; the cache keeps a burst of
+        escalations from re-probing a dead host once per question."""
+        base = _base_url(self._cfg)
+        now = time.monotonic()
+        cached = _reachable_cache.get(base)
+        if cached and now - cached[0] < _REACHABLE_TTL_S:
+            return cached[1]
+
+        parsed = urllib.parse.urlparse(base)
+        host, port = parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+        ok = False
+        if host:
+            try:
+                socket.create_connection((host, port), timeout=_PROBE_TIMEOUT_S).close()
+                ok = True
+            except OSError as e:
+                print(f"[jarvis] LM Studio at {host}:{port} is not answering ({e}); "
+                      f"it will not be tried first.", file=sys.stderr)
+        _reachable_cache[base] = (now, ok)
+        return ok
 
     def converse(self, system_prompt, messages):
         try:

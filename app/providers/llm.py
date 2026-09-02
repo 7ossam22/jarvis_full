@@ -42,6 +42,20 @@ class LLMProvider(ABC):
         """True when this backend has what it needs to attempt a call at all
         (an API key, or — Anthropic only — a `claude` CLI found on PATH)."""
 
+    def is_reachable(self):
+        """True when this backend can plausibly be reached right now.
+
+        Separate from is_configured(), which only asks whether the settings
+        exist. For the hosted APIs there is nothing cheap and honest to test —
+        their own retry loops handle a flaky internet — so the default is True.
+        A local backend on the LAN is different: the machine serving it is
+        routinely just switched off, and that is worth one cheap probe, because
+        preferring a host that is not there costs a full request timeout before
+        anything else is even tried. Used for ORDERING only, never to drop a
+        provider: a probe that is wrong must not be able to leave the app with
+        no brain at all."""
+        return True
+
     @abstractmethod
     def converse(self, system_prompt, messages):
         """Returns the model's final text reply for this turn. Runs its own
@@ -51,11 +65,22 @@ class LLMProvider(ABC):
         canned apology."""
 
 
-def get_llm_providers(cfg):
+def get_llm_providers(cfg, prefer=None):
     """Returns the usable LLMProvider instances in the order they should be
     tried: the one `model.provider` ("anthropic" | "gemini" | "lmstudio") names
     first, then any other configured backend as failover. With no explicit
-    choice the order is Anthropic first, for backward compatibility."""
+    choice the order is Anthropic first, for backward compatibility.
+
+    `prefer` overrides `model.provider` for one call site without changing the
+    app-wide choice. It exists because not every caller wants the same backend:
+    the chat you talk to and the one-shot question the form autopilot asks when
+    it gets stuck have opposite needs. A conversation wants the strongest model
+    available; the autopilot fires dozens of tiny constrained-JSON questions in
+    a burst, which is exactly the shape that exhausts a metered per-minute
+    quota — and it needs none of that strength to answer them. An unconfigured
+    or misspelled preference is not an error: the list is merely left in its
+    default order, so the request still gets answered.
+    """
     from .anthropic_provider import AnthropicProvider
     from .gemini_provider import GeminiProvider
     from .lmstudio_provider import LMStudioProvider
@@ -65,26 +90,39 @@ def get_llm_providers(cfg):
         if p.is_configured()
     ]
 
-    choice = (cfg.get("model.provider") or "").strip().lower()
-    ordered.sort(key=lambda p: p.name != choice)  # stable: chosen one first
+    choice = (prefer or cfg.get("model.provider") or "").strip().lower()
+    # Stable sort: the chosen backend goes first, but only if it answers a
+    # knock. An unreachable choice keeps its natural place in the list rather
+    # than being dropped, so it is still tried — just not ahead of backends
+    # that are actually up.
+    ordered.sort(key=lambda p: not (p.name == choice and p.is_reachable()))
     return ordered
 
 
-def call_model(cfg, system_prompt, messages, fallback_text):
+def call_model(cfg, system_prompt, messages, fallback_text, prefer=None):
     """Tries each configured provider in order, returning the first successful
     reply. Deliberately broad except: two very differently-shaped backends
     (HTTP APIs, a subprocess CLI) fail in idiosyncratic ways, and there is
-    always a safe last resort (fallback_text) below this loop."""
+    always a safe last resort (fallback_text) below this loop.
+
+    `prefer` names a backend to try first for this call only — see
+    get_llm_providers(). Failover is unchanged: preferring a backend that is
+    down still reaches the others."""
     from .. import telemetry
 
     failures = []
-    for provider in get_llm_providers(cfg):
+    for provider in get_llm_providers(cfg, prefer=prefer):
         try:
+            telemetry.activity(f"Asking {provider.name}…")
             return provider.converse(system_prompt, messages)
         except Exception as e:
             failures.append(f"{provider.name}: {e}")
             print(f"[jarvis] {provider.name} model call failed ({e}); trying next…", file=sys.stderr)
             telemetry.record("provider", f"{provider.name} failed, trying the next backend", e)
+            # Falling back between backends is slow and completely invisible;
+            # unannounced it reads as the app having frozen.
+            telemetry.activity(f"{provider.name} is not answering — trying another backend",
+                               notable=True)
 
     # Every backend failed. Returning the canned apology alone would present a
     # total outage as an ordinary answer, so say what actually happened — a
