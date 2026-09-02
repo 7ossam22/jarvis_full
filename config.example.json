@@ -15,6 +15,11 @@
     "lmstudio_api_key": "lm-studio",
     "lmstudio_use_tools": true
   },
+  "browser": {
+    "automation_hosts": [
+      "nec-dev.autotrial.app"
+    ]
+  },
   "persona": {
     "name": "JARVIS",
     "address_term": "sir",

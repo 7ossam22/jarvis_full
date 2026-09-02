@@ -72,6 +72,12 @@ def handle_chat(cfg, notes_dir, viewer_dir, body):
     from . import telemetry
 
     t0 = time.time()
+    # Tool handlers run several layers below this and cannot otherwise see what
+    # was asked — which is the only thing separating "play it" from "open it in
+    # the browser". See app/turn.py.
+    from . import turn
+    turn.bind_message(question)
+
     system_prompt = persona.build_system_prompt(cfg)
     answer = call_model(cfg, system_prompt, messages, fallback)
 

@@ -30,6 +30,8 @@ import time
 import urllib.error
 import urllib.request
 
+from .. import turn
+
 DAEMON_URL = "http://127.0.0.1:4701"
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DAEMON_SCRIPT = os.path.join(ROOT, "tools", "browser_daemon.py")
@@ -606,6 +608,24 @@ def _novatek_payload(cfg, extra=None):
 def execute_browser_tool(cfg, tool_name, tool_input):
     """Executes a browser, Flutter automation, or system UI tool call."""
     try:
+        # Display routing, enforced rather than merely requested. The system
+        # prompt asks for the same thing, but a prompt is advice: the model
+        # reached for the real browser on "play X on YouTube" anyway, and the
+        # video left the interface entirely. This only ever fires inside a chat
+        # turn where the user did NOT name the browser and the target is one
+        # the interface can definitely display itself, so automation and
+        # explicit browser requests are untouched.
+        if tool_name in ("browser_open_url", "system_open"):
+            target = tool_input.get("url") or tool_input.get("target") or ""
+            hosts = turn.DEFAULT_AUTOMATION_HOSTS
+            if cfg is not None:
+                configured = cfg.get("browser.automation_hosts")
+                if isinstance(configured, list) and configured:
+                    hosts = tuple(str(h) for h in configured)
+            violation = turn.browser_policy_violation(target, automation_hosts=hosts)
+            if violation:
+                return {"status": "error", "error": violation}
+
         if tool_name == "system_open":
             target = (tool_input.get("target") or "").strip()
             if not target:
