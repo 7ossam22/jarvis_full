@@ -14,11 +14,13 @@ import {
 } from "./controller/voiceController.js";
 import { handleSubmit, cancelPendingRequests } from "./controller/chatController.js";
 import { startSystemPanel } from "./view/systemPanel.js";
+import { setHttpsPort } from "./view/cameraWindow.js";
 
 async function boot() {
   initConsole();
   const config = await fetchConfig();
   logLine("Config loaded from server.", "system");
+  if (config?.server?.https_enabled) setHttpsPort(config.server.https_port);
 
   scene.initScene(config);
   setNoteCount(graphData.nodes.length);

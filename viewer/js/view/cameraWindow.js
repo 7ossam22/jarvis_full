@@ -25,14 +25,25 @@ let videoEl = null;
 let panelEl = null;
 let lastError = "";
 
+// The server's https port, from /config — so the fix below can name the exact
+// URL to open rather than telling the user to go and set https up themselves.
+let httpsPort = 0;
+
+export function setHttpsPort(port) {
+  httpsPort = Number(port) || 0;
+}
+
 /** Camera access needs a secure context. Served over plain http:// on a LAN
  *  address the browser blocks it outright and getUserMedia is not even
  *  defined, which otherwise surfaces as a baffling silent failure. */
 export function cameraBlockedReason() {
   if (window.isSecureContext) return "";
+  const fix = httpsPort
+    ? `Open Jarvis at https://${location.hostname}:${httpsPort} instead and accept the `
+      + `self-signed certificate warning once.`
+    : `Open Jarvis at http://localhost:${location.port} on the machine itself, or serve it over https.`;
   return `the page is served over http:// from ${location.hostname}, and browsers only allow `
-       + `camera access on localhost or https. Open Jarvis at http://localhost:${location.port} `
-       + `on the machine itself, or serve it over https.`;
+       + `camera access on localhost or https. ${fix}`;
 }
 
 export function eyesAreOpen() {

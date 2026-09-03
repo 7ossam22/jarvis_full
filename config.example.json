@@ -1,7 +1,9 @@
 {
   "server": {
     "port": 4700,
-    "bind": "0.0.0.0"
+    "bind": "0.0.0.0",
+    "https_enabled": true,
+    "https_port": 4443
   },
   "model": {
     "provider": "",
@@ -18,9 +20,7 @@
     "lmstudio_vision": false
   },
   "browser": {
-    "automation_hosts": [
-      "nec-dev.autotrial.app"
-    ]
+    "automation_hosts": []
   },
   "persona": {
     "name": "JARVIS",
@@ -77,7 +77,16 @@
   },
   "novatek": {
     "username": "YOUR-NOVATEK-USERNAME",
-    "password": "YOUR-NOVATEK-PASSWORD"
+    "password": "YOUR-NOVATEK-PASSWORD",
+    "default_site": "nec",
+    "sites": {
+      "nec": {
+        "url": "https://nec-dev.autotrial.app"
+      },
+      "hcc": {
+        "url": "https://hcc-dev.autotrial.app"
+      }
+    }
   },
   "gmail": {
     "access_token": "YOUR-GMAIL-OAUTH-ACCESS-TOKEN"

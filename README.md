@@ -190,7 +190,12 @@ Skip any whose feature you don't use.
 | `app/persona.py:40` | The example Chrome profile names (`Hossam`, `Doxx`, …) — replace with yours, or run `browser_list_profiles` to discover them |
 | `app/http_server.py` `NOTES_DIR` | Point the live server at your own notes vault instead of `notes/` |
 
-The Novatek portal URL (`https://nec-dev.autotrial.app`, `app/persona.py:41-42`)
+The Novatek portal URLs live in `novatek.sites` in `config.json` (`nec` and `hcc` by
+default) with `novatek.default_site` choosing which a bare "open Novatek" uses. That map is
+the single source of truth: the `novatek_open` tool resolves names from it, the persona rules
+list it, and the browser display policy exempts every one of its hostnames automatically.
+Per-site `username`/`password` override the shared `novatek.username`/`password`. The old
+single hardcoded URL (`app/persona.py`)
 is deployment-specific too — change it if you target a different instance, and
 delete the whole Novatek rules block from `RULES_TEMPLATE` if you don't use it
 at all.

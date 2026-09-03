@@ -104,8 +104,15 @@ Rules:
   - When the user asks to close all tabs, close the browser, or close everything, ALWAYS invoke `browser_close` with `scope: "all"`.
   - When the user asks to switch between tabs, invoke `browser_switch_tab` with the `tab_index` or matching `query`.
   - When the user specifies a profile (e.g. 'Hossam', 'Doxx', 'Habiba', 'Elkenany'), pass `profile` to `browser_open_url` or discover available profiles using `browser_list_profiles`. Subsequent actions automatically reuse and operate inside the active window.
-- When the user asks to open Novatek (e.g. "open Novatek", "launch Novatek portal", "open nec-dev.autotrial.app"):
-  - Navigate to `https://nec-dev.autotrial.app` using `browser_open_url`.
+- When the user asks to open Novatek (e.g. "open Novatek", "open Novatek hcc", "open Novatek nec",
+  "launch Novatek portal"):
+  - Use `novatek_open`, NOT `browser_open_url`. There is more than one Novatek deployment
+    ({novatek_sites}) and each is a separate live trial site, so never type a portal URL from
+    memory. Pass the name the user said as `site` — "open Novatek hcc" is `site: "hcc"` — and
+    omit `site` only when they named none, which uses the configured default ({novatek_default}).
+  - If the tool says the name is not configured, say so and list the sites it named. Do NOT
+    retry with a different site or fall back to the default: opening the wrong portal means
+    logging into the wrong trial and filling real forms in it.
   - Inspect and state the app type using `browser_detect_app_type` (discovering it is built with Flutter Web).
   - Check that it opens on the login screen and verify if a loading indicator animation is active. If no loading animation is happening, it indicates it is ready for login credentials.
   - Enter the admin credentials: username `{novatek_username}` and password `{novatek_password}` using `browser_flutter_type` or `browser_type`.
@@ -224,6 +231,26 @@ Rules:
 NOVATEK_UNSET = "NOT-CONFIGURED"
 
 
+def _novatek_site_list(cfg):
+    """"nec (nec-dev.autotrial.app), hcc (hcc-dev.autotrial.app)" — the real
+    deployments, read from config so the rules text can never name a portal
+    that does not exist or miss one that does."""
+    from urllib.parse import urlparse
+    sites = cfg.novatek_sites()
+    if not sites:
+        return "none configured"
+    return ", ".join(f"{key} ({urlparse(site['url']).hostname})"
+                     for key, site in sorted(sites.items()))
+
+
+def _novatek_default_name(cfg):
+    sites = cfg.novatek_sites()
+    default = cfg.novatek_site()
+    if not sites or not default:
+        return "none"
+    return next((k for k, v in sites.items() if v["url"] == default["url"]), "none")
+
+
 def _novatek_credentials(cfg):
     """Config.novatek_credentials, mapped onto the placeholder the RULES text
     is formatted with when no login is configured."""
@@ -253,6 +280,8 @@ def build_system_prompt(cfg):
         max_gallery=max_gallery,
         novatek_username=novatek_username,
         novatek_password=novatek_password,
+        novatek_sites=_novatek_site_list(cfg),
+        novatek_default=_novatek_default_name(cfg),
     )
     if novatek_username == NOVATEK_UNSET:
         prompt += (

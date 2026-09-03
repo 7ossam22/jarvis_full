@@ -74,7 +74,7 @@ _IMAGE_WORD_RE = re.compile(
 #: cannot drive a Flutter app behind a login, so refusing the real browser here
 #: would break the Novatek workflow outright. Override with
 #: `browser.automation_hosts` in config.json.
-DEFAULT_AUTOMATION_HOSTS = ("nec-dev.autotrial.app",)
+DEFAULT_AUTOMATION_HOSTS = ("nec-dev.autotrial.app", "hcc-dev.autotrial.app")
 
 
 def wants_display(text=None):
@@ -251,4 +251,48 @@ def browser_policy_violation(url, automation_hosts=DEFAULT_AUTOMATION_HOSTS):
             f"for a site you must log into and operate rather than read."
         )
 
+    return None
+
+
+# ---- which Novatek deployment ----------------------------------------------
+# There is more than one portal now ("open novatek hcc" vs "open novatek nec"),
+# and picking the wrong one is not a harmless mistake: the automation logs in
+# and starts filling real forms. Matched deterministically here rather than
+# left to the model, and only immediately beside the word Novatek, so an
+# unrelated "nec" elsewhere in a sentence cannot select a portal.
+#
+# Two patterns rather than one alternation: a single regex scanned left to
+# right matches "open novatek" on the BEFORE branch first, consumes the word,
+# and then never sees the "hcc" that follows it.
+_SITE_AFTER_RE = re.compile(
+    r"\bnovatek\b[\s\-:]*([a-z0-9][a-z0-9_-]{0,15})\b", re.IGNORECASE)
+_SITE_BEFORE_RE = re.compile(
+    r"\b([a-z0-9][a-z0-9_-]{0,15})[\s\-]+novatek\b", re.IGNORECASE)
+
+#: Words that sit beside "novatek" in ordinary speech and are not site names.
+_NOT_SITE_WORDS = frozenset({
+    "and", "then", "please", "now", "portal", "app", "site", "in", "on", "at",
+    "the", "to", "for", "with", "up", "open", "login", "log", "is", "it", "a",
+    "my", "our", "this", "that", "again", "quickly", "first", "next", "start",
+    "launch", "go", "goto", "visit", "close", "reopen", "load", "show", "me",
+})
+
+
+def novatek_site_key(text=None):
+    """The site key named in the message ("nec", "hcc"), or None if none named.
+
+    Returns whatever word was actually used, even an unknown one — the caller
+    validates it against the configured sites and reports a name it does not
+    recognise. Silently falling back to the default on a typo would log into
+    the wrong portal and start filling real forms in it.
+    """
+    text = text if text is not None else _message.get()
+    if not text or "novatek" not in text.lower():
+        return None
+    for pattern in (_SITE_AFTER_RE, _SITE_BEFORE_RE):
+        match = pattern.search(text)
+        if match:
+            candidate = match.group(1).lower()
+            if candidate not in _NOT_SITE_WORDS:
+                return candidate
     return None

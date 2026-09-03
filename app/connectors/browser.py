@@ -43,6 +43,28 @@ def get_browser_tools():
     """Returns tool definitions for on-screen browser automation, Flutter Web, and system control."""
     return [
         {
+            "name": "novatek_open",
+            "description": (
+                "Open a Novatek portal by NAME, not by URL. There is more than one "
+                "deployment (e.g. 'nec', 'hcc') and each is a separate live trial site, "
+                "so ALWAYS use this instead of browser_open_url when the user says "
+                "Novatek — it resolves the correct URL from configuration. Pass the name "
+                "the user said ('open novatek hcc' -> site 'hcc'); omit `site` only when "
+                "they just said 'open novatek' with no name, and the configured default "
+                "is used. A name that is not configured is refused, listing the real ones."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "site": {
+                        "type": "string",
+                        "description": "Portal name the user said, e.g. 'nec' or 'hcc'. Omit for the default.",
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
             "name": "browser_open_url",
             "description": (
                 "Open a URL or search page in a real, visible browser window on the user's screen. "
@@ -593,6 +615,42 @@ def _ensure_daemon():
     return f"The browser daemon failed to start — see {DAEMON_LOG}."
 
 
+def _open_novatek(cfg, site_name=None):
+    """Opens the named Novatek portal, resolving its URL from config.
+
+    The model is not asked to remember which hostname belongs to which
+    deployment: getting that wrong logs into the wrong trial site and starts
+    filling real forms in it, so the mapping is looked up, and a name that is
+    not configured is refused by name rather than quietly defaulting.
+    """
+    if cfg is None:
+        return {"status": "error", "error": "no configuration available"}
+
+    sites = cfg.novatek_sites()
+    if not sites:
+        return {"status": "error",
+                "error": "No Novatek portals are configured. Add them under "
+                         "novatek.sites in config.json."}
+
+    if site_name:
+        site = cfg.novatek_site(site_name)
+        if site is None:
+            return {"status": "error",
+                    "error": f"There is no Novatek site called {site_name!r}. "
+                             f"Configured: {', '.join(sorted(sites))}."}
+        chosen = str(site_name).strip().lower()
+    else:
+        site = cfg.novatek_site()
+        chosen = next((k for k, v in sites.items() if v["url"] == site["url"]), "default")
+
+    result = _daemon_request("/open", {"url": site["url"], "new_tab": False,
+                                       "profile": None, "tab_index": None})
+    if isinstance(result, dict):
+        result.setdefault("site", chosen)
+        result.setdefault("url", site["url"])
+    return result
+
+
 def _novatek_payload(cfg, extra=None):
     """The autopilot endpoints sign forms as the Novatek user, so they need the
     login. It is resolved here from config/env and passed per call — the daemon
@@ -619,9 +677,14 @@ def execute_browser_tool(cfg, tool_name, tool_input):
             target = tool_input.get("url") or tool_input.get("target") or ""
             hosts = turn.DEFAULT_AUTOMATION_HOSTS
             if cfg is not None:
-                configured = cfg.get("browser.automation_hosts")
-                if isinstance(configured, list) and configured:
-                    hosts = tuple(str(h) for h in configured)
+                # Every configured Novatek portal is an application to operate,
+                # so each is exempt from the "show it in the interface" policy
+                # automatically — adding a site must not mean remembering to
+                # add its hostname here as well.
+                hosts = tuple(cfg.novatek_hosts()) or hosts
+                extra = cfg.get("browser.automation_hosts")
+                if isinstance(extra, list) and extra:
+                    hosts = hosts + tuple(str(h) for h in extra)
             violation = turn.browser_policy_violation(target, automation_hosts=hosts)
             if violation:
                 return {"status": "error", "error": violation}
@@ -640,6 +703,9 @@ def execute_browser_tool(cfg, tool_name, tool_input):
         err = _ensure_daemon()
         if err:
             return {"error": err}
+
+        if tool_name == "novatek_open":
+            return _open_novatek(cfg, tool_input.get("site"))
 
         if tool_name == "browser_open_url":
             return _daemon_request("/open", {

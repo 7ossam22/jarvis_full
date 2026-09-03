@@ -2,6 +2,10 @@
 # get started.
 config.json
 
+# The self-signed TLS certificate + private key generated on first https
+# start. Machine-local (it names this host's LAN addresses), never source.
+certs/
+
 # Live-grown notes captured via voice ("remember that…") and the generated
 # graph data are local state, not source.
 notes/captures/

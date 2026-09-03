@@ -8,6 +8,7 @@ reachable — path-traversal guard unchanged from the original server.py).
 """
 import json
 import os
+import ssl
 import sys
 import threading
 import time
@@ -15,7 +16,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import controllers, telemetry
+from . import controllers, telemetry, tls
 from .config import Config
 from .graph import regenerate_graph
 
@@ -282,6 +283,55 @@ class JarvisHandler(BaseHTTPRequestHandler):
         self._send_json(result, status=status)
 
 
+class TLSThreadingHTTPServer(ThreadingHTTPServer):
+    """The same server, speaking TLS.
+
+    The handshake is deliberately deferred out of the accept loop and into
+    the per-connection worker thread: a client that opens a socket and then
+    stalls — or that speaks plain http:// at the https port, which is the
+    single most common way to arrive here by accident — would otherwise
+    block every other connection until it timed out.
+    """
+
+    def __init__(self, address, handler, ssl_context):
+        self.ssl_context = ssl_context
+        super().__init__(address, handler)
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        return self.ssl_context.wrap_socket(sock, server_side=True,
+                                            do_handshake_on_connect=False), addr
+
+    def finish_request(self, request, client_address):
+        request.settimeout(20)
+        request.do_handshake()
+        request.settimeout(None)
+        super().finish_request(request, client_address)
+
+    def handle_error(self, request, client_address):
+        # A failed handshake is routine here (a port scan, a browser that
+        # declined the self-signed certificate, http:// at the wrong port);
+        # it is worth one line, not a traceback claiming the server broke.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, ConnectionError, TimeoutError)):
+            sys.stderr.write(f"[jarvis] tls: dropped {client_address[0]} — {exc}\n")
+            return
+        super().handle_error(request, client_address)
+
+
+def _start_https(bind, port):
+    """Builds and binds the HTTPS listener, or returns None with a reason
+    logged — https is an addition to the http listener, never a precondition
+    for it, so nothing here may stop the server from coming up."""
+    try:
+        cert_path, key_path = tls.ensure_certificate()
+        context = tls.make_ssl_context(cert_path, key_path)
+        return TLSThreadingHTTPServer((bind, port), JarvisHandler, context)
+    except Exception as e:
+        print(f"[jarvis] https disabled on port {port} — {e}", file=sys.stderr)
+        return None
+
+
 def main():
     cfg = Config.load()
 
@@ -298,11 +348,28 @@ def main():
     bind = cfg.get("server.bind", "0.0.0.0")
     server = ThreadingHTTPServer((bind, port), JarvisHandler)
     print(f"[jarvis] Serving on http://{bind}:{port}  (open this in Chrome)")
+
+    # The camera and the wake-word microphone are secure-context features, so
+    # over the LAN they only work on https — hence a second listener on the
+    # same handler rather than a replacement for the http one.
+    https_server = None
+    if cfg.get("server.https_enabled", True):
+        # 4443, not port + 1: 4701 belongs to the browser-automation daemon
+        # (tools/browser_daemon.py) and taking it would break every browser tool.
+        https_port = cfg.get("server.https_port", 4443)
+        https_server = _start_https(bind, https_port)
+        if https_server is not None:
+            print(f"[jarvis] Serving on https://{bind}:{https_port}  "
+                  f"(self-signed — accept the browser warning once)")
+            threading.Thread(target=https_server.serve_forever, daemon=True).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[jarvis] Shutting down.")
         server.shutdown()
+        if https_server is not None:
+            https_server.shutdown()
 
 
 if __name__ == "__main__":

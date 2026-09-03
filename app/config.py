@@ -82,11 +82,77 @@ class Config:
             return None, None
         return username, password
 
+    #: The portal was one URL for a long time and it was hardcoded in five
+    #: places — the persona rules, the browser policy exemption, the retrieval
+    #: notes, the README and the tests. A second deployment turns every one of
+    #: those into a place to forget. These defaults are the fallback; the real
+    #: source of truth is `novatek.sites` in config.json, and everything else
+    #: reads it through the accessors below.
+    NOVATEK_DEFAULT_SITES = {
+        "nec": "https://nec-dev.autotrial.app",
+        "hcc": "https://hcc-dev.autotrial.app",
+    }
+    NOVATEK_DEFAULT_SITE = "nec"
+
+    def novatek_sites(self):
+        """{key: {"url", "username", "password"}} for every configured portal.
+
+        Credentials fall back to the shared `novatek.username`/`password`, so
+        two deployments sharing a login need no repetition — and one that does
+        not can override them per site.
+        """
+        shared_user, shared_pass = self.novatek_credentials()
+        configured = self.get("novatek.sites")
+        if not isinstance(configured, dict) or not configured:
+            configured = {k: {"url": v} for k, v in self.NOVATEK_DEFAULT_SITES.items()}
+
+        sites = {}
+        for key, value in configured.items():
+            if isinstance(value, str):          # tolerate the terse "key": "url"
+                value = {"url": value}
+            if not isinstance(value, dict):
+                continue
+            url = (value.get("url") or "").strip().rstrip("/")
+            if not url:
+                continue
+            sites[str(key).strip().lower()] = {
+                "url": url,
+                "username": (value.get("username") or shared_user or "") or None,
+                "password": (value.get("password") or shared_pass or "") or None,
+            }
+        return sites
+
+    def novatek_site(self, name=None):
+        """One site by key ("nec", "hcc"), or the default. None if unknown."""
+        sites = self.novatek_sites()
+        if not sites:
+            return None
+        if name:
+            return sites.get(str(name).strip().lower())
+        default = (self.get("novatek.default_site")
+                   or self.NOVATEK_DEFAULT_SITE).strip().lower()
+        return sites.get(default) or next(iter(sites.values()))
+
+    def novatek_hosts(self):
+        """Every portal hostname, for the browser display policy's exemption:
+        these are applications to operate, never pages to embed."""
+        from urllib.parse import urlparse
+        hosts = []
+        for site in self.novatek_sites().values():
+            host = (urlparse(site["url"]).hostname or "").lower()
+            if host and host not in hosts:
+                hosts.append(host)
+        return tuple(hosts)
+
     def public_dict(self):
         """Only what the browser needs — never provider_api_key or
         elevenlabs_api_key. Curated explicitly (not filtered from the full
         dict) so a future secret field can't leak by omission."""
         return {
+            "server": {
+                "https_enabled": self.get("server.https_enabled", True),
+                "https_port": self.get("server.https_port", 4443),
+            },
             "persona": {
                 "name": self.get("persona.name", "JARVIS"),
                 "address_term": self.get("persona.address_term", "sir"),
