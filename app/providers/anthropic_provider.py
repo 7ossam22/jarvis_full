@@ -98,117 +98,27 @@ def call_anthropic(cfg, system_prompt, messages):
     return ""
 
 
-# Cheap pre-filter: only run the (slow) LLM tool-decision call when the recent
-# conversation plausibly involves a connector at all. Checked against the last
-# few turns, not just the last sentence — "now share it there too" must still
-# trigger when Discord came up a turn earlier.
-CONNECTOR_HINTS = (
-    "discord", "email", "gmail", "mail", "inbox", "send", "post",
-    "share", "message", "dm", "channel",
-    "open", "close", "browser", "tab", "tabs", "website", "launch", "chrome",
-    "profile", "profiles", "switch", "click", "type", "scroll", "screenshot",
-    "jira", "ticket", "issue", "volume", "sound", "stats", "app",
-    "flutter", "patrol", "canvaskit", "widget", "widgets", "semantics",
+from .cli_provider import (
+    CONNECTOR_HINTS,
+    is_cli_available,
+    call_cli_fallback,
+    call_cli_turn,
+    CLI_CLAUDE,
 )
 
 
-def _decide_connector_action(cfg, messages):
-    """One small `claude -p` call that decides whether the latest user turn
-    needs a connector tool (Gmail/Discord/Browser/System/Jira) and with what arguments, given the
-    whole recent conversation — replaces brittle keyword parsing of just the
-    last sentence. Returns {"tool": name, "input": {...}} or None."""
-    transcript = "\n\n".join(
-        f"{m['role'].upper()}: {m['content']}" for m in messages[-6:]
-    )
-    # Exactly the tools this provider is allowed to invoke — offering any more
-    # would let the router pick one that dispatch would then refuse.
-    tools_desc = json.dumps(registry.get_tools_for_provider(ANTHROPIC))
-    sys_p = (
-        "You are the tool-routing brain for a voice assistant. Given a conversation, decide "
-        "whether the LAST user turn requires calling one of these tools:\n" + tools_desc + "\n\n"
-        "Rules:\n"
-        "- Respond ONLY with raw JSON, nothing else.\n"
-        '- No tool needed (questions, lookups, small talk): {"tool": "none"}\n'
-        '- Tool needed: {"tool": "<name>", "input": {<arguments matching its input_schema>}}\n'
-        "- Resolve every back-reference ('send this', 'that screenshot', 'what you found') "
-        "against the earlier turns: tool inputs must contain the ACTUAL resolved content, "
-        "self-contained and understandable with no other context — never the literal "
-        "referring words.\n"
-        "- When sharing content that has a '[reference links: ...]' footnote in the "
-        "conversation, append the most relevant link to the message/body being sent.\n"
-        "- For discord_send_message, channel_id may be a channel NAME like 'general' — it is "
-        "resolved automatically. Default to 'general' when the user names no channel.\n"
-        "- browser_open_url, browser_list_tabs, browser_switch_tab, browser_close, browser_detect_app_type, "
-        "browser_flutter_get_widgets, browser_flutter_click, browser_flutter_type, flutter_run_test are for browser & Flutter apps: "
-        "use them when the user asks to open a website/Flutter app, check open tabs, interact with widgets, or run Flutter tests.\n"
-    )
-    try:
-        res = subprocess.run(
-            ["claude", "-p", transcript, "--system-prompt", sys_p],
-            capture_output=True, text=True, timeout=45,
-            stdin=subprocess.DEVNULL,
-        )
-        out = res.stdout.strip()
-        if "{" in out and "}" in out:
-            parsed = json.loads(out[out.find("{"):out.rfind("}")+1])
-            if parsed.get("tool") and parsed["tool"] != "none":
-                return parsed
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError) as e:
-        print(f"[jarvis] connector decision failed ({e})", file=sys.stderr)
-    return None
-
-
 def call_claude_cli(cfg, system_prompt, messages):
-    extra_context = ""
-    recent_text = " ".join(str(m.get("content", "")) for m in messages[-5:]).lower()
-    if any(k in recent_text for k in CONNECTOR_HINTS):
-        action = _decide_connector_action(cfg, messages)
-        if action:
-            tool_name = action.get("tool", "")
-            tool_input = action.get("input") or {}
-            result = registry.dispatch(tool_name, tool_input, ANTHROPIC, cfg)
-            if result is not None:
-                print(f"[jarvis] connector call {tool_name}({json.dumps(tool_input)[:200]}) -> "
-                      f"{json.dumps(result)[:300]}", file=sys.stderr)
-                extra_context = (
-                    f"\n\n[CONNECTOR TOOL RESULT — {tool_name} was already executed by the "
-                    "system on the user's behalf. Report its outcome truthfully: on success, "
-                    "confirm what was done; on error, relay the stated reason. Do not claim "
-                    "anything is unconfigured unless this result says so.]:\n"
-                    f"{json.dumps(result)}\n"
-                )
-
-    # Defence in depth: call_model already keeps image turns away from here,
-    # and if that ever stops being true this must fail loudly to the next
-    # backend rather than quietly answer a question about an unseen picture.
-    if vision.has_images(messages):
-        raise RuntimeError(
-            "the claude CLI fallback is text-only and cannot see an image; "
-            "set model.provider_api_key to use the vision-capable API")
-
-    convo = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
-    full_prompt = f"{convo}{extra_context}\n\nASSISTANT:"
-    result = subprocess.run(
-        ["claude", "-p", full_prompt, "--system-prompt", system_prompt, "--allowedTools", "WebSearch,WebFetch"],
-        capture_output=True, text=True, timeout=90,
-        stdin=subprocess.DEVNULL,
-    )
-
-
-    if result.returncode != 0 or not result.stdout.strip():
-        raise RuntimeError(result.stderr or "claude CLI returned no output")
-    return result.stdout.strip()
-
+    return call_cli_turn(cfg, system_prompt, messages, cli_name=CLI_CLAUDE, provider_name=ANTHROPIC)
 
 
 class AnthropicProvider(LLMProvider):
     name = "anthropic"
 
     def is_configured(self):
-        return self._cfg.has_real_api_key() or shutil.which("claude") is not None
+        return self._cfg.has_real_api_key() or is_cli_available(self._cfg, preferred=CLI_CLAUDE)
 
     def supports_vision(self):
-        # Only the direct API carries image blocks. The `claude -p` fallback
+        # Only the direct API carries image blocks. The CLI fallback
         # takes a single text prompt, so a frame cannot reach it at all.
         return self._cfg.has_real_api_key()
 
@@ -218,7 +128,8 @@ class AnthropicProvider(LLMProvider):
             try:
                 return call_anthropic(cfg, system_prompt, messages)
             except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError) as e:
-                print(f"[jarvis] Anthropic API call failed ({e}); trying claude CLI…", file=sys.stderr)
-        return call_claude_cli(cfg, system_prompt, messages)
+                print(f"[jarvis] Anthropic API call failed ({e}); trying CLI fallback…", file=sys.stderr)
+        return call_cli_fallback(cfg, system_prompt, messages, preferred=CLI_CLAUDE, provider_name=ANTHROPIC)
+
 
 

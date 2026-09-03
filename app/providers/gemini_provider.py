@@ -20,6 +20,7 @@ import urllib.request
 from .llm import LLMProvider
 from .. import telemetry, vision
 from ..connectors.registry import GEMINI, registry
+from .cli_provider import is_cli_available, call_cli_fallback, CLI_AGY
 
 DEFAULT_MODEL = "gemini-flash-latest"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -235,15 +236,30 @@ def call_gemini(cfg, system_prompt, messages):
             "rounds in one turn. Say \"continue\" and I will pick up exactly where I left off.")
 
 
+def _has_gemini_key(cfg):
+    key = (cfg.get("model.gemini_api_key") or "") if cfg else ""
+    return bool(key.strip()) and "PUT-YOUR" not in key
+
+
 class GeminiProvider(LLMProvider):
     name = "gemini"
 
     def is_configured(self):
-        key = self._cfg.get("model.gemini_api_key") or ""
-        return bool(key.strip()) and "PUT-YOUR" not in key
+        return _has_gemini_key(self._cfg) or is_cli_available(self._cfg, preferred=CLI_AGY)
 
     def supports_vision(self):
-        return True
+        # Direct API carries image blocks; CLI fallback is text-only.
+        return _has_gemini_key(self._cfg)
 
     def converse(self, system_prompt, messages):
-        return call_gemini(self._cfg, system_prompt, messages)
+        cfg = self._cfg
+        if _has_gemini_key(cfg):
+            try:
+                return call_gemini(cfg, system_prompt, messages)
+            except Exception as e:
+                if is_cli_available(cfg, preferred=CLI_AGY):
+                    print(f"[jarvis] Gemini API call failed ({e}); trying CLI fallback…", file=sys.stderr)
+                    return call_cli_fallback(cfg, system_prompt, messages, preferred=CLI_AGY, provider_name=GEMINI)
+                raise
+        return call_cli_fallback(cfg, system_prompt, messages, preferred=CLI_AGY, provider_name=GEMINI)
+

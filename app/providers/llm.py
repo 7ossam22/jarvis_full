@@ -8,22 +8,21 @@ configured backend serves as automatic failover.
 
 Available providers (app/providers/*_provider.py):
   - "anthropic" (anthropic_provider.py) — Claude via the direct API
-    (model.provider_api_key + model.model_id), falling back to the local
-    `claude -p` CLI (a logged-in Claude Code subscription) when no API key
-    is set or the API call fails. is_configured() is true if EITHER exists.
+    (model.provider_api_key + model.model_id), falling back to CLI (claude/agy)
+    when no API key is set or the API call fails.
   - "gemini" (gemini_provider.py) — Google Gemini via the direct API
-    (model.gemini_api_key + model.gemini_model_id). No local CLI fallback.
+    (model.gemini_api_key + model.gemini_model_id), falling back to CLI (agy/claude)
+    when unconfigured or quota-limited.
   - "lmstudio" (lmstudio_provider.py) — a local model on the LAN served by
     LM Studio's OpenAI-compatible server (model.lmstudio_base_url, e.g.
     http://192.168.1.50:1234/v1). No web-search tool; connector tools work.
+  - "agy" / "claude" (cli_provider.py) — direct execution via local CLI without
+    an API key.
 
-How to switch, in config.json:
-    "model": { "provider": "gemini" }     # or "anthropic" / "lmstudio"
-Leave "provider" empty/unset and Anthropic is tried first (backward-compatible
-default) with Gemini as silent failover — or vice versa, whichever backend
-IS configured if only one has a real key. Either way, an unconfigured
-provider (no key, no CLI) is simply skipped, never a hard error — see
-get_llm_providers() below.
+CLI Fallback configuration, in config.json:
+    "model": { "cli_fallback": "agy" }     # or "claude" / "auto" / "none"
+Leave "cli_fallback" empty or "auto" to automatically pick the best installed CLI
+with automatic failover between them if one fails.
 """
 import sys
 from abc import ABC, abstractmethod
@@ -96,19 +95,28 @@ def get_llm_providers(cfg, prefer=None):
     from .anthropic_provider import AnthropicProvider
     from .gemini_provider import GeminiProvider
     from .lmstudio_provider import LMStudioProvider
+    from .cli_provider import CLIProvider, CLI_AGY, CLI_CLAUDE
 
-    ordered = [
-        p for p in (AnthropicProvider(cfg), GeminiProvider(cfg), LMStudioProvider(cfg))
-        if p.is_configured()
+    candidate_providers = [
+        AnthropicProvider(cfg),
+        GeminiProvider(cfg),
+        LMStudioProvider(cfg),
+        CLIProvider(cfg, cli_type=CLI_AGY),
+        CLIProvider(cfg, cli_type=CLI_CLAUDE),
     ]
 
-    choice = (prefer or cfg.get("model.provider") or "").strip().lower()
+    ordered = [p for p in candidate_providers if p.is_configured()]
+
+    choice = (prefer or (cfg.get("model.provider") if cfg else "") or "").strip().lower()
+    if choice in ("antigravity", "gemini-cli"):
+        choice = CLI_AGY
     # Stable sort: the chosen backend goes first, but only if it answers a
     # knock. An unreachable choice keeps its natural place in the list rather
     # than being dropped, so it is still tried — just not ahead of backends
     # that are actually up.
     ordered.sort(key=lambda p: not (p.name == choice and p.is_reachable()))
     return ordered
+
 
 
 def call_model(cfg, system_prompt, messages, fallback_text, prefer=None,

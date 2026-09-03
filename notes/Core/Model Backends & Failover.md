@@ -10,13 +10,16 @@ configured backend is kept as automatic failover.
 
 1. **Anthropic Claude (`AnthropicProvider`)**:
    - Direct API with `model.provider_api_key` + `model.model_id`.
-   - Falls back to the local `claude -p` CLI (a logged-in Claude Code
-     subscription) when there's no API key or the API is unreachable.
+   - Falls back to local CLI (`claude -p` or `agy -p`) when there's no API key or the API is unreachable.
    - Server-side web search tool.
 2. **Google Gemini (`GeminiProvider`)**:
    - Direct API with `model.gemini_api_key` + `model.gemini_model_id`.
-   - `google_search` grounding tool. No local fallback.
-3. **LM Studio — local model over the LAN (`LMStudioProvider`)**:
+   - Falls back to local CLI (`agy -p` or `claude -p`) when unconfigured or on quota limit.
+   - `google_search` grounding tool.
+3. **Local CLI Backends (`CLIProvider` — Antigravity `agy` & Claude `claude`)**:
+   - Direct CLI execution without requiring API keys. Selectable via `"provider": "agy"` or `"provider": "claude"`.
+   - Configurable via `"model.cli_fallback"`: `"agy"`, `"claude"`, `"auto"` (default, with failover), or `"none"`.
+4. **LM Studio — local model over the LAN (`LMStudioProvider`)**:
    - Talks to LM Studio's OpenAI-compatible "Local Server" at
      `model.lmstudio_base_url` (e.g. `http://192.168.1.50:1234/v1`).
    - Optional `lmstudio_model_id`, `lmstudio_api_key`, and
