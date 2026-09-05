@@ -66,9 +66,9 @@ let orbGlowTarget = 0;
 
 // ---------------------------------------------------------------------
 // Plexiform Neon Orb
-// A glowing spherical plexus: geodesic wireframe struts + illuminated
-// vertex nodes + an orbiting ring of glowing particles, all swept with a
-// dual-tone cyan -> magenta neon gradient.
+// A living constellation shell: thousands of wave-displaced light points
+// that breathe and ripple, plus an orbiting ring of glowing particles, all
+// swept with a dual-tone cyan -> magenta neon gradient.
 // ---------------------------------------------------------------------
 const ORB_GRADIENT_CHUNK = `
   uniform vec3  uColorA;
@@ -90,64 +90,75 @@ function buildPlexusOrb(radius, colorA, colorB) {
 
   // -- Dark occluding core: keeps far-side struts from muddling the front.
   const core = new THREE.Mesh(
-    new THREE.SphereGeometry(radius * 0.955, 64, 64),
+    new THREE.SphereGeometry(radius * 0.92, 64, 64),
     new THREE.MeshBasicMaterial({ color: 0x0b0d1a, transparent: true, opacity: 0.88 })
   );
   group.add(core);
 
-  // -- Geodesic lattice used for both the struts and the nodes.
-  const lattice = new THREE.IcosahedronGeometry(radius, 3);
+  // -- Constellation shell: a dense fibonacci-distributed point cloud that
+  //    breathes with multi-frequency wave displacement. The old rigid
+  //    geodesic struts are gone: the surface is now living light, not scaffolding.
+  const SHELL_COUNT = 2600;
+  const shellPos = new Float32Array(SHELL_COUNT * 3);
+  const shellSeed = new Float32Array(SHELL_COUNT);
+  const GOLDEN = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < SHELL_COUNT; i++) {
+    const y = 1 - (i / (SHELL_COUNT - 1)) * 2;
+    const rr = Math.sqrt(Math.max(0, 1 - y * y));
+    const th = GOLDEN * i;
+    shellPos[i * 3]     = Math.cos(th) * rr * radius;
+    shellPos[i * 3 + 1] = y * radius;
+    shellPos[i * 3 + 2] = Math.sin(th) * rr * radius;
+    shellSeed[i] = Math.random();
+  }
+  const shellGeom = new THREE.BufferGeometry();
+  shellGeom.setAttribute("position", new THREE.BufferAttribute(shellPos, 3));
+  shellGeom.setAttribute("aSeed", new THREE.BufferAttribute(shellSeed, 1));
 
-  // -- Glowing struts (the "plexiform wireframe").
-  const struts = new THREE.LineSegments(
-    new THREE.WireframeGeometry(lattice),
-    new THREE.ShaderMaterial({
-      uniforms: orbUniforms,
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      vertexShader: `
-        varying vec3 vPos;
-        void main() {
-          vPos = normalize(position);
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: ORB_GRADIENT_CHUNK + `
-        varying vec3 vPos;
-        void main() {
-          float t = clamp(vPos.x * 0.5 + 0.5, 0.0, 1.0);
-          vec3 col = mix(uColorA, uColorB, smoothstep(0.0, 1.0, t));
-          float depthFade = 0.42 + 0.58 * clamp(vPos.z * 0.5 + 0.5, 0.0, 1.0);
-          float a = (0.30 + uGlow * 0.45 + uPulse * 0.10 * uGlow) * depthFade;
-          gl_FragColor = vec4(col * (1.0 + uGlow * 0.75), a);
-        }
-      `
-    })
-  );
-  group.add(struts);
-
-  // -- Illuminated nodes at every lattice vertex.
   const nodes = new THREE.Points(
-    lattice.clone(),
+    shellGeom,
     new THREE.ShaderMaterial({
       uniforms: orbUniforms,
       transparent: true,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       vertexShader: `
-        varying vec3 vPos;
+        attribute float aSeed;
+        varying vec3  vPos;
+        varying float vSeed;
+        varying float vWave;
+        uniform float uTime;
         uniform float uGlow;
         uniform float uPulse;
         void main() {
-          vPos = normalize(position);
-          vec4 mv = modelViewMatrix * vec4(position, 1.0);
-          gl_PointSize = (5.5 + uGlow * 4.0 + uPulse * 1.6 * uGlow) * (300.0 / -mv.z);
+          vec3 dir = normalize(position);
+          float R = length(position);
+          vPos = dir;
+          vSeed = aSeed;
+
+          // Multi-frequency travelling waves: the "breath" of the orb.
+          float w = sin(dir.x * 3.1 + uTime * 0.85)
+                  + sin(dir.y * 4.7 - uTime * 1.25)
+                  + sin(dir.z * 2.3 + uTime * 0.55)
+                  + 0.65 * sin((dir.x + dir.y + dir.z) * 7.9 + uTime * 2.1);
+          w *= 0.25;
+          vWave = w * 0.5 + 0.5;
+
+          float breathe = 1.0 + 0.035 * sin(uTime * 0.7);
+          float amp = 0.055 + uGlow * 0.085 + uPulse * 0.035 * uGlow;
+          vec3 p = dir * R * breathe * (1.0 + w * amp);
+
+          vec4 mv = modelViewMatrix * vec4(p, 1.0);
+          float twinkle = 0.6 + 0.4 * sin(uTime * (1.4 + aSeed * 3.0) + aSeed * 9.0);
+          gl_PointSize = (2.0 + aSeed * 2.2 + vWave * 2.4 + uGlow * 3.0 + uPulse * 1.4 * uGlow)
+                         * twinkle * (300.0 / -mv.z);
           gl_Position = projectionMatrix * mv;
         }
       `,
       fragmentShader: ORB_GRADIENT_CHUNK + `
-        varying vec3 vPos;
+        varying vec3  vPos;
+        varying float vSeed;
+        varying float vWave;
         void main() {
           vec2 c = gl_PointCoord - 0.5;
           float d = length(c) * 2.0;
@@ -155,10 +166,12 @@ function buildPlexusOrb(radius, colorA, colorB) {
           float soft = pow(1.0 - d, 2.0);
           float t = clamp(vPos.x * 0.5 + 0.5, 0.0, 1.0);
           vec3 col = mix(uColorA, uColorB, smoothstep(0.0, 1.0, t));
-          // white-hot centre sharpens the neon
-          col = mix(col, vec3(1.0), pow(1.0 - d, 6.0) * (0.45 + uGlow * 0.4));
-          float depthFade = 0.45 + 0.55 * clamp(vPos.z * 0.5 + 0.5, 0.0, 1.0);
-          gl_FragColor = vec4(col, soft * depthFade * (0.60 + uGlow * 0.55));
+          // crests of the wave run hotter than the troughs -> visible living ripple
+          col = mix(col * 0.75, col + vec3(0.25), vWave);
+          col = mix(col, vec3(1.0), pow(1.0 - d, 6.0) * (0.40 + uGlow * 0.4));
+          float depthFade = 0.40 + 0.60 * clamp(vPos.z * 0.5 + 0.5, 0.0, 1.0);
+          float a = soft * depthFade * (0.42 + vWave * 0.30 + uGlow * 0.55);
+          gl_FragColor = vec4(col, a);
         }
       `
     })
@@ -493,7 +506,11 @@ function orbFrame(ts) {
     orbUniforms.uGlow.value = orbGlow;
     orbUniforms.uTime.value = t;
   }
-  // Only the loose particles drift; the orb lattice itself stays locked.
+  // The constellation shell drifts slowly; the loose particles orbit faster.
+  if (brainShell) {
+    brainShell.rotation.y = t * 0.035;
+    brainShell.rotation.x = Math.sin(t * 0.16) * 0.06;
+  }
   if (particleRing) {
     particleRing.rotation.y = t * 0.12;
     particleRing.rotation.x = 0.28;
