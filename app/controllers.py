@@ -12,7 +12,7 @@ import sys
 import urllib.error
 import uuid
 
-from . import history, persona, retrieval
+from . import history, persona, retrieval, telemetry
 from .graph import build_graph, regenerate_graph
 from .images import extract_media_references, extract_image_references
 from .providers.llm import call_model
@@ -33,12 +33,97 @@ def get_public_config(cfg):
     return cfg.public_dict()
 
 
+def _chat_reply(answer, session_id, **extra):
+    """The shape every /chat response has, so a short-circuit reply is
+    indistinguishable to the viewer from a model-generated one."""
+    payload = {"answer": answer, "nodes": [], "session_id": session_id,
+               "image_urls": [], "video_urls": [], "show_url": None,
+               "jira_data": None, "screenshot_url": None, "errors": []}
+    payload.update(extra)
+    return payload, 200
+
+
+def _decide_staged_changes(question, session_id):
+    """Applies or rejects staged code changes on the user's say-so.
+
+    Returns a finished (response, status) when the message WAS a decision, and
+    None when it was ordinary conversation that should go to the model.
+
+    Bare "yes" / "no" only count while something is actually waiting —
+    otherwise every casual agreement in conversation would write files.
+    """
+    from . import proposals
+
+    waiting = proposals.pending(with_diff=False)
+    if not waiting:
+        return None
+    decision = proposals.parse_decision(question)
+    if decision is None:
+        return None
+
+    scope = decision["ids"]
+    if scope == "all":
+        targets = [p["id"] for p in waiting]
+    elif scope:
+        targets = scope
+    elif len(waiting) == 1:
+        targets = [waiting[0]["id"]]
+    else:
+        # Never guess which of several changes was meant: approving the wrong
+        # diff writes the wrong file, and the user believes otherwise.
+        listing = ", ".join(f"#{p['id']} ({p['path']})" for p in waiting)
+        return _chat_reply(
+            f"Which one, sir? {len(waiting)} are waiting: {listing}.",
+            session_id, pending_changes=waiting)
+
+    if decision["action"] == "show":
+        return None          # let the model explain it, with the diffs in context
+
+    applied, rejected, problems = [], [], []
+    for change_id in targets:
+        try:
+            if decision["action"] == "approve":
+                record = proposals.apply(change_id)
+                applied.append(f"#{record['id']} {record['path']} "
+                               f"(+{record['added']}/-{record['removed']})")
+                telemetry.record("info", f"applied change #{record['id']}", record["path"])
+            else:
+                record = proposals.reject(change_id, question[:120])
+                rejected.append(f"#{record['id']} {record['path']}")
+        except proposals.ProposalError as e:
+            problems.append(str(e))
+            telemetry.record("error", f"change #{change_id} could not be applied", e)
+
+    parts = []
+    if applied:
+        parts.append("Written to disk: " + "; ".join(applied)
+                     + ". Restart the server for it to take effect.")
+    if rejected:
+        parts.append("Discarded: " + "; ".join(rejected) + ".")
+    if problems:
+        # Surfaced, never swallowed: a failed write that reads as success is
+        # the exact failure this whole flow exists to prevent.
+        parts.append("Could not do it: " + "; ".join(problems))
+    return _chat_reply(" ".join(parts) or "Nothing to do, sir.", session_id,
+                       pending_changes=proposals.pending(with_diff=False),
+                       errors=problems)
+
+
 def handle_chat(cfg, notes_dir, viewer_dir, body):
     """Returns (response_dict, http_status)."""
     question = (body.get("message") or "").strip()
     session_id = body.get("session_id") or str(uuid.uuid4())
     if not question:
         return {"error": "empty message"}, 400
+
+    # Approving a staged code change happens HERE, before the model is called
+    # and without consulting it. The model can stage diffs; only this parse of
+    # the user's own words can write one to disk, so nothing the model emits —
+    # a tool call, a confident "shall I apply it?", a rationale claiming prior
+    # consent — can reach the file system. See app/proposals.py.
+    verdict = _decide_staged_changes(question, session_id)
+    if verdict is not None:
+        return verdict
 
     graph = regenerate_graph(notes_dir, viewer_dir)
     nodes = graph["nodes"]

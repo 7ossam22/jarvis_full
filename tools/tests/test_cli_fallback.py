@@ -1,6 +1,12 @@
 """tools/tests/test_cli_fallback.py — Unit tests for CLI provider & configurable fallback."""
+import os
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
+
+# Every other suite here does this; without it the file only runs with
+# PYTHONPATH set, which made it look like a failure rather than a setup detail.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from app.config import Config
 from app.providers.cli_provider import (

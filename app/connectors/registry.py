@@ -538,6 +538,16 @@ def _register_builtin_connectors(reg: ToolRegistry) -> None:
     ):
         reg.register_connector_bundle(getter, executor, only_llm=False)
 
+    # Reading and changing this project's own source, for EVERY provider.
+    # only_llm=False because the safety property is the approval gate in
+    # app/proposals.py, not the provider list: nothing these tools do reaches
+    # disk without the user's own word, so gating them by backend would buy no
+    # safety and would leave the assistant able to edit itself on one model and
+    # not another.
+    from .project import get_project_tools, execute_project_tool
+    reg.register_connector_bundle(get_project_tools, execute_project_tool,
+                                  only_llm=False)
+
 
 _register_builtin_connectors(registry)
 
