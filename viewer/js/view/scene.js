@@ -1,4 +1,4 @@
-// js/view/scene.js — Zen White Glass 3D Humanoid Brain Scene (View layer).
+// js/view/scene.js — Cyberpunk-neon plexiform Orb scene (View layer).
 // Renders an anatomical 3D Humanoid Brain (dual cerebral hemispheres,
 // cortical gyri/sulci folds, cerebellum, brainstem, corpus callosum internal
 // axon pathways) with glowing pearl neurons inside that surge with Zen energy
@@ -7,14 +7,14 @@ import { graphData, neighborsOf, linkKey } from "../model/graphData.js";
 import { openPanel, closePanel } from "./panel.js";
 
 const GROUP_PALETTE = [
-  "#d94a38", // Zen Akane / Vermilion
-  "#2563eb", // Zen Aizome / Royal Indigo
-  "#059669", // Zen Matcha / Jade Green
-  "#d97706", // Zen Yamabuki / Warm Amber
-  "#7c3aed", // Zen Fuji / Wisteria Violet
-  "#0891b2", // Zen Asagi / Teal Cyan
-  "#db2777", // Zen Sakura / Blossom Rose
-  "#475569"  // Zen Sumi / Ink Slate
+  "#2563eb", // Electric Blue
+  "#ec4899", // Vibrant Magenta Pink
+  "#3b82f6", // Azure
+  "#f472b6", // Blossom Pink
+  "#0ea5e9", // Sky Cyan-Blue
+  "#db2777", // Deep Rose
+  "#60a5fa", // Pale Blue
+  "#a855f7"  // Blue-Pink Blend Violet
 ];
 const groupColorCache = {};
 function groupColor(group) {
@@ -52,132 +52,225 @@ function refreshStyles() {
   Graph.linkDirectionalParticles(Graph.linkDirectionalParticles());
 }
 
-// Radiant pearl radial-gradient glow texture for neuron soma points
-const glowTexture = (() => {
-  const size = 128;
-  const c = document.createElement("canvas");
-  c.width = c.height = size;
-  const ctx = c.getContext("2d");
-  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-  g.addColorStop(0, "rgba(255, 255, 255, 1)");
-  g.addColorStop(0.35, "rgba(255, 255, 255, 0.9)");
-  g.addColorStop(0.7, "rgba(147, 197, 253, 0.45)");
-  g.addColorStop(1, "rgba(217, 74, 56, 0)");
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, size, size);
-  return new THREE.CanvasTexture(c);
-})();
-
 let Graph;
-let BRAIN_RADIUS = 140;
-let BRAIN_SHELL_BASE_OPACITY = 0.16;
-let BRAIN_WIRE_BASE_OPACITY = 0.32;
-let brainShell, brainWire, brainStemMesh;
+let BRAIN_RADIUS = 100;
+let brainShell;          // the one and only orb
+let orbHalo;             // soft additive hallow/glow disc behind the orb
+let particleRing;        // orbiting glowing particles / digital noise
+const ORB_BLUE = 0x00e5ff; // electric cyan  (#00E5FF)
+const ORB_PINK = 0xff00e6; // neon magenta  (#FF00E6)
+let orbUniforms = null;
+let haloUniforms = null;
+let orbGlow = 0;         // 0..1 eased "speaking" glow amount
+let orbGlowTarget = 0;
 
 // ---------------------------------------------------------------------
-// Anatomical Humanoid Brain Mesh Deformation Algorithm
-// Computes dual cerebral hemispheres, longitudinal fissure, frontal/
-// parietal/occipital/temporal lobes, cerebellum, and brain stem.
+// Plexiform Neon Orb
+// A glowing spherical plexus: geodesic wireframe struts + illuminated
+// vertex nodes + an orbiting ring of glowing particles, all swept with a
+// dual-tone cyan -> magenta neon gradient.
 // ---------------------------------------------------------------------
-function humanoidBrainDeform(v, baseR) {
-  const u = v.clone().normalize();
-  const isLeft = u.x < 0;
-  const side = isLeft ? -1 : 1;
+const ORB_GRADIENT_CHUNK = `
+  uniform vec3  uColorA;
+  uniform vec3  uColorB;
+  uniform float uPulse;
+  uniform float uGlow;
+  uniform float uTime;
+`;
 
-  // 1. Brain Stem (Inferior Central Base)
-  const isStem = Math.abs(u.x) < 0.24 && u.y < -0.32 && u.z > -0.35 && u.z < 0.35;
-  if (isStem) {
-    v.x = u.x * baseR * 0.35;
-    v.z = (u.z * baseR * 0.4) - baseR * 0.2;
-    v.y = u.y * baseR * 1.15;
-    return v;
-  }
+function buildPlexusOrb(radius, colorA, colorB) {
+  const group = new THREE.Group();
+  orbUniforms = {
+    uColorA: { value: new THREE.Color(colorA) },
+    uColorB: { value: new THREE.Color(colorB) },
+    uPulse:  { value: 0.0 },
+    uGlow:   { value: 0.0 },
+    uTime:   { value: 0.0 }
+  };
 
-  // 2. Cerebellum (Infero-Posterior Base)
-  const isCerebellum = u.y < -0.28 && u.z < -0.32 && Math.abs(u.x) < 0.72;
-  if (isCerebellum) {
-    const cerX = (u.x - side * 0.2) * 1.35;
-    const cerY = (u.y + 0.52) * 2.0;
-    const cerZ = (u.z + 0.62) * 1.9;
-    const cerDist = Math.sqrt(cerX * cerX + cerY * cerY + cerZ * cerZ);
-    // Folia (fine horizontal striation grooves)
-    const folia = Math.sin(u.y * 42.0) * 2.2;
-    const cerR = baseR * 0.42 + folia;
-    v.x = (u.x * 0.8) + (side * baseR * 0.14);
-    v.y = -baseR * 0.46 + (u.y * cerR * 0.52);
-    v.z = -baseR * 0.50 + (u.z * cerR * 0.52);
-    return v;
-  }
+  // -- Dark occluding core: keeps far-side struts from muddling the front.
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(radius * 0.955, 64, 64),
+    new THREE.MeshBasicMaterial({ color: 0x0b0d1a, transparent: true, opacity: 0.88 })
+  );
+  group.add(core);
 
-  // 3. Cerebral Hemispheres (Left & Right Cortex)
-  // Longitudinal fissure (sagittal gap dividing left and right hemispheres)
-  const distFromGap = Math.abs(u.x);
-  const fissureIndent = Math.exp(-distFromGap * 8.5) * (baseR * 0.26);
+  // -- Geodesic lattice used for both the struts and the nodes.
+  const lattice = new THREE.IcosahedronGeometry(radius, 3);
 
-  // Anatomical Lobe Proportion Scaling
-  let lobeX = 0.96;
-  let lobeY = 0.82; // slightly flattened top-to-bottom
-  let lobeZ = 1.22; // elongated front-to-back
+  // -- Glowing struts (the "plexiform wireframe").
+  const struts = new THREE.LineSegments(
+    new THREE.WireframeGeometry(lattice),
+    new THREE.ShaderMaterial({
+      uniforms: orbUniforms,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      vertexShader: `
+        varying vec3 vPos;
+        void main() {
+          vPos = normalize(position);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: ORB_GRADIENT_CHUNK + `
+        varying vec3 vPos;
+        void main() {
+          float t = clamp(vPos.x * 0.5 + 0.5, 0.0, 1.0);
+          vec3 col = mix(uColorA, uColorB, smoothstep(0.0, 1.0, t));
+          float depthFade = 0.42 + 0.58 * clamp(vPos.z * 0.5 + 0.5, 0.0, 1.0);
+          float a = (0.30 + uGlow * 0.45 + uPulse * 0.10 * uGlow) * depthFade;
+          gl_FragColor = vec4(col * (1.0 + uGlow * 0.75), a);
+        }
+      `
+    })
+  );
+  group.add(struts);
 
-  // Frontal lobe prefrontal bulge
-  if (u.z > 0.25) lobeZ += Math.sin((u.z - 0.25) * Math.PI) * 0.16;
-  // Temporal lobe lateral expansion
-  if (u.y < 0.12 && u.y > -0.48 && Math.abs(u.x) > 0.38) lobeX += 0.20;
+  // -- Illuminated nodes at every lattice vertex.
+  const nodes = new THREE.Points(
+    lattice.clone(),
+    new THREE.ShaderMaterial({
+      uniforms: orbUniforms,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      vertexShader: `
+        varying vec3 vPos;
+        uniform float uGlow;
+        uniform float uPulse;
+        void main() {
+          vPos = normalize(position);
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = (5.5 + uGlow * 4.0 + uPulse * 1.6 * uGlow) * (300.0 / -mv.z);
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: ORB_GRADIENT_CHUNK + `
+        varying vec3 vPos;
+        void main() {
+          vec2 c = gl_PointCoord - 0.5;
+          float d = length(c) * 2.0;
+          if (d > 1.0) discard;
+          float soft = pow(1.0 - d, 2.0);
+          float t = clamp(vPos.x * 0.5 + 0.5, 0.0, 1.0);
+          vec3 col = mix(uColorA, uColorB, smoothstep(0.0, 1.0, t));
+          // white-hot centre sharpens the neon
+          col = mix(col, vec3(1.0), pow(1.0 - d, 6.0) * (0.45 + uGlow * 0.4));
+          float depthFade = 0.45 + 0.55 * clamp(vPos.z * 0.5 + 0.5, 0.0, 1.0);
+          gl_FragColor = vec4(col, soft * depthFade * (0.60 + uGlow * 0.55));
+        }
+      `
+    })
+  );
+  group.add(nodes);
 
-  // Cortical Gyri and Sulci Folds (Multi-frequency trigonometric harmonics)
-  const f1 = Math.sin(u.x * 11.5) * Math.cos(u.y * 9.5) * Math.sin(u.z * 10.5);
-  const f2 = Math.sin(u.x * 20.0 + 1.2) * Math.sin(u.y * 18.0 + 0.6) * Math.cos(u.z * 16.0);
-  const f3 = Math.cos(u.x * 5.5) * Math.sin(u.z * 6.5 + u.y * 4.5);
-  const gyriSulci = (f1 * 5.2 + f2 * 2.8 + f3 * 3.8);
-
-  const finalR = baseR * 0.86 + gyriSulci - fissureIndent;
-
-  v.x = u.x * finalR * lobeX;
-  v.y = u.y * finalR * lobeY;
-  v.z = u.z * finalR * lobeZ;
-
-  // Center gap separation
-  if (Math.abs(v.x) < 7 && v.y > -baseR * 0.28) {
-    v.x += side * 3.5;
-  }
-
-  return v;
+  return group;
 }
 
-function buildHumanoidBrainMesh(radius, detail, opacity, color, wireframe) {
-  const geometry = new THREE.IcosahedronGeometry(radius, detail);
-  const pos = geometry.attributes.position;
-  const v = new THREE.Vector3();
-  for (let i = 0; i < pos.count; i++) {
-    v.fromBufferAttribute(pos, i);
-    humanoidBrainDeform(v, radius);
-    pos.setXYZ(i, v.x, v.y, v.z);
-  }
-  geometry.computeVertexNormals();
-  const material = new THREE.MeshBasicMaterial({
-    color, transparent: true, opacity, wireframe,
-    blending: THREE.NormalBlending, depthWrite: false, side: THREE.DoubleSide,
-  });
-  return new THREE.Mesh(geometry, material);
-}
-
-// Ambient neural dust floating inside the brain cavity
-function addNeuralDust() {
-  const COUNT = 320;
-  const positions = new Float32Array(COUNT * 3);
+// -- Orbiting ring of glowing particles / digital noise around the orb.
+function buildParticleRing(radius, colorA, colorB) {
+  const COUNT = 900;
+  const pos = new Float32Array(COUNT * 3);
+  const seed = new Float32Array(COUNT);
   for (let i = 0; i < COUNT; i++) {
-    const v = new THREE.Vector3((Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
-    humanoidBrainDeform(v, BRAIN_RADIUS * (0.25 + Math.random() * 0.55));
-    positions[i * 3] = v.x;
-    positions[i * 3 + 1] = v.y;
-    positions[i * 3 + 2] = v.z;
+    const ang = Math.random() * Math.PI * 2;
+    const r = radius * (1.18 + Math.pow(Math.random(), 1.7) * 0.75);
+    const lift = (Math.random() - 0.5) * radius * 0.42;
+    pos[i * 3]     = Math.cos(ang) * r;
+    pos[i * 3 + 1] = lift;
+    pos[i * 3 + 2] = Math.sin(ang) * r;
+    seed[i] = Math.random();
   }
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  const material = new THREE.PointsMaterial({
-    color: 0x94a3b8, size: 1.4, transparent: true, opacity: 0.5, blending: THREE.NormalBlending
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  geom.setAttribute("aSeed", new THREE.BufferAttribute(seed, 1));
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: orbUniforms,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: `
+      attribute float aSeed;
+      varying float vSeed;
+      varying vec3 vPos;
+      uniform float uTime;
+      uniform float uGlow;
+      void main() {
+        vSeed = aSeed;
+        vPos = normalize(position);
+        vec3 p = position;
+        p.y += sin(uTime * (0.6 + aSeed) + aSeed * 6.28) * 3.5;
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        gl_PointSize = (1.4 + aSeed * 2.6 + uGlow * 2.0) * (300.0 / -mv.z);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: ORB_GRADIENT_CHUNK + `
+      varying float vSeed;
+      varying vec3 vPos;
+      void main() {
+        vec2 c = gl_PointCoord - 0.5;
+        float d = length(c) * 2.0;
+        if (d > 1.0) discard;
+        float soft = pow(1.0 - d, 1.8);
+        float t = clamp(vPos.x * 0.5 + 0.5, 0.0, 1.0);
+        vec3 col = mix(uColorA, uColorB, t);
+        float flicker = 0.55 + 0.45 * sin(uTime * (2.0 + vSeed * 5.0) + vSeed * 12.0);
+        gl_FragColor = vec4(col, soft * flicker * (0.30 + uGlow * 0.45));
+      }
+    `
   });
-  Graph.scene().add(new THREE.Points(geometry, material));
+  return new THREE.Points(geom, mat);
+}
+
+// ---------------------------------------------------------------------
+// Hallow / halo: a camera-facing additive disc sitting BEHIND the orb that
+// bleeds a soft blue-pink aura outwards. It swells and brightens on speech.
+// ---------------------------------------------------------------------
+function buildHaloMesh(radius, colorA, colorB) {
+  const geometry = new THREE.PlaneGeometry(radius * 6.0, radius * 6.0, 1, 1);
+  haloUniforms = {
+    uColorA: { value: new THREE.Color(colorA) },
+    uColorB: { value: new THREE.Color(colorB) },
+    uGlow:   { value: 0.0 },
+    uPulse:  { value: 0.0 }
+  };
+  const material = new THREE.ShaderMaterial({
+    uniforms: haloUniforms,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform vec3  uColorA;
+      uniform vec3  uColorB;
+      uniform float uGlow;
+      uniform float uPulse;
+      varying vec2 vUv;
+      void main() {
+        vec2 p = vUv - 0.5;
+        float d = length(p) * 2.0;               // 0 at centre, 1 at edge
+        float core = smoothstep(0.62, 0.16, d);  // bright inner bloom
+        float wide = smoothstep(1.0, 0.10, d);   // wide feathered aura
+        float a = core * 0.55 + wide * 0.35;
+        a *= (0.42 + uGlow * 0.85 + uPulse * 0.12 * uGlow);
+        vec3 col = mix(uColorA, uColorB, clamp(vUv.y * 0.85 + 0.08, 0.0, 1.0));
+        gl_FragColor = vec4(col * (0.85 + uGlow * 0.8), a);
+      }
+    `
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.renderOrder = -10;   // always drawn behind the orb
+  return mesh;
 }
 
 function hexToInt(hex, fallback) {
@@ -187,52 +280,53 @@ function hexToInt(hex, fallback) {
 }
 
 export function initScene(config) {
-  BRAIN_RADIUS = config?.brain?.radius ?? 140;
-  const shellColor = hexToInt(config?.brain?.shell_color, 0xe2e8f0);
-  const wireColor = hexToInt(config?.brain?.wire_color, 0x94a3b8);
+  BRAIN_RADIUS = config?.brain?.radius ?? 100;
+  // Orb gradient is fixed: electric blue -> magenta pink. The old grey/white
+  // brain.shell_color / brain.wire_color defaults are ignored on purpose; only
+  // explicit orb_color_a / orb_color_b overrides are honoured.
+  const shellColor = hexToInt(config?.brain?.orb_color_a, ORB_BLUE);
+  const wireColor = hexToInt(config?.brain?.orb_color_b, ORB_PINK);
 
   Graph = ForceGraph3D()(document.getElementById("graph"))
     .graphData(graphData)
     .backgroundColor("rgba(0,0,0,0)")
-    .nodeLabel(n => `<div style="background: rgba(255,255,255,0.92); backdrop-filter: blur(14px); padding: 5px 14px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.95); box-shadow: 0 4px 20px rgba(24,39,75,0.08); font-family: var(--font-main, sans-serif); color: #1e293b; font-size: 12px; font-weight: 600;">${n.label}</div>`)
-    .nodeColor(n => (highlightNodes.size === 0 || highlightNodes.has(n.id)) ? groupColor(n.group) : "rgba(148,163,184,0.28)")
-    .nodeVal(n => highlightNodes.has(n.id) ? 9.5 : (brainGlowActive ? 7.0 : 4.8))
-    .nodeResolution(16)
-    .nodeOpacity(0.95)
-    .linkColor(l => highlightLinks.has(linkKey(l)) ? "rgba(217,74,56,0.95)" : (brainGlowActive ? "rgba(217,74,56,0.6)" : "rgba(148,163,184,0.32)"))
-    .linkWidth(l => highlightLinks.has(linkKey(l)) ? 2.4 : (brainGlowActive ? 1.0 : 0.6))
-    .linkDirectionalParticles(l => highlightLinks.has(linkKey(l)) ? (brainGlowActive ? 5 : 3) : (brainGlowActive ? 2 : 0))
-    .linkDirectionalParticleWidth(2.5)
-    .linkDirectionalParticleSpeed(0.008)
-    .nodeThreeObjectExtend(true)
-    .nodeThreeObject(n => {
-      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
-        map: glowTexture, color: groupColor(n.group), transparent: true,
-        opacity: 0.9, blending: THREE.NormalBlending, depthWrite: false,
-      }));
-      sprite.scale.set(12, 12, 1);
-      return sprite;
-    })
-    .onNodeClick(node => flyToNode(node, { openPanel: true }))
+    // Note balls, links and particles are fully suppressed: the orb is the whole visual.
+    .nodeThreeObjectExtend(false)
+    .nodeThreeObject(() => new THREE.Object3D())
+    .nodeLabel(() => "")
+    .nodeVal(0)
+    .nodeOpacity(0)
+    .linkWidth(0)
+    .linkColor(() => "rgba(0,0,0,0)")
+    .linkDirectionalParticles(0)
+    .enableNodeDrag(false)
     .onBackgroundClick(() => { clearHighlight(); closePanel(); });
 
-  Graph.controls().autoRotate = true;
-  Graph.controls().autoRotateSpeed = 0.35;
-  Graph.controls().addEventListener("start", () => { Graph.controls().autoRotate = false; });
-  let idleTimer = null;
-  Graph.controls().addEventListener("end", () => {
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => { Graph.controls().autoRotate = true; }, 4000);
-  });
+  // The orb is a fixed centrepiece: no auto-spin, no drag-rotate, no zoom, no pan.
+  // 3d-force-graph may hand back TrackballControls (noZoom/noRotate/noPan) or
+  // OrbitControls (enableZoom/enableRotate/enablePan), so lock both dialects.
+  const controls = Graph.controls();
+  controls.autoRotate = false;
+  controls.enableRotate = false;
+  controls.enableZoom = false;
+  controls.enablePan = false;
+  controls.enableDamping = false;
+  controls.noRotate = true;
+  controls.noZoom = true;
+  controls.noPan = true;
+  if (Graph.enableNavigationControls) Graph.enableNavigationControls(false);
+  if (controls.update) controls.update();
 
-  // Construct Humanoid Brain Shell & Wireframe Cortex
-  brainShell = buildHumanoidBrainMesh(BRAIN_RADIUS, 4, BRAIN_SHELL_BASE_OPACITY, shellColor, false);
-  brainWire = buildHumanoidBrainMesh(BRAIN_RADIUS + 3, 2, BRAIN_WIRE_BASE_OPACITY, wireColor, true);
+  // Construct the solid gradient orb and its hallow
+  orbHalo = buildHaloMesh(BRAIN_RADIUS, shellColor, wireColor);
+  Graph.scene().add(orbHalo);
+  brainShell = buildPlexusOrb(BRAIN_RADIUS, shellColor, wireColor);
   Graph.scene().add(brainShell);
-  Graph.scene().add(brainWire);
-  Graph.scene().fog = new THREE.FogExp2(0xeef2f7, 0.0012);
+  particleRing = buildParticleRing(BRAIN_RADIUS, shellColor, wireColor);
+  Graph.scene().add(particleRing);
 
-  addNeuralDust();
+  // Keep the halo square-on to the camera and start the always-on render loop
+  requestAnimationFrame(orbFrame);
 
   // Containment force: Constrains neuron nodes inside the anatomical humanoid brain shape
   Graph.d3Force("containment", (alpha) => {
@@ -254,7 +348,7 @@ export function initScene(config) {
   const linkForce = Graph.d3Force("link");
   if (linkForce) linkForce.distance(30);
 
-  Graph.cameraPosition({ x: 0, y: 35, z: 320 });
+  Graph.cameraPosition({ x: 0, y: 0, z: 700 });
 
   initToolbarControls();
   initVoiceWaveformCanvas();
@@ -295,7 +389,8 @@ function initInteractiveUI() {
     btnCortex.addEventListener("click", () => {
       setModeActive(btnCortex);
       if (brainShell) brainShell.visible = true;
-      if (brainWire) brainWire.visible = wireframeVisible;
+      if (orbHalo) orbHalo.visible = true;
+      if (particleRing) particleRing.visible = true;
       modal && modal.classList.add("hidden");
     });
   }
@@ -304,7 +399,8 @@ function initInteractiveUI() {
     btnNetwork.addEventListener("click", () => {
       setModeActive(btnNetwork);
       if (brainShell) brainShell.visible = false;
-      if (brainWire) brainWire.visible = false;
+      if (orbHalo) orbHalo.visible = false;
+      if (particleRing) particleRing.visible = false;
       modal && modal.classList.add("hidden");
     });
   }
@@ -352,24 +448,17 @@ function openAnalyticsModal() {
 // Camera flight / fly-to-source
 // ---------------------------------------------------------------------
 
+// Camera moves are disabled by design: triggering a note must never zoom or
+// dolly the orb. These keep the highlight/panel behaviour and nothing else.
 export function flyToNode(node, opts = {}) {
   if (!node) return;
-  const distance = 140;
-  const distRatio = 1 + distance / Math.hypot(node.x || 1, node.y || 1, node.z || 1);
-  Graph.cameraPosition(
-    { x: (node.x || 0) * distRatio, y: (node.y || 0) * distRatio, z: (node.z || 0) * distRatio },
-    node,
-    1400
-  );
   const ids = new Set([node.id, ...(neighborsOf[node.id] || [])]);
   setHighlight(ids);
   if (opts.openPanel) openPanel(node);
 }
 
 export function flyToCluster(ids) {
-  const idSet = new Set(ids);
-  setHighlight(idSet);
-  Graph.zoomToFit(1400, 120, n => idSet.has(n.id));
+  setHighlight(new Set(ids));
 }
 
 export function refreshGraphData() {
@@ -381,51 +470,57 @@ export function refreshGraphData() {
 // ---------------------------------------------------------------------
 // Humanoid Brain Glow & Speech Pulsing Animation
 // ---------------------------------------------------------------------
-let brainGlowStartTs = 0;
-let brainGlowStyleTick = 0;
-function brainGlowFrame(ts) {
-  if (!brainGlowActive) return;
-  if (!brainGlowStartTs) brainGlowStartTs = ts;
-  const t = (ts - brainGlowStartTs) / 1000;
-  const pulse = 0.5 + 0.5 * Math.sin(t * 4.2);
-  
-  brainShell.material.opacity = BRAIN_SHELL_BASE_OPACITY + pulse * 0.28;
-  brainWire.material.opacity = BRAIN_WIRE_BASE_OPACITY + pulse * 0.38;
-  
-  const scale = 1 + pulse * 0.025;
-  brainShell.scale.setScalar(scale);
-  brainWire.scale.setScalar(scale);
+// A single always-on frame loop: keeps the halo facing the camera, eases the
+// speaking glow in and out, and pulses the orb while JARVIS talks.
+function orbFrame(ts) {
+  const t = ts / 1000;
 
-  if (ts - brainGlowStyleTick > 150) {
-    brainGlowStyleTick = ts;
-    refreshStyles();
+  // Halo is a billboard: copy the camera's orientation every frame.
+  if (orbHalo && Graph) {
+    const cam = Graph.camera();
+    if (cam) orbHalo.quaternion.copy(cam.quaternion);
   }
-  requestAnimationFrame(brainGlowFrame);
+
+  // Ease the glow towards its target so speech start/stop fades, never snaps.
+  orbGlowTarget = brainGlowActive ? 1 : 0;
+  orbGlow += (orbGlowTarget - orbGlow) * 0.09;
+  if (Math.abs(orbGlowTarget - orbGlow) < 0.002) orbGlow = orbGlowTarget;
+
+  const pulse = brainGlowActive ? (0.5 + 0.5 * Math.sin(t * 4.2)) : 0;
+
+  if (orbUniforms) {
+    orbUniforms.uPulse.value = pulse;
+    orbUniforms.uGlow.value = orbGlow;
+    orbUniforms.uTime.value = t;
+  }
+  // Only the loose particles drift; the orb lattice itself stays locked.
+  if (particleRing) {
+    particleRing.rotation.y = t * 0.12;
+    particleRing.rotation.x = 0.28;
+  }
+  if (haloUniforms) {
+    haloUniforms.uPulse.value = pulse;
+    haloUniforms.uGlow.value = orbGlow;
+  }
+  if (brainShell) brainShell.scale.setScalar(1 + orbGlow * pulse * 0.035);
+  if (orbHalo) orbHalo.scale.setScalar(1 + orbGlow * (0.10 + pulse * 0.06));
+
+  requestAnimationFrame(orbFrame);
 }
 
 export function startBrainGlow() {
   if (brainGlowActive) return;
   brainGlowActive = true;
-  brainGlowStartTs = 0;
-  
+
   const indicator = document.getElementById("speaking-indicator");
   if (indicator) indicator.classList.remove("hidden");
-
-  refreshStyles();
-  requestAnimationFrame(brainGlowFrame);
 }
 
 export function stopBrainGlow() {
   brainGlowActive = false;
-  
+
   const indicator = document.getElementById("speaking-indicator");
   if (indicator) indicator.classList.add("hidden");
-
-  brainShell.material.opacity = BRAIN_SHELL_BASE_OPACITY;
-  brainWire.material.opacity = BRAIN_WIRE_BASE_OPACITY;
-  brainShell.scale.setScalar(1);
-  brainWire.scale.setScalar(1);
-  refreshStyles();
 }
 
 // ---------------------------------------------------------------------
@@ -441,7 +536,7 @@ function initToolbarControls() {
   if (btnFocus) {
     btnFocus.addEventListener("click", () => {
       clearHighlight();
-      Graph.cameraPosition({ x: 0, y: 35, z: 320 }, { x: 0, y: 0, z: 0 }, 1200);
+      Graph.cameraPosition({ x: 0, y: 0, z: 700 }, { x: 0, y: 0, z: 0 }, 1200);
     });
   }
 
@@ -453,26 +548,28 @@ function initToolbarControls() {
   }
 
   if (btnWire) {
+    // No wireframe layer any more - the button just hides/shows the orb.
     btnWire.addEventListener("click", () => {
       wireframeVisible = !wireframeVisible;
-      brainWire.visible = wireframeVisible;
+      if (brainShell) brainShell.visible = wireframeVisible;
+      if (orbHalo) orbHalo.visible = wireframeVisible;
+      if (particleRing) particleRing.visible = wireframeVisible;
       btnWire.classList.toggle("active", wireframeVisible);
     });
   }
 
   if (btnRotate) {
-    btnRotate.addEventListener("click", () => {
-      const isRotating = !Graph.controls().autoRotate;
-      Graph.controls().autoRotate = isRotating;
-      btnRotate.classList.toggle("active", isRotating);
-    });
+    // Spinning is disabled by design - the orb stays put. Hide the toggle so
+    // it cannot re-enable rotation.
+    btnRotate.classList.remove("active");
+    btnRotate.style.display = "none";
   }
 
   if (btnReset) {
     btnReset.addEventListener("click", () => {
       clearHighlight();
       closePanel();
-      Graph.cameraPosition({ x: 0, y: 35, z: 320 }, { x: 0, y: 0, z: 0 }, 1000);
+      Graph.cameraPosition({ x: 0, y: 0, z: 700 }, { x: 0, y: 0, z: 0 }, 1000);
     });
   }
 
@@ -513,7 +610,7 @@ function initVoiceWaveformCanvas() {
         h = 3 + Math.abs(Math.sin(now * 0.4 + i * 0.4)) * 3;
       }
       const y = (canvas.height - h) / 2;
-      ctx.fillStyle = brainGlowActive ? "#d94a38" : "#94a3b8";
+      ctx.fillStyle = brainGlowActive ? "#ff00e6" : "#00e5ff";
       ctx.beginPath();
       ctx.roundRect(x, y, barWidth, h, 2);
       ctx.fill();
