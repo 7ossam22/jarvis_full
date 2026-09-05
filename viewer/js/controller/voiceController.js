@@ -220,9 +220,6 @@ export function initVoiceController(config, commandCallback, cancelCallback) {
     }
   };
   recognizer.onresult = (e) => {
-    if (isSpeaking()) {
-      stopSpeaking();
-    }
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const result = e.results[i];
       if (result.isFinal) {

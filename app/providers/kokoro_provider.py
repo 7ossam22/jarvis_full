@@ -7,15 +7,15 @@ endpoint, CPU-friendly, no API key, no per-character billing). Configured
 entirely by `voice.kokoro_base_url` (e.g. http://localhost:8880): set it and
 this provider is live, leave it empty and it's ignored.
 
-British male voice packs (bm_george, bm_lewis, bm_fable) suit the butler;
-default matches the ElevenLabs "George" choice.
+A voice pack's first letter is its language and its second its gender:
+bf_emma is British female, bm_george British male, af_heart American female.
 """
 import json
 import urllib.request
 
 from .tts import TTSProvider
 
-DEFAULT_VOICE = "bm_george"
+DEFAULT_VOICE = "bf_emma"
 
 
 class KokoroTTS(TTSProvider):
@@ -41,4 +41,7 @@ class KokoroTTS(TTSProvider):
         )
         # Local CPU inference: quick for short butler replies, but allow slack.
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read(), "audio/mpeg"
+            # Trust the server's own Content-Type: a Kokoro build without an
+            # MP3 encoder answers with wav, and the viewer plays whatever it
+            # is told — mislabelling it as mpeg is what would break playback.
+            return resp.read(), resp.headers.get("content-type") or "audio/mpeg"

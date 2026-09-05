@@ -11,4 +11,6 @@ Standard library only. No pip installs.
 from app.http_server import main
 
 if __name__ == "__main__":
+    print("Hello sir, JARVIS is initializing with full system access.")
     main()
+

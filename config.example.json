@@ -33,6 +33,7 @@
   },
   "voice": {
     "tts_provider": "",
+    "tts_failover": true,
     "elevenlabs_api_key": "PUT-YOUR-ELEVENLABS-KEY-HERE",
     "elevenlabs_voice_id": "JBFqnCBsd6RMkjVDRZzb",
     "elevenlabs_model_id": "eleven_turbo_v2_5",
@@ -41,7 +42,7 @@
     "fish_audio_model": "s1",
     "fish_audio_base_url": "",
     "kokoro_base_url": "",
-    "kokoro_voice": "bm_george",
+    "kokoro_voice": "bf_emma",
     "kokoro_speed": 1.0
   },
   "wake_word": {

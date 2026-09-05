@@ -52,6 +52,8 @@ def normalize_cli_name(name: str | None) -> str:
     cleaned = str(name).strip().lower()
     if cleaned in ("antigravity", "gemini-cli"):
         return CLI_AGY
+    if cleaned in ("claude", "anthropic", "claude-code"):
+        return CLI_CLAUDE
     if cleaned in ("off", "disabled", "false", "no"):
         return CLI_NONE
     return cleaned
@@ -139,7 +141,7 @@ def _decide_connector_action(cfg, messages, cli_name: str, provider_name: str = 
     )
 
     if cli_name == CLI_CLAUDE:
-        cmd = ["claude", "-p", transcript, "--system-prompt", sys_p]
+        cmd = ["claude", "-p", transcript, "--system-prompt", sys_p, "--dangerously-skip-permissions"]
     else:  # CLI_AGY
         combined_prompt = f"{sys_p}\n\nCONVERSATION:\n{transcript}"
         cmd = ["agy", "-p", combined_prompt, "--disable-slash-commands", "--effort", "low", "--dangerously-skip-permissions"]
@@ -193,7 +195,7 @@ def call_cli_turn(cfg, system_prompt: str, messages: list, cli_name: str,
     full_prompt = f"{convo}{extra_context}\n\nASSISTANT:"
 
     if cli_name == CLI_CLAUDE:
-        cmd = ["claude", "-p", full_prompt, "--system-prompt", system_prompt, "--allowedTools", "WebSearch,WebFetch"]
+        cmd = ["claude", "-p", full_prompt, "--system-prompt", system_prompt, "--dangerously-skip-permissions"]
     else:  # CLI_AGY
         prompt = f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\nCONVERSATION:\n{full_prompt}"
         effort = (cfg.get("model.agy_effort") if cfg else None) or "low"

@@ -27,10 +27,13 @@ on the frontend.
   prompt, and falls through to a live web search when nothing fits or the
   question is about the outside world (current events, prices, "what does X
   look like").
-- **The Voice** — real speech via a server-side [ElevenLabs](https://elevenlabs.io)
-  proxy (the API key never reaches the browser), with an automatic fallback
-  to the browser's built-in `speechSynthesis` if no key is configured or the
-  call fails.
+- **The Voice** — real speech from [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
+  running locally on this machine (`tools/setup_kokoro.sh`): no API key, no
+  per-character billing, no audio leaving the box. Cloud backends
+  ([ElevenLabs](https://elevenlabs.io), [Fish Audio](https://fish.audio)) are
+  still there behind the same interface and are still proxied server-side so
+  their keys never reach the browser. All of them fall back to the browser's
+  built-in `speechSynthesis` if nothing is configured or the call fails.
 - **Always-listening conversation mode** — say "Jarvis" once to start a
   conversation; after that, no wake word is needed for follow-ups until you
   say something like "bye", "thanks for helping", or "that'll be all".
@@ -92,7 +95,67 @@ won't cut it), and optionally an
    **No ElevenLabs key?** Skip it too — JARVIS falls back to the browser's
    built-in voice automatically.
 
-2. **Point it at your notes** (optional). By default JARVIS reads the sample
+   **Want a real voice without paying for one?** Install Kokoro locally
+   instead (below).
+
+2. **Give it a local voice** (recommended). Kokoro-82M runs on this machine,
+   costs nothing per word, and needs no API key:
+
+   ```bash
+   tools/setup_kokoro.sh
+   ```
+
+   That builds `.venv-kokoro` (CPU torch — the model is small, and this
+   leaves the GPU free), downloads Kokoro-82M, and installs a
+   `systemd --user` service so the voice box comes back on login. Then point
+   `config.json` at it:
+
+   ```json
+   {
+     "voice": {
+       "tts_provider": "kokoro",
+       "tts_failover": false,
+       "kokoro_base_url": "http://127.0.0.1:8880",
+       "kokoro_voice": "bf_emma"
+     }
+   }
+   ```
+
+   `tts_failover: false` keeps JARVIS on the local voice only, so a hiccup
+   never quietly bills a cloud provider instead.
+
+   The voice box (`tools/kokoro_server.py`) serves the same
+   OpenAI-compatible `POST /v1/audio/speech` that
+   [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) does, so you
+   can swap in that project — or a Docker container, or a box elsewhere on
+   the LAN — by changing `kokoro_base_url` and nothing else. It binds to
+   `127.0.0.1` only; the JARVIS server proxies it, exactly as it does the
+   cloud backends.
+
+   Handy commands:
+
+   ```bash
+   systemctl --user status kokoro-tts       # is it up?
+   systemctl --user restart kokoro-tts      # after changing the service file
+   journalctl --user -u kokoro-tts -n 50    # why isn't it up?
+   curl http://127.0.0.1:8880/v1/audio/voices   # every voice pack available
+   ```
+
+   Non-English voices need their own G2P engine on top of the base install:
+   the Japanese packs (`jf_alpha`, `jf_gongitsune`, `jf_nezumi`,
+   `jf_tebukuro`, `jm_kumo`) want `tools/setup_kokoro.sh --japanese`, without
+   which they fail with `No module named 'pyopenjtalk'` or `Failed
+   initializing MeCab`. Chinese (`zf_`/`zm_`) needs `misaki[zh]` the same way.
+
+   British female packs are `bf_emma`, `bf_isabella`, `bf_alice`, `bf_lily`;
+   British male are `bm_george`, `bm_lewis`, `bm_fable`, `bm_daniel`. The
+   `af_`/`am_` packs are American — `af_heart` and `af_bella` are the
+   best-sounding female voices in the model, at the cost of the accent. A
+   voice pack's first letter is its language and the second its gender
+   (`bf_` = British female), so `kokoro_voice` alone switches accent,
+   language, and gender.
+
+3. **Point it at your notes** (optional). By default JARVIS reads the sample
    `notes/` folder in this repo. To use your own vault instead:
 
    ```bash
@@ -104,7 +167,7 @@ won't cut it), and optionally an
    always stay in sync — point the live server permanently at your own
    vault by changing `NOTES_DIR` in `app/http_server.py`.)
 
-3. **Launch it.**
+4. **Launch it.**
 
    ```bash
    python3 server.py
@@ -232,12 +295,26 @@ Almost every behavior tunable lives in `config.json` — see
 | `server` | Port and bind address (`0.0.0.0` reaches your LAN, `127.0.0.1` is local-only) |
 | `model` | Three interchangeable LLM backends behind one interface (`app/providers/llm.py`) — Anthropic Claude (`provider_api_key`, `model_id`), Google Gemini (`gemini_api_key`, `gemini_model_id`), and a **local model over the LAN via LM Studio** (`lmstudio_base_url`, e.g. `http://192.168.1.50:1234/v1`; optional `lmstudio_model_id`, `lmstudio_api_key`, `lmstudio_use_tools`), plus local CLI backends (**Antigravity `agy`** and Claude `claude`). Both Claude and Gemini fall back to local CLI execution if no API key is set or the API fails/exhausts quota. Set `"cli_fallback"` in `config.json` to `"agy"` (Antigravity), `"claude"`, `"auto"` (default, with automatic failover between them), or `"none"` (to disable). You can also set `"provider"` directly to `"agy"` or `"claude"` to run without any API key. The local model runs the same connector tool loop (Gmail/Discord/Jira/browser/system) but has no web search. `"assist_provider"` overrides that choice **for the Novatek form autopilot's stuck-escalation questions only** (`POST /assist/form-question`) — set it to `"lmstudio"` when your main provider is a metered or free-tier key, since a stuck visit fires dozens of these in a burst and that is exactly what trips a per-minute quota. Leave it empty and the autopilot follows `provider` like everything else. `"vision_provider"` does the same for camera frames: it picks which backend LOOKS at a picture, separately from the one that talks. A turn carrying a frame only ever reaches a backend that can actually see it — Claude via the direct API (not the CLI fallback, which is text-only), Gemini, or LM Studio with `"lmstudio_vision": true` and a multimodal model loaded. If none can see, Jarvis says so rather than answering blind. |
 | `persona` | Name, address term ("sir"), tone description, and a free-text `system_prompt_extra` for tweaks that don't need a code change |
-| `voice` | Three interchangeable TTS backends behind one interface (`app/providers/tts.py`) — ElevenLabs, Fish Audio, and local Kokoro. Set `"tts_provider"` to pick which one is tried first, same failover behavior as `model.provider` above. |
+| `voice` | Three interchangeable TTS backends behind one interface (`app/providers/tts.py`) — ElevenLabs, Fish Audio, and local Kokoro. Set `"tts_provider"` to pick which one is tried first, same failover behavior as `model.provider` above. Set `"tts_failover": false` to use **only** that one — which is what you want with local Kokoro, since falling over from a free local voice to a metered cloud one spends money exactly when you didn't ask it to. Kokoro reads `"kokoro_base_url"` (e.g. `http://127.0.0.1:8880`), `"kokoro_voice"` (`bf_emma`, `bf_isabella`, `bm_george`, `af_heart`, …) and `"kokoro_speed"`. |
 | `wake_word` | The wake word itself, how long to wait for a command after a bare "Jarvis", and how long to wait for silence before treating a sentence as finished |
 | `conversation` | Extra closing phrases to end conversation mode, and the spoken sign-off lines |
 | `retrieval` | How many notes to retrieve per question, how many turns of history to keep |
 | `images` | Max images per gallery lookup |
 | `brain` | Radius and colors of the 3D brain visualization |
+
+**Why long replies still start speaking immediately.** Synthesis cost is
+linear in text length, so asking any backend for a whole paragraph at once
+means waiting out the whole paragraph before the first word — a 434-character
+reply measured 14.0s of silence. `viewer/js/controller/speechController.js`
+splits the reply at sentence boundaries and pipelines the requests, so
+playback begins after the *first* piece (~1.0s) while the rest is synthesized
+behind it. Pieces start small and grow by `GROWTH` (1.8x) up to
+`CHUNK_CHARS`, which is what keeps synthesis ahead of playback: Kokoro runs
+~2.8x faster than real time, so a piece that is at most ~1.8x its predecessor
+is always ready before the predecessor finishes playing. Measured on the same
+reply: **14.0s to first word before, 1.0s after, with no gaps.** The pieces
+are verbatim slices of the reply — the splitter works in offsets rather than
+splitting and rejoining, so it can't turn "3 p.m." into "3 p. m.".
 
 Edit `config.json` and reload the page (and restart the server for `server.*`
 changes) — no code changes needed for anything in this list.
@@ -281,6 +358,8 @@ app/                         backend (Model + Controller)
     cli_provider.py              CLI runner (Antigravity `agy` & Claude `claude` with configurable fallback)
     lmstudio_provider.py         local model on the LAN via LM Studio (OpenAI-compatible)
     elevenlabs_provider.py       ElevenLabs text-to-speech
+    fish_audio_provider.py       Fish Audio text-to-speech
+    kokoro_provider.py           local Kokoro text-to-speech (tools/kokoro_server.py)
   controllers.py                request handling logic (no HTTP specifics)
   http_server.py                HTTP routing, static file serving, GET /config
 
@@ -308,7 +387,10 @@ notes/captures/                notes JARVIS writes for you via "remember that…
 | No sound | Click **Wake JARVIS** once — browsers block audio before the first interaction. |
 | Page looks stale after a change | Hard reload: `Cmd+Shift+R` / `Ctrl+Shift+R`. |
 | "I appear to be without a working brain" | No LLM backend is usable: no `model.provider_api_key` (Anthropic), `model.gemini_api_key` (Gemini), or `model.lmstudio_base_url` (LM Studio) in `config.json`, and the `claude` CLI isn't installed/logged in either. |
-| JARVIS uses the browser voice instead of a real one | None of the three TTS backends (ElevenLabs/Fish Audio/Kokoro) are configured, or all of them failed — check the server's console output. |
+| JARVIS uses the browser voice instead of a real one | None of the three TTS backends (ElevenLabs/Fish Audio/Kokoro) are configured, or all of them failed — check the server's console output. With Kokoro, check the voice box is up: `systemctl --user status kokoro-tts` and `curl http://127.0.0.1:8880/health`. |
+| A `jf_`/`jm_` (Japanese) or `zf_`/`zm_` (Chinese) voice 500s | That language's G2P engine isn't installed. Japanese: `tools/setup_kokoro.sh --japanese`. Chinese: `.venv-kokoro/bin/pip install "misaki[zh]"`. Then `systemctl --user restart kokoro-tts`. Note these voices phonemize *their own* language — feeding English text to a Japanese pack produces Japanese-accented approximations, not English. |
+| The voice pauses mid-reply | Synthesis has fallen behind playback. Raise `KOKORO_THREADS` (8 is the measured sweet spot on 16 cores; 16 is *far* slower than 8), or lower `GROWTH`/`CHUNK_CHARS` in `viewer/js/controller/speechController.js` so later pieces stay smaller. |
+| Kokoro is silent or slow | `journalctl --user -u kokoro-tts -n 50`. The first request after a restart loads the model and takes a few seconds; later ones are faster than real time. Bump `KOKORO_THREADS` in `~/.config/systemd/user/kokoro-tts.service` if the machine has cores to spare. |
 | Answers are generic / off-topic | Your notes folder is thin on that topic, or you pointed `build.py` at the wrong path — re-run `python3 build.py /full/path/to/notes`. |
 | Port 4700 already in use | Another `server.py` is still running — stop it, or edit `server.port` in `config.json`. |
 | Mic cuts off while you're still talking | Should no longer happen — see `wake_word.silence_commit_ms` in `config.json` if you want it more/less patient. |
