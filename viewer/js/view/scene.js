@@ -88,11 +88,54 @@ function buildPlexusOrb(radius, colorA, colorB) {
     uTime:   { value: 0.0 }
   };
 
-  // -- Dark occluding core: keeps far-side struts from muddling the front.
+  // -- Gradient occluding core: still hides the far-side points, but is now
+  //    tinted with the same two-colour gradient as the shell instead of being
+  //    a flat black ball. A fresnel rim lifts the edges so the sphere reads as
+  //    a lit volume rather than a silhouette.
   const core = new THREE.Mesh(
     new THREE.SphereGeometry(radius * 0.92, 64, 64),
-    new THREE.MeshBasicMaterial({ color: 0x0b0d1a, transparent: true, opacity: 0.88 })
+    new THREE.ShaderMaterial({
+      uniforms: orbUniforms,
+      transparent: true,
+      depthWrite: true,
+      vertexShader: `
+        varying vec3 vDir;
+        varying vec3 vNrm;
+        varying vec3 vEye;
+        void main() {
+          vDir = normalize(position);
+          vNrm = normalize(normalMatrix * normal);
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          vEye = normalize(-mv.xyz);
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: ORB_GRADIENT_CHUNK + `
+        varying vec3 vDir;
+        varying vec3 vNrm;
+        varying vec3 vEye;
+        void main() {
+          // same left-to-right A->B ramp the shell points use, plus a gentle
+          // vertical lift so the gradient reads diagonally.
+          float t = clamp(vDir.x * 0.42 + vDir.y * 0.18 + 0.5, 0.0, 1.0);
+          vec3 grad = mix(uColorA, uColorB, smoothstep(0.0, 1.0, t));
+
+          float fres = pow(1.0 - max(dot(vNrm, vEye), 0.0), 2.2);
+          float breathe = 0.5 + 0.5 * sin(uTime * 0.7);
+
+          // deep-tinted variant, eased back up: only a partial squaring of
+          // the ramp, so the core stays smoked glass but no longer sooty.
+          vec3 deep = mix(grad, grad * grad, 0.55);
+          vec3 body = deep * (0.17 + 0.11 * uGlow + 0.025 * breathe);
+          vec3 rim  = deep * (0.62 + 0.38 * uGlow + 0.08 * uPulse * uGlow);
+          vec3 col  = mix(body, rim, fres);
+
+          gl_FragColor = vec4(col, 0.94 + 0.05 * fres);
+        }
+      `
+    })
   );
+  core.renderOrder = -5;
   group.add(core);
 
   // -- Constellation shell: a dense fibonacci-distributed point cloud that
