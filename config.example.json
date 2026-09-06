@@ -94,5 +94,12 @@
   },
   "gmail": {
     "access_token": "YOUR-GMAIL-OAUTH-ACCESS-TOKEN"
+  },
+  "spotify": {
+    "client_id": "YOUR-SPOTIFY-CLIENT-ID",
+    "client_secret": "YOUR-SPOTIFY-CLIENT-SECRET",
+    "access_token": "YOUR-SPOTIFY-ACCESS-TOKEN",
+    "refresh_token": "YOUR-SPOTIFY-REFRESH-TOKEN",
+    "device_id": ""
   }
 }

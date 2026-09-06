@@ -20,6 +20,8 @@ The first request for a given language loads a pipeline and the first request
 for a given voice downloads its ~0.5 MB pack from the HF cache; both are then
 held in memory, so only the very first synthesis pays that cost.
 """
+import ctypes
+import gc
 import io
 import os
 import threading
@@ -59,6 +61,27 @@ _pipelines_lock = threading.Lock()
 # Kokoro's model is not re-entrant; one synthesis at a time keeps concurrent
 # /speak calls from corrupting each other's audio.
 _synth_lock = threading.Lock()
+
+# Kokoro runs on CPU through glibc malloc, which happily keeps freed arenas
+# mapped: Python drops the tensors but RSS never comes back down, so the
+# process looks like it is leaking a few hundred MB per spoken reply. A
+# collect + malloc_trim after each synthesis hands those arenas back to the OS.
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+except OSError:  # non-glibc (musl, macOS) - the collect alone still helps
+    _libc = None
+
+
+def _release_memory():
+    """Drop synthesis garbage and return freed arenas to the OS."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if _libc is not None and hasattr(_libc, "malloc_trim"):
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
 
 
 def _pipeline(lang_code):
@@ -132,15 +155,22 @@ def speech(req: SpeechRequest):
     try:
         pipeline = _pipeline(lang_code)
         with _synth_lock:
-            chunks = [audio.numpy() for _, _, audio in
-                      pipeline(text, voice=voice, speed=req.speed or 1.0)]
+            # inference_mode stops torch building autograd graphs for a model
+            # that is never trained here - without it every reply leaves its
+            # activation graph behind and RSS climbs for the life of the process.
+            with torch.inference_mode():
+                chunks = [audio.numpy().copy() for _, _, audio in
+                          pipeline(text, voice=voice, speed=req.speed or 1.0)]
     except Exception as e:
+        _release_memory()
         raise HTTPException(status_code=500, detail=f"synthesis failed: {e}")
 
     if not chunks:
         raise HTTPException(status_code=500, detail="synthesis produced no audio")
 
     body, content_type = _encode(np.concatenate(chunks), response_format)
+    del chunks
+    _release_memory()
     return Response(content=body, media_type=content_type)
 
 

@@ -531,10 +531,12 @@ def _register_builtin_connectors(reg: ToolRegistry) -> None:
     )
 
     # Scoped external APIs — available to every backend.
+    from .spotify import get_spotify_tools, execute_spotify_tool
     for getter, executor in (
         (get_gmail_tools, execute_gmail_tool),
         (get_discord_tools, execute_discord_tool),
         (get_jira_tools, execute_jira_tool),
+        (get_spotify_tools, execute_spotify_tool),
     ):
         reg.register_connector_bundle(getter, executor, only_llm=False)
 

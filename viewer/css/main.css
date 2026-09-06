@@ -938,3 +938,87 @@ body {
 }
 @keyframes coreLabelBreathe { 0%, 100% { opacity: 0.72; } 50% { opacity: 1; } }
 body.speaking #core-label { color: #ffffff; opacity: 1; }
+
+/* ================= Spotify Now-Playing Panel =================
+   Sits above the SYSTEM panel in the bottom-left column, sharing its smoked
+   neon glass so playback reads as part of the core, not a bolted-on widget. */
+#spotify-panel {
+  position: fixed; bottom: 320px; left: 24px; z-index: 21;
+  width: min(390px, 42vw);
+  background: rgba(20, 24, 46, 0.94); border: 1px solid var(--panel-border);
+  border-radius: 16px; backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: var(--panel-shadow);
+  display: flex; flex-direction: column; overflow: hidden;
+  font-family: var(--font-mono);
+  transition: max-height .25s ease, box-shadow .25s ease;
+  max-height: 260px;
+}
+#spotify-panel.collapsed { max-height: 38px; }
+#spotify-panel.alert { box-shadow: 0 0 0 1px rgba(255, 61, 110, 0.35), var(--panel-shadow); }
+#spotify-panel-header {
+  flex-shrink: 0; display: flex; align-items: center; gap: 10px;
+  padding: 11px 14px; font-size: 10.5px; letter-spacing: 0.09em; font-weight: 700;
+  background: rgba(20, 24, 46, 0.80); border-bottom: 1px solid var(--panel-border);
+  user-select: none;
+}
+#spotify-panel-title { color: var(--text); }
+#spotify-panel-state { margin-left: auto; font-size: 10px; letter-spacing: .06em; }
+#spotify-panel-state.ok   { color: var(--ok); text-shadow: 0 0 10px rgba(0, 255, 163, 0.55); }
+#spotify-panel-state.warn { color: #ffb347; }
+#spotify-panel-state.bad  { color: var(--error); }
+#spotify-panel-toggle { cursor: pointer; color: var(--text-dim); font-size: 12px; }
+#spotify-panel-body { padding: 12px 14px 14px; font-size: 11px; overflow: hidden; }
+#spotify-panel-body.dim { opacity: 0.75; }
+
+#spotify-now { display: flex; gap: 12px; align-items: center; }
+#spotify-art {
+  width: 58px; height: 58px; flex-shrink: 0; border-radius: 10px;
+  background: rgba(0, 229, 255, 0.07) center/cover no-repeat;
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 0 18px -6px rgba(255, 0, 230, 0.5);
+}
+#spotify-meta { min-width: 0; }
+#spotify-track {
+  color: var(--text); font-size: 12.5px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#spotify-artist { color: var(--accent-light); margin-top: 3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#spotify-album { color: var(--text-subtle); margin-top: 2px; font-size: 10px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+#spotify-progress {
+  margin-top: 11px; height: 3px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.10); overflow: hidden;
+}
+#spotify-progress-fill {
+  display: block; height: 100%; width: 0%;
+  background: linear-gradient(90deg, var(--neon-cyan), var(--neon-magenta));
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.6); transition: width .4s linear;
+}
+#spotify-times {
+  display: flex; justify-content: space-between;
+  color: var(--text-subtle); font-size: 9.5px; margin-top: 4px;
+}
+
+#spotify-controls { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+#spotify-controls button {
+  background: rgba(0, 229, 255, 0.06); color: var(--text);
+  border: 1px solid var(--panel-border); border-radius: 10px;
+  padding: 5px 11px; font-size: 13px; cursor: pointer; line-height: 1;
+  transition: background .2s ease, box-shadow .2s ease, transform .1s ease;
+}
+#spotify-controls button:hover {
+  background: var(--panel-bg-hover); box-shadow: 0 0 14px -4px var(--neon-cyan);
+}
+#spotify-controls button:active { transform: scale(0.94); }
+#spotify-volume {
+  flex: 1; min-width: 60px; margin-left: 4px; accent-color: var(--neon-magenta);
+  height: 3px; cursor: pointer;
+}
+#spotify-volume-val { color: var(--text-dim); font-size: 9.5px; min-width: 30px; text-align: right; }
+#spotify-device {
+  margin-top: 9px; color: var(--text-dim); font-size: 9.5px; letter-spacing: .04em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}

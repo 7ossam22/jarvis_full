@@ -132,11 +132,38 @@ class JarvisHandler(BaseHTTPRequestHandler):
             # Live diagnostics for the viewer's system panel: what is running,
             # whether it looks stuck, and every error that has been recorded
             # rather than merely printed to a terminal nobody is watching.
-            self._send_json(controllers.handle_status(Config.load()))
+            try:
+                self._send_json(controllers.handle_status(Config.load()))
+            except Exception as e:
+                self.log_message("handle_status failed: %s", e)
+                self._send_json({
+                    "busy": False,
+                    "stuck": False,
+                    "running": None,
+                    "error_count": 1,
+                    "events": [],
+                    "providers": [],
+                    "provider_in_use": None,
+                    "model": None,
+                    "tools": 0,
+                    "sessions": [],
+                    "problems": [f"status check failed: {e}"],
+                })
             return
 
         if url_path == "/chat/result":
             self._handle_chat_result(parsed.query)
+            return
+
+        if url_path == "/spotify/state":
+            # Feeds the viewer's now-playing panel. Read-only, and it reports
+            # its own failures rather than 500-ing, because "Spotify is not
+            # reachable" is exactly the thing the panel exists to show.
+            from .connectors.spotify import spotify_playback_snapshot
+            try:
+                self._send_json(spotify_playback_snapshot(Config.load()))
+            except Exception as e:
+                self._send_json({"status": "error", "error": str(e)})
             return
 
         if url_path == "/embeddable":
@@ -212,8 +239,37 @@ class JarvisHandler(BaseHTTPRequestHandler):
             self._send_json(result, status=status)
         elif self.path == "/jira/action":
             self._handle_jira_action()
+        elif self.path == "/spotify/control":
+            self._handle_spotify_control()
         else:
             self.send_error(404, "Not found")
+
+    def _handle_spotify_control(self):
+        """Transport buttons on the now-playing panel.
+
+        Deliberately a thin pass-through to the same tool functions the model
+        calls, so the panel and JARVIS drive playback through one code path
+        rather than two that can disagree.
+        """
+        from .connectors.spotify import execute_spotify_tool
+        body = self._read_json_body()
+        cfg = Config.load()
+        action = body.get("action", "")
+        if action == "volume":
+            result = execute_spotify_tool(cfg, "spotify_set_volume",
+                                          {"volume_percent": body.get("volume_percent")})
+        elif action in ("show_panel", "hide_panel"):
+            # The panel's own ✕ and any "open the player" request land here, so
+            # the viewer and the model raise/lower the same flag.
+            result = execute_spotify_tool(cfg, f"spotify_{action}", {})
+        elif action in ("play", "resume", "pause", "next", "previous", "stop", "status"):
+            # The connector's vocabulary calls it "resume"; the panel's button
+            # says "play". Translate here rather than teaching the UI jargon.
+            verb = "resume" if action == "play" else action
+            result = execute_spotify_tool(cfg, "spotify_playback_control", {"action": verb})
+        else:
+            result = {"status": "error", "error": f"Unsupported control action: {action!r}"}
+        self._send_json(result)
 
     def _handle_jira_action(self):
         from .connectors.jira import execute_jira_tool
@@ -327,6 +383,12 @@ def _start_https(bind, port):
         cert_path, key_path = tls.ensure_certificate()
         context = tls.make_ssl_context(cert_path, key_path)
         return TLSThreadingHTTPServer((bind, port), JarvisHandler, context)
+    except OSError as e:
+        if getattr(e, "errno", None) == 98:
+            print(f"[jarvis] https disabled on port {port} — port {port} is already in use", file=sys.stderr)
+            return None
+        print(f"[jarvis] https disabled on port {port} — {e}", file=sys.stderr)
+        return None
     except Exception as e:
         print(f"[jarvis] https disabled on port {port} — {e}", file=sys.stderr)
         return None
@@ -346,8 +408,18 @@ def main():
 
     port = cfg.get("server.port", 4700)
     bind = cfg.get("server.bind", "0.0.0.0")
-    server = ThreadingHTTPServer((bind, port), JarvisHandler)
-    print(f"[jarvis] Serving on http://{bind}:{port}  (open this in Chrome)")
+    try:
+        server = ThreadingHTTPServer((bind, port), JarvisHandler)
+    except OSError as e:
+        if getattr(e, "errno", None) == 98:
+            print(f"\n[jarvis] ERROR: Port {port} is already in use by another process.", file=sys.stderr)
+            print(f"[jarvis] Another instance of JARVIS or another service is listening on port {port}.", file=sys.stderr)
+            print(f"[jarvis] You can stop it with: fuser -k {port}/tcp", file=sys.stderr)
+            sys.exit(1)
+        raise
+
+    display_host = "localhost" if bind in ("0.0.0.0", "::") else bind
+    print(f"[jarvis] Serving on http://{display_host}:{port}  (open this in Chrome)")
 
     # The camera and the wake-word microphone are secure-context features, so
     # over the LAN they only work on https — hence a second listener on the
@@ -359,7 +431,7 @@ def main():
         https_port = cfg.get("server.https_port", 4443)
         https_server = _start_https(bind, https_port)
         if https_server is not None:
-            print(f"[jarvis] Serving on https://{bind}:{https_port}  "
+            print(f"[jarvis] Serving on https://{display_host}:{https_port}  "
                   f"(self-signed — accept the browser warning once)")
             threading.Thread(target=https_server.serve_forever, daemon=True).start()
 

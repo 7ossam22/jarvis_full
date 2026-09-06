@@ -526,13 +526,19 @@ def handle_status(cfg):
     500s when something is wrong is worse than none.
     """
     from . import history, telemetry
-    from .connectors.registry import registry
-    from .providers.llm import get_llm_providers
 
     snap = telemetry.snapshot()
 
     problems = []
     try:
+        from .connectors.registry import registry
+        tool_count = len(registry)
+    except Exception as e:
+        problems.append(f"connector registry setup failed: {e}")
+        tool_count = 0
+
+    try:
+        from .providers.llm import get_llm_providers
         providers = [p.name for p in get_llm_providers(cfg)]
     except Exception as e:                                   # noqa: BLE001
         providers, _ = [], problems.append(f"provider setup failed: {e}")
@@ -580,7 +586,7 @@ def handle_status(cfg):
         "provider_in_use": providers[0] if providers else None,
         "model": (cfg.get("model.lmstudio_model_id") if providers[:1] == ["lmstudio"]
                   else cfg.get("model.model_id")),
-        "tools": len(registry),
+        "tools": tool_count,
         "sessions": sessions,
         "problems": problems,
     }
