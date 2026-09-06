@@ -4,17 +4,12 @@
      pure-white highlights to sharpen the neon glow. */
   --bg: #12121e;
   --bg-gradient:
-    /* Faint tech mesh: three irregular line families at odd angles that
-       tessellate the backdrop into randomly-angled triangles, not squares. */
-    repeating-linear-gradient(23deg, rgba(0, 229, 255, 0.05) 0 1px, transparent 1px 74px),
-    repeating-linear-gradient(-49deg, rgba(255, 0, 230, 0.042) 0 1px, transparent 1px 61px),
-    repeating-linear-gradient(101deg, rgba(0, 229, 255, 0.035) 0 1px, transparent 1px 93px),
-    /* Neon atmosphere bloom */
-    radial-gradient(ellipse at 18% 12%, rgba(0, 229, 255, 0.13) 0%, transparent 52%),
-    radial-gradient(ellipse at 84% 16%, rgba(255, 0, 230, 0.12) 0%, transparent 52%),
-    radial-gradient(ellipse at 50% 92%, rgba(120, 0, 255, 0.10) 0%, transparent 58%),
-    /* Dark navy/charcoal base */
-    linear-gradient(160deg, #12121e 0%, #0d0f1c 55%, #08080f 100%);
+    /* Deep-space bloom: soft neon atmosphere over a near-black navy void.
+       No mesh, no grid -- the depth comes from the animated aurora layers below. */
+    radial-gradient(ellipse 90% 60% at 18% 6%, rgba(0, 229, 255, 0.10) 0%, transparent 60%),
+    radial-gradient(ellipse 80% 55% at 86% 12%, rgba(255, 0, 230, 0.09) 0%, transparent 60%),
+    radial-gradient(ellipse 120% 70% at 50% 104%, rgba(120, 0, 255, 0.12) 0%, transparent 62%),
+    linear-gradient(165deg, #0e0e1a 0%, #0a0b16 50%, #05050b 100%);
 
   /* ---- Smoked Neon Glass Surfaces ---- */
   --panel-bg: rgba(20, 24, 46, 0.72);
@@ -67,9 +62,54 @@ body {
   color: var(--text-body);
   background: var(--bg-gradient);
   background-attachment: fixed;
-  background-size: cover, cover, cover, cover, cover, cover, cover;
+  background-size: cover, cover, cover, cover;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* ---- Living Aurora Backdrop ----
+   Two slow, counter-drifting neon clouds plus a fine star dust field and a
+   vignette. All fixed, all pointer-transparent, all behind the orb (z-index 1). */
+body::before {
+  content: ""; position: fixed; inset: -25%; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(closest-side at 30% 35%, rgba(0, 229, 255, 0.20) 0%, transparent 100%),
+    radial-gradient(closest-side at 72% 30%, rgba(255, 0, 230, 0.17) 0%, transparent 100%),
+    radial-gradient(closest-side at 52% 78%, rgba(120, 60, 255, 0.16) 0%, transparent 100%),
+    radial-gradient(closest-side at 12% 72%, rgba(0, 255, 200, 0.10) 0%, transparent 100%);
+  background-size: 65% 65%, 58% 58%, 72% 72%, 50% 50%;
+  background-repeat: no-repeat;
+  filter: blur(52px) saturate(150%);
+  opacity: 0.85;
+  animation: auroraDrift 46s ease-in-out infinite alternate;
+  will-change: transform;
+}
+body::after {
+  content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    /* horizon glow behind the orb */
+    radial-gradient(ellipse 46% 34% at 50% 52%, rgba(0, 229, 255, 0.07) 0%, transparent 70%),
+    /* vignette to sink the corners */
+    radial-gradient(ellipse 78% 70% at 50% 48%, transparent 42%, rgba(0, 0, 0, 0.62) 100%);
+  animation: starBreathe 11s ease-in-out infinite;
+}
+/* Real stars live on a canvas (js/view/starfield.js): randomly scattered,
+   parallaxed and twinkling. The old tiled dot gradients repeated on a fixed
+   pitch and read as graph paper, so they are gone. */
+#starfield {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+}
+@keyframes auroraDrift {
+  0%   { transform: translate3d(-2%, -1%, 0) scale(1.00) rotate(0deg); }
+  50%  { transform: translate3d(3%, 2%, 0) scale(1.08) rotate(4deg); }
+  100% { transform: translate3d(1%, -3%, 0) scale(1.03) rotate(-3deg); }
+}
+@keyframes starBreathe {
+  0%, 100% { opacity: 0.75; }
+  50%      { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  body::before, body::after { animation: none; }
 }
 
 #graph { position: fixed; inset: 0; z-index: 1; }
@@ -182,7 +222,7 @@ body {
   display: flex; align-items: center; justify-content: center;
   background: var(--bg-gradient);
   background-attachment: fixed;
-  background-size: cover, cover, cover, cover, cover, cover, cover;
+  background-size: cover, cover, cover, cover;
 }
 .boot-card {
   display: flex; flex-direction: column; align-items: center; justify-content: center;

@@ -5,6 +5,7 @@
 // when speaking.
 import { graphData, neighborsOf, linkKey } from "../model/graphData.js";
 import { openPanel, closePanel } from "./panel.js";
+import { initStarfield, setStarfieldEnergy } from "./starfield.js";
 
 const GROUP_PALETTE = [
   "#2563eb", // Electric Blue
@@ -57,6 +58,7 @@ let BRAIN_RADIUS = 100;
 let brainShell;          // the one and only orb
 let orbHalo;             // soft additive hallow/glow disc behind the orb
 let particleRing;        // orbiting glowing particles / digital noise
+let orbSigil;            // vertical Japanese "JARVIS" glyph column at the orb's centre
 const ORB_BLUE = 0x00e5ff; // electric cyan  (#00E5FF)
 const ORB_PINK = 0xff00e6; // neon magenta  (#FF00E6)
 let orbUniforms = null;
@@ -224,6 +226,90 @@ function buildPlexusOrb(radius, colorA, colorB) {
   return group;
 }
 
+// ---------------------------------------------------------------------
+// Vertical Japanese name sigil: ジャーヴィス ("JARVIS") painted down the
+// centre of the orb. Drawn to a canvas texture, billboarded at the camera and
+// additively blended so it glows out of the smoked-glass core rather than
+// sitting on top of it as a flat decal. Breathes and brightens with speech.
+// ---------------------------------------------------------------------
+function buildOrbSigil(radius) {
+  const chars = ["ジ", "ャ", "ー", "ヴ", "ィ", "ス"];
+  const CELL = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = CELL;
+  canvas.height = CELL * chars.length;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.font = `600 ${Math.round(CELL * 0.72)}px "Noto Sans JP", "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowColor = "rgba(255,255,255,0.85)";
+  ctx.shadowBlur = CELL * 0.10;
+  chars.forEach((ch, i) => {
+    const cx = CELL * 0.5;
+    const cy = CELL * (i + 0.5);
+    if (ch === "ー") {
+      // the long-vowel bar runs horizontally when set sideways: rotate it
+      // upright so the column reads correctly top-to-bottom.
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(Math.PI / 2);
+      ctx.fillText(ch, 0, 0);
+      ctx.restore();
+    } else {
+      ctx.fillText(ch, cx, cy);
+    }
+  });
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.generateMipmaps = false;
+  if ("colorSpace" in texture) texture.colorSpace = THREE.SRGBColorSpace;
+
+  const height = radius * 1.34;
+  const width = height / chars.length;
+  const uniforms = Object.assign({ uMap: { value: texture } }, orbUniforms);
+
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(width, height, 1, 1),
+    new THREE.ShaderMaterial({
+      uniforms,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+      blending: THREE.AdditiveBlending,
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: ORB_GRADIENT_CHUNK + `
+        uniform sampler2D uMap;
+        varying vec2 vUv;
+        void main() {
+          // CanvasTexture already applies flipY, so sample the UV straight:
+          // flipping it again turned the column upside-down and mirrored.
+          float m = texture2D(uMap, vUv).a;
+          if (m < 0.01) discard;
+          // mostly white, faintly tinted by the orb's own gradient so it sits
+          // inside the sphere instead of floating over it.
+          vec3 tint = mix(uColorA, uColorB, clamp(1.0 - vUv.y, 0.0, 1.0));
+          vec3 col  = mix(vec3(1.0), tint, 0.22);
+          float breathe = 0.5 + 0.5 * sin(uTime * 0.7);
+          float amp = 0.46 + 0.05 * breathe + 0.42 * uGlow + 0.16 * uPulse * uGlow;
+          gl_FragColor = vec4(col * (0.9 + 0.5 * uGlow), m * amp);
+        }
+      `
+    })
+  );
+  mesh.renderOrder = 6;   // always drawn over the core, under nothing
+  return mesh;
+}
+
 // -- Orbiting ring of glowing particles / digital noise around the orb.
 function buildParticleRing(radius, colorA, colorB) {
   const COUNT = 900;
@@ -336,6 +422,7 @@ function hexToInt(hex, fallback) {
 }
 
 export function initScene(config) {
+  initStarfield();
   BRAIN_RADIUS = config?.brain?.radius ?? 100;
   // Orb gradient is fixed: electric blue -> magenta pink. The old grey/white
   // brain.shell_color / brain.wire_color defaults are ignored on purpose; only
@@ -380,6 +467,8 @@ export function initScene(config) {
   Graph.scene().add(brainShell);
   particleRing = buildParticleRing(BRAIN_RADIUS, shellColor, wireColor);
   Graph.scene().add(particleRing);
+  orbSigil = buildOrbSigil(BRAIN_RADIUS);
+  Graph.scene().add(orbSigil);
 
   // Keep the halo square-on to the camera and start the always-on render loop
   requestAnimationFrame(orbFrame);
@@ -532,9 +621,14 @@ function orbFrame(ts) {
   const t = ts / 1000;
 
   // Halo is a billboard: copy the camera's orientation every frame.
-  if (orbHalo && Graph) {
+  if (Graph) {
     const cam = Graph.camera();
-    if (cam) orbHalo.quaternion.copy(cam.quaternion);
+    if (cam) {
+      if (orbHalo) orbHalo.quaternion.copy(cam.quaternion);
+      // the sigil is a billboard too: it must always face the viewer, and it
+      // deliberately does NOT inherit the shell's slow drift rotation.
+      if (orbSigil) orbSigil.quaternion.copy(cam.quaternion);
+    }
   }
 
   // Ease the glow towards its target so speech start/stop fades, never snaps.
@@ -564,6 +658,7 @@ function orbFrame(ts) {
   }
   if (brainShell) brainShell.scale.setScalar(1 + orbGlow * pulse * 0.035);
   if (orbHalo) orbHalo.scale.setScalar(1 + orbGlow * (0.10 + pulse * 0.06));
+  if (orbSigil) orbSigil.scale.setScalar(1 + orbGlow * pulse * 0.05);
 
   requestAnimationFrame(orbFrame);
 }
@@ -571,6 +666,7 @@ function orbFrame(ts) {
 export function startBrainGlow() {
   if (brainGlowActive) return;
   brainGlowActive = true;
+  setStarfieldEnergy(true);
 
   const indicator = document.getElementById("speaking-indicator");
   if (indicator) indicator.classList.remove("hidden");
@@ -578,6 +674,7 @@ export function startBrainGlow() {
 
 export function stopBrainGlow() {
   brainGlowActive = false;
+  setStarfieldEnergy(false);
 
   const indicator = document.getElementById("speaking-indicator");
   if (indicator) indicator.classList.add("hidden");

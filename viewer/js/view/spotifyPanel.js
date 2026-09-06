@@ -11,10 +11,12 @@
 // the panel and JARVIS can never disagree about playback.
 import { log as logLine } from "./console.js";
 
-const POLL_MS = 4000;
+const POLL_MS = 4000;        // visible and expanded: keep the panel live
+const IDLE_POLL_MS = 10000;  // collapsed or hidden: still notices a change within ~10s
 
 let el = null;
 let collapsed = false;
+let timer = null;
 let lastKey = null;      // track identity, so the log announces changes once
 let lastErr = null;
 let suppressUntil = 0;   // brief poll pause after a command: Spotify's own
@@ -65,6 +67,9 @@ function build() {
     collapsed = !collapsed;
     el.classList.toggle("collapsed", collapsed);
     el.querySelector("#spotify-panel-toggle").textContent = collapsed ? "▸" : "▾";
+    // Expanding must repaint immediately rather than wait out an idle tick.
+    if (!collapsed) poll();
+    else schedule();
   });
 
   el.querySelectorAll("#spotify-controls button").forEach((btn) => {
@@ -100,7 +105,7 @@ async function send(action, extra = {}) {
     logLine(`Spotify ${action} failed — ${e}`, "error");
   }
   suppressUntil = Date.now() + 600;
-  setTimeout(poll, 700);
+  setTimeout(poll, 700);   // a command is an explicit user action: always refresh
 }
 
 function setState(text, cls) {
@@ -182,18 +187,39 @@ function render(s) {
   }
 }
 
+/** True when nobody can actually see the panel: the tab is in the background,
+ *  the panel is collapsed to its header, or the backend has hidden it. */
+function dormant() {
+  if (document.hidden) return true;
+  if (collapsed) return true;
+  if (el && el.style.display === "none") return true;
+  return false;
+}
+
+/** Re-arm the next tick at the cadence the current visibility deserves. */
+function schedule() {
+  if (timer) clearTimeout(timer);
+  // Background tab: stop entirely. visibilitychange restarts us.
+  if (document.hidden) { timer = null; return; }
+  timer = setTimeout(poll, dormant() ? IDLE_POLL_MS : POLL_MS);
+}
+
 async function poll() {
-  if (Date.now() < suppressUntil) return;
+  if (Date.now() < suppressUntil) { schedule(); return; }
   try {
     const res = await fetch("/spotify/state");
     if (res.ok) render(await res.json());
   } catch (e) {
     setState("SERVER UNREACHABLE", "bad");
   }
+  schedule();
 }
 
 export function startSpotifyPanel() {
   if (!el) build();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) poll();   // foreground again: refresh now, then re-arm
+    else schedule();
+  });
   poll();
-  setInterval(poll, POLL_MS);
 }

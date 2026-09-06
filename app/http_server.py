@@ -339,6 +339,26 @@ class JarvisHandler(BaseHTTPRequestHandler):
         self._send_json(result, status=status)
 
 
+# One log line per (client ip, failure reason). Repeats are counted rather
+# than printed, and the tally is shown again only when it crosses a power of
+# ten, so a device stuck in a retry loop stays visible without flooding.
+_tls_drops = {}
+_tls_drops_lock = threading.Lock()
+
+
+def _log_tls_drop(client_ip, exc):
+    reason = getattr(exc, "reason", None) or type(exc).__name__
+    key = (client_ip, reason)
+    with _tls_drops_lock:
+        count = _tls_drops.get(key, 0) + 1
+        _tls_drops[key] = count
+    if count == 1:
+        sys.stderr.write(f"[jarvis] tls: dropped {client_ip} — {exc} "
+                         f"(further identical drops from this client are silenced)\n")
+    elif count in (10, 100, 1000, 10000):
+        sys.stderr.write(f"[jarvis] tls: dropped {client_ip} — {reason} x{count}\n")
+
+
 class TLSThreadingHTTPServer(ThreadingHTTPServer):
     """The same server, speaking TLS.
 
@@ -368,9 +388,15 @@ class TLSThreadingHTTPServer(ThreadingHTTPServer):
         # A failed handshake is routine here (a port scan, a browser that
         # declined the self-signed certificate, http:// at the wrong port);
         # it is worth one line, not a traceback claiming the server broke.
+        #
+        # And exactly one line: a device that refuses the self-signed cert
+        # usually has something retrying in the background, so the same drop
+        # arrives hundreds of times an hour. The first one is the diagnosis;
+        # the rest are noise that buries every other log line, so each
+        # (client, reason) pair is reported once and then counted silently.
         exc = sys.exc_info()[1]
         if isinstance(exc, (ssl.SSLError, ConnectionError, TimeoutError)):
-            sys.stderr.write(f"[jarvis] tls: dropped {client_address[0]} — {exc}\n")
+            _log_tls_drop(client_address[0], exc)
             return
         super().handle_error(request, client_address)
 
